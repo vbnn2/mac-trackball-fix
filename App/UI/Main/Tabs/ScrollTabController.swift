@@ -108,16 +108,16 @@ class ScrollTabController: NSViewController {
             }
         }
 
-        let specs: [(keyPath: String, title: String)] = [
-            ("Scroll.tuning.sensitivity",  MFLocalizedString("scroll.tuning.sensitivity", comment: "")),
-            ("Scroll.tuning.acceleration", MFLocalizedString("scroll.tuning.acceleration", comment: "")),
-            ("Scroll.tuning.smoothness",   MFLocalizedString("scroll.tuning.smoothness", comment: "")),
-            ("Scroll.tuning.glide",        MFLocalizedString("scroll.tuning.glide", comment: "")),
-            ("Scroll.tuning.fast-scroll",  MFLocalizedString("scroll.tuning.fast-scroll", comment: "")),
+        /// `fallback` must match `default_config.plist > Scroll.tuning` and ScrollConfig's `slider()` fallbacks.
+        /// It's only used for a config that predates these keys — nothing backfills them (see ScrollConfig).
+        /// Note the string keys are kebab-case while the config keys are camelCase.
+        let specs: [(configKey: String, stringKey: String, fallback: Double)] = [
+            ("Scroll.tuning.sensitivity",  "scroll.tuning.sensitivity",  0.10),
+            ("Scroll.tuning.acceleration", "scroll.tuning.acceleration", 1.0),
+            ("Scroll.tuning.smoothness",   "scroll.tuning.smoothness",   0.5),
+            ("Scroll.tuning.glide",        "scroll.tuning.glide",        0.75),
+            ("Scroll.tuning.fastScroll",   "scroll.tuning.fast-scroll",  0.67),
         ]
-        /// The config keys are camelCase; only the *string* key is kebab-case.
-        let configKeys = ["Scroll.tuning.sensitivity", "Scroll.tuning.acceleration",
-                          "Scroll.tuning.smoothness", "Scroll.tuning.glide", "Scroll.tuning.fastScroll"]
 
         let section = NSStackView()
         section.orientation = .vertical
@@ -128,14 +128,14 @@ class ScrollTabController: NSViewController {
         section.setHuggingPriority(.required, for: .vertical)
         section.setContentHuggingPriority(.required, for: .vertical)
 
-        for (i, spec) in specs.enumerated() {
+        for spec in specs {
 
-            let label = NSTextField(labelWithString: spec.title)
+            let label = NSTextField(labelWithString: MFLocalizedString(spec.stringKey, comment: ""))
             label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
             label.alignment = .right
             label.widthAnchor.constraint(equalToConstant: 90).isActive = true
 
-            let value = (config(configKeys[i]) as? NSNumber)?.doubleValue ?? (configKeys[i].hasSuffix("fastScroll") ? 0.0 : 0.5)
+            let value = (config(spec.configKey) as? NSNumber)?.doubleValue ?? spec.fallback
 
             let readout = NSTextField(labelWithString: String(format: "%.2f", value))
             readout.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
@@ -149,9 +149,9 @@ class ScrollTabController: NSViewController {
             /// to the Helper — on every pixel of the drag.
             slider.isContinuous = false
             slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
-            slider.setAccessibilityIdentifier("axTuning_" + configKeys[i])
+            slider.setAccessibilityIdentifier("axTuning_" + spec.configKey)
 
-            tuningSliders[slider] = (keyPath: configKeys[i], readout: readout)
+            tuningSliders[slider] = (keyPath: spec.configKey, readout: readout)
 
             let row = NSStackView(views: [label, slider, readout])
             row.orientation = .horizontal

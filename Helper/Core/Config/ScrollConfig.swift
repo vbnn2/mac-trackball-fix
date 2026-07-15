@@ -277,11 +277,18 @@ import Cocoa
         return SharedUtilitySwift.clip(v, betweenLow: 0.0, high: 1.0)
     }
 
-    @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.5) }()
-    @objc lazy var u_acceleration: Double = { slider("acceleration", 0.5) }()
+    /// Fallbacks must match `default_config.plist > Scroll.tuning`. They aren't dead code: `_loadAndRepair` is a
+    /// configVersion migration, not a key-merger, so a config written before these keys existed simply won't have
+    /// them — and the Helper never repairs at all. These values are what actually runs in that case.
+    ///
+    /// [Jul 16 2026] Tuned by hand on the TB800 and adopted as the defaults. The shape is: a very low base
+    /// sensitivity so slow scrolling moves in small steps rather than lurching, with strong acceleration and
+    /// fastScroll to get the distance back on a fast spin.
+    @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.10) }()
+    @objc lazy var u_acceleration: Double = { slider("acceleration", 1.0) }()
     @objc lazy var u_smoothnessAmount: Double = { slider("smoothness", 0.5) }()
-    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.0) }()
-    @objc lazy var u_glide: Double = { slider("glide", 0.5) }()
+    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.67) }()
+    @objc lazy var u_glide: Double = { slider("glide", 0.75) }()
 
     /// How long the scroll keeps gliding after your finger leaves the ring.
     ///     The animator hands off from the base curve to a drag curve, which models `v'(t) = -a*v(t)^b`

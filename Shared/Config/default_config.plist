@@ -22,15 +22,15 @@
 		<key>tuning</key>
 		<dict>
 			<key>sensitivity</key>
-			<real>0.5</real>
+			<real>0.10</real>
 			<key>acceleration</key>
-			<real>0.5</real>
+			<real>1.0</real>
 			<key>smoothness</key>
 			<real>0.5</real>
 			<key>fastScroll</key>
-			<real>0.0</real>
+			<real>0.67</real>
 			<key>glide</key>
-			<real>0.5</real>
+			<real>0.75</real>
 		</dict>
 		<key>trackpadSimulation</key>
 		<true/>
