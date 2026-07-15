@@ -18,6 +18,10 @@ class ScrollTabController: NSViewController {
     var smooth = ConfigValue<String>(configPath: "Scroll.smooth")
     var trackpad = ConfigValue<Bool>(configPath: "Scroll.trackpadSimulation")
     var reverseDirection = ConfigValue<Bool>(configPath: "Scroll.reverseDirection")
+    var invertZoom = ConfigValue<Bool>(configPath: "Scroll.invertZoom")
+
+    /// Fork: tuning sliders. keyPath -> (slider, readout label)
+    private var tuningSliders: [NSSlider: (keyPath: String, readout: NSTextField)] = [:]
     var scrollSpeed = ConfigValue<String>(configPath: "Scroll.speed")
     var precise = ConfigValue<Bool>(configPath: "Scroll.precise")
     var horizontalMod = ConfigValue<UInt>(configPath: "Scroll.modifiers.horizontal")
@@ -83,8 +87,92 @@ class ScrollTabController: NSViewController {
         }
     }
     
+    /// Fork: tuning sliders
+
+    private func addTuningSliders() {
+
+        /// Hide upstream's Smoothness and Speed pickers.
+        ///     Hidden, not deleted: their outlets stay wired and their reactive bindings keep running, so the
+        ///     underlying `Scroll.smooth` / `Scroll.speed` config values keep their current meaning. `smooth` still
+        ///     selects *which* animation curve is used (LowInertia etc.) — the Smoothness slider then overrides that
+        ///     curve's step duration (see ScrollConfig.tuned()). masterStack sets detachesHiddenViews=YES in IB, so
+        ///     hidden rows collapse properly here.
+        for control in [smoothPicker as NSView?, speedPicker as NSView?] {
+            guard let control = control else { continue }
+            var row: NSView = control
+            while let parent = row.superview, parent !== masterStack { row = parent }
+            if row.superview === masterStack {
+                row.isHidden = true
+            } else {
+                assert(false, "ScrollTab layout changed: picker is not inside masterStack.")
+            }
+        }
+
+        let specs: [(keyPath: String, title: String)] = [
+            ("Scroll.tuning.sensitivity",  MFLocalizedString("scroll.tuning.sensitivity", comment: "")),
+            ("Scroll.tuning.acceleration", MFLocalizedString("scroll.tuning.acceleration", comment: "")),
+            ("Scroll.tuning.smoothness",   MFLocalizedString("scroll.tuning.smoothness", comment: "")),
+            ("Scroll.tuning.glide",        MFLocalizedString("scroll.tuning.glide", comment: "")),
+            ("Scroll.tuning.fast-scroll",  MFLocalizedString("scroll.tuning.fast-scroll", comment: "")),
+        ]
+        /// The config keys are camelCase; only the *string* key is kebab-case.
+        let configKeys = ["Scroll.tuning.sensitivity", "Scroll.tuning.acceleration",
+                          "Scroll.tuning.smoothness", "Scroll.tuning.glide", "Scroll.tuning.fastScroll"]
+
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 6
+        /// Hug vertically, or masterStack (distribution=fill) stretches this and the 99999 tab-measuring probe in
+        /// TabViewController.resizeWindowToFit() reports a nonsense height. Same trap as the General tab.
+        section.setHuggingPriority(.required, for: .vertical)
+        section.setContentHuggingPriority(.required, for: .vertical)
+
+        for (i, spec) in specs.enumerated() {
+
+            let label = NSTextField(labelWithString: spec.title)
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 90).isActive = true
+
+            let value = (config(configKeys[i]) as? NSNumber)?.doubleValue ?? (configKeys[i].hasSuffix("fastScroll") ? 0.0 : 0.5)
+
+            let readout = NSTextField(labelWithString: String(format: "%.2f", value))
+            readout.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+            readout.textColor = .secondaryLabelColor
+            readout.alignment = .left
+            readout.widthAnchor.constraint(equalToConstant: 30).isActive = true
+
+            let slider = NSSlider(value: value, minValue: 0, maxValue: 1,
+                                  target: self, action: #selector(tuningSliderChanged(_:)))
+            /// Fire on mouse-up only. Continuous would call commitConfig() — a config file write plus an IPC message
+            /// to the Helper — on every pixel of the drag.
+            slider.isContinuous = false
+            slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
+            slider.setAccessibilityIdentifier("axTuning_" + configKeys[i])
+
+            tuningSliders[slider] = (keyPath: configKeys[i], readout: readout)
+
+            let row = NSStackView(views: [label, slider, readout])
+            row.orientation = .horizontal
+            row.spacing = 6
+            row.setHuggingPriority(.required, for: .vertical)
+            row.setContentHuggingPriority(.required, for: .vertical)
+            section.addArrangedSubview(row)
+        }
+
+        masterStack.insertArrangedSubview(section, at: 0)
+    }
+
+    @objc private func tuningSliderChanged(_ sender: NSSlider) {
+        guard let entry = tuningSliders[sender] else { assert(false); return }
+        entry.readout.stringValue = String(format: "%.2f", sender.doubleValue)
+        setConfig(entry.keyPath, NSNumber(value: sender.doubleValue))
+        commitConfig() /// -> writes the file and messages the Helper, which reloads ScrollConfig. Live, no restart.
+    }
+
     /// Init
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
         
@@ -110,6 +198,39 @@ class ScrollTabController: NSViewController {
         /// Natural direction
         reverseDirection.bindingTarget <~ reverseDirectionToggle.reactive.boolValues
         reverseDirectionToggle.reactive.boolValue <~ reverseDirection.producer
+
+        /// Fork: tuning sliders (replaces the Smoothness / Speed pickers)
+        addTuningSliders()
+
+        /// Fork: Invert zoom
+        ///     Added in code rather than IB, like the other fork additions. `reverseDirectionToggle` is itself a
+        ///     direct arranged subview of masterStack (a plain checkbox), so we mirror it and slot in right below.
+        do {
+            let toggle = NSButton(checkboxWithTitle: MFLocalizedString("scroll.invert-zoom", comment: ""),
+                                  target: nil, action: nil)
+            toggle.toolTip = MFLocalizedString("scroll.invert-zoom.hint", comment: "")
+            toggle.setAccessibilityIdentifier("axInvertZoomToggle")
+
+            /// Mirror the Reverse Direction toggle's vertical hugging (750 in IB).
+            ///     masterStack is `distribution = fill`, so a subview with the default (250) hugging gets stretched
+            ///     — and since TabViewController measures tabs by growing the window to 99999x99999
+            ///     (TabViewController.swift:551), that would blow the tab's measured height up to 99999.
+            toggle.setContentHuggingPriority(.init(750), for: .vertical)
+
+            /// Insert directly below Reverse Direction.
+            ///     Index is read back via masterStack.arrangedSubviews, which CollapsingStackView overrides to
+            ///     unwrap its NoClipWrappers (Collapse.swift:140). That's safe here: wrappers replace their view
+            ///     in place, so the unwrapped list stays the same length and order as the real one.
+            if let i = masterStack.arrangedSubviews.firstIndex(of: reverseDirectionToggle) {
+                masterStack.insertArrangedSubview(toggle, at: i + 1)
+            } else {
+                assert(false, "ScrollTab layout changed: reverseDirectionToggle is not in masterStack.")
+                masterStack.addArrangedSubview(toggle)
+            }
+
+            invertZoom.bindingTarget <~ toggle.reactive.boolValues
+            toggle.reactive.boolValue <~ invertZoom.producer
+        }
         
         /// Scroll speed
         scrollSpeed.bindingTarget <~ speedPicker.reactive.selectedIdentifiers.map({ identifier in

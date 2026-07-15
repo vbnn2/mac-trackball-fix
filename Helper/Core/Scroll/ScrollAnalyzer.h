@@ -23,7 +23,13 @@ typedef struct {
     double consecutiveScrollSwipeCounter;
     BOOL scrollDirectionDidChange;
     CFTimeInterval timeBetweenTicks;
-    
+
+    double unitsPerTick;
+    /// ^ Fork: the scroll units this tick carried, smoothed over the *same* rolling window as `timeBetweenTicks`.
+    ///     Use this — not the raw per-event unit count — to compute velocity. `timeBetweenTicks` is a 3-tick rolling
+    ///     average, so dividing an instantaneous unit count by it mixes two different time bases and reads
+    ///     erratically exactly when units and interval change at different rates (i.e. a decelerating spin).
+
     CFTimeInterval DEBUG_timeBetweenTicksRaw;
     /// ^ Unsmoothed time between ticks. For debugging, don't use this.
     int64_t DEBUG_consecutiveScrollSwipeCounterRaw;
@@ -34,7 +40,7 @@ typedef struct {
 
 + (BOOL)peekIsFirstConsecutiveTickWithTickOccuringAt:(CFTimeInterval)thisScrollTickTimeStamp direction:(MFDirection)direction config:(ScrollConfig *)scrollConfig;
 
-+ (ScrollAnalysisResult)updateWithTickOccuringAt:(CFTimeInterval)thisScrollTickTimeStamp direction:(MFDirection)direction config:(ScrollConfig *)scrollConfig;
++ (ScrollAnalysisResult)updateWithTickOccuringAt:(CFTimeInterval)thisScrollTickTimeStamp direction:(MFDirection)direction units:(int64_t)units config:(ScrollConfig *)scrollConfig;
 
 + (void)resetState;
 

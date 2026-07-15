@@ -59,6 +59,10 @@ static MFScrollModificationResult _modifications;
 static ScrollConfig *_scrollConfig;
 static MFScrollAnimationCurveParameters *_animationParams;
 static ScrollAnalysisResult _lastScrollAnalysisResult;
+
+/// Fork: state for the trailing-detent suppression in heavyProcessing(). Both are only touched from `_scrollQueue`.
+static CFTimeInterval _lastProcessedTickTime = 0;
+static double _lastProcessedVelocity = 0; /// units/s of the last tick we actually scrolled
 static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
 //static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
@@ -217,8 +221,27 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     int64_t scrollPhase      = CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase);
     int64_t scrollDeltaAxis1 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1);
     int64_t scrollDeltaAxis2 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2);
+    int64_t lineDeltaAxis1   = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+    int64_t lineDeltaAxis2   = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+    /// ^ The *line* deltas, as opposed to the point deltas above. See `unitsForThisTick` in heavyProcessing() for
+    ///     why we carry both: point delta is already accelerated by macOS and is not a usable unit count.
     int64_t drawingTabletID  = CGEventGetIntegerValueField(event, kCGTabletEventDeviceID);
     bool isDiagonal = scrollDeltaAxis1 != 0 && scrollDeltaAxis2 != 0;
+
+    /// TEMP INSTRUMENTATION [PLAN.md, Feature 1 / Step 1.1] — remove once the units/s question is settled.
+    ///     Logged *before* the early-out below so that passed-through (diagonal / continuous) events show up too.
+    ///     Scalars only: os_log makes scalar args public, so this stays readable without `log config private_data:on`.
+    DDLogInfo("MFDELTA: cont=%lld phase=%lld line=(%lld,%lld) point=(%lld,%lld) fixed=(%.3f,%.3f) diag=%d",
+              isPixelBased,
+              scrollPhase,
+              lineDeltaAxis1,
+              lineDeltaAxis2,
+              scrollDeltaAxis1,
+              scrollDeltaAxis2,
+              CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1),
+              CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2),
+              (int)isDiagonal);
+
     if (isPixelBased != 0
         || scrollPhase != 0 /// Not entirely sure if testing for 'scrollPhase' here makes sense
         || drawingTabletID != 0 /// Untested
@@ -243,7 +266,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     ///  Executing heavy stuff on a different thread to prevent the eventTap from timing out. We wrote this before knowing that you can just re-enable the eventTap when it times out. But this doesn't hurt.
     
     dispatch_async(_scrollQueue, ^{
-        heavyProcessing(eventCopy, scrollDeltaAxis1, scrollDeltaAxis2, tickTime);
+        heavyProcessing(eventCopy, scrollDeltaAxis1, scrollDeltaAxis2, lineDeltaAxis1, lineDeltaAxis2, tickTime);
     });
     
     return NULL;
@@ -251,7 +274,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 #pragma mark - Main event processing
 
-static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t scrollDeltaAxis2, CFTimeInterval tickTS) {
+static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t scrollDeltaAxis2, int64_t lineDeltaAxis1, int64_t lineDeltaAxis2, CFTimeInterval tickTS) {
     
     /// Declare stuff for later
     static DriverUnsuspender unsuspendDrivers = ^{}; /// This is old stuff that should be removed I think [Jun 2 2025]
@@ -296,11 +319,14 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     /// Get scrollDelta
     
     int64_t scrollDelta = 0;
-    
+    int64_t lineDelta = 0;
+
     if (inputAxis == kMFAxisVertical) {
         scrollDelta = scrollDeltaAxis1;
+        lineDelta = lineDeltaAxis1;
     } else if (inputAxis == kMFAxisHorizontal) {
         scrollDelta = scrollDeltaAxis2;
+        lineDelta = lineDeltaAxis2;
     } else {
         NSCAssert(NO, @"Invalid scroll axis");
     }
@@ -376,6 +402,16 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         
         /// Update modfications
         MFScrollModificationResult newMods = [ScrollModifiers currentModificationsWithEvent:event];
+
+        /// Fork: while Scroll & Zoom Mode is latched, the ring zooms with no modifier held.
+        ///     Forced here rather than in ScrollModifiers so it beats whatever the keyboard says: the whole point of
+        ///     the mode is that you don't have to hold anything. Note this deliberately overrides any *effect*
+        ///     modification (horizontal scroll, rotate, ...) but leaves input modifications (precise/quick) alone,
+        ///     so Option-to-be-precise still works while zooming.
+        if (HelperState.shared.scrollAndZoomModeIsActive) {
+            newMods.effectMod = kMFScrollEffectModificationZoom;
+        }
+
         if (![ScrollModifiers scrollModsAreEqual:newMods other:_modifications]) {
             resetState_Unsafe();
             _modifications = newMods;
@@ -396,8 +432,66 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     
     scrollDirection = [ScrollUtility directionForInputAxis:inputAxis inputDelta:scrollDelta invertSetting:_scrollConfig.u_invertDirection horizontalModifier:(_modifications.effectMod == kMFScrollEffectModificationHorizontalScroll)]; /// Why do we need to get the scrollDirection again? We already calculated it during the "preliminary scrollAnalysis". Can it ever change betweent he 2 times we calculate it?
     
+    /// Fork: drop a lone trailing detent.
+    ///
+    /// The problem (measured [Jul 15 2026], see PLAN.md):
+    ///     A free-spinning ring emits one last 1-unit tick as it settles, a few hundred ms after the spin is over.
+    ///     Because that lands past `consecutiveScrollTickIntervalMax` (160ms), it counts as a brand-new scroll: the
+    ///     real gap is thrown away, `dt` is forced to 160ms, and the tick gets a full fresh animation. Observed:
+    ///     a spin ended, then 267ms later a lone `line=1` produced a discrete 73px scroll with its own 211ms
+    ///     animation. That's the "pause, then it scrolls a bit more" — and when the ring settles *backwards*, the
+    ///     same tick scrolls the other way, which is the "it scrolls up a bit after I stop".
+    ///
+    /// Why it has to be a timing heuristic:
+    ///     A settling detent and a deliberate one-notch nudge are byte-identical events (`line=1 point=1`). Only
+    ///     the context differs — a settling tick closely follows a *fast* scroll.
+    ///
+    /// Kept deliberately narrow:
+    ///     - only a lone <=1-unit tick (a real scroll gathers magnitude immediately)
+    ///     - only when the previous scroll was genuinely fast
+    ///     - only inside a short window after it
+    ///     - `_lastProcessedTickTime` is NOT updated when we suppress, so the *next* tick measures its gap from the
+    ///       real scroll and won't be suppressed. That bounds the damage: if you do deliberately nudge one notch
+    ///       right after a spin, you lose that one notch, never the scroll that follows.
+    ///     - It runs before ScrollAnalyzer.update so a suppressed tick doesn't disturb the analyzer's state.
+    {
+        static const CFTimeInterval kTrailingDetentMinGap = 0.160; /// The scroll had visibly paused
+        static const CFTimeInterval kTrailingDetentWindow = 0.400; /// Observed at 260-267ms
+        static const double kTrailingDetentDecelRatio = 4.0;
+
+        CFTimeInterval gapSinceLastProcessed = tickTS - _lastProcessedTickTime;
+
+        BOOL isLoneUnit  = llabs(lineDelta) <= 1;
+        BOOL didPause    = gapSinceLastProcessed > kTrailingDetentMinGap;
+        BOOL isSoonAfter = gapSinceLastProcessed < kTrailingDetentWindow;
+
+        /// Did the ring *abruptly decelerate* into this tick?
+        ///     This replaces an earlier sentinel test that keyed off `consecutiveScrollTickIntervalMax`. That worked
+        ///     only because the old 160ms window forced every isolated tick to report exactly 6.25 units/s — and
+        ///     raising the window to `trackballSlowScrollWindow` (so slow scrolling gets its real velocity back)
+        ///     destroys that signal. Deceleration is the more honest question anyway.
+        ///
+        ///     Measured [Jul 15 2026]:
+        ///       - trailing detent after a fast spin:  66.7 -> 3.7 units/s  (18x)
+        ///       - trailing detent after a slow spin:  17.4 -> 3.8 units/s  (4.6x)
+        ///       - a tick of deliberate slow scrolling: ~4 -> ~4 units/s    (1x)  <- must never be suppressed
+        ///     So a 4x drop separates "the ring settled after moving" from "this is just how you're scrolling".
+        double thisVelocity = 1.0 / gapSinceLastProcessed; /// isLoneUnit, so units == 1
+        BOOL decelerated = _lastProcessedVelocity > (thisVelocity * kTrailingDetentDecelRatio);
+
+        if (isLoneUnit && didPause && isSoonAfter && decelerated) {
+            DDLogDebug("Scroll.m: dropping trailing detent (gap: %.0fms, %.1f -> %.1f units/s, %.1fx decel)",
+                       gapSinceLastProcessed * 1000, _lastProcessedVelocity, thisVelocity,
+                       _lastProcessedVelocity / thisVelocity);
+            return;
+        }
+    }
+
     /// Run full scrollAnalysis
-    ScrollAnalysisResult scrollAnalysisResult = [ScrollAnalyzer updateWithTickOccuringAt:tickTS direction:scrollDirection config:_scrollConfig];
+    ScrollAnalysisResult scrollAnalysisResult = [ScrollAnalyzer updateWithTickOccuringAt:tickTS direction:scrollDirection units:llabs(lineDelta) config:_scrollConfig];
+
+    /// Fork: remember this tick for the trailing-detent check above. Only reached by ticks we actually process.
+    _lastProcessedTickTime = tickTS;
 
     
     /// Store scrollAnalysisResult
@@ -410,6 +504,29 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     
     /// Make scrollDelta positive, now that we have scrollDirection stored
     scrollDelta = llabs(scrollDelta);
+
+    /// Get the unit count this event carries.
+    ///
+    /// Why this exists [Jul 2026]:
+    ///     `ScrollAnalyzer` models input as a notched wheel: one event == one detent, and the only signal is how
+    ///     fast detents arrive. That's wrong for a free-spinning ring like the TB800, which reports multi-unit
+    ///     deltas. Measured over 346 real events (see PLAN.md): |line| ranges 1...9, and only 35 of 260 vertical
+    ///     events were |line| == 1 — the mode is 9. Report rate and magnitude climb *together*, so the curve's
+    ///     input (1/timeBetweenTicks) spans only ~10x (6.2 -> 66.7 Hz) while true scroll velocity
+    ///     (rate * |line|) spans ~97x. Everything past that 10x was being thrown away.
+    ///
+    /// Why the LINE delta and not `scrollDelta`:
+    ///     `scrollDelta` is the *point* delta, which macOS has already accelerated — a single |line| == 1 report
+    ///     was measured yielding point deltas of 1, 3, 8 and 13 depending on spin speed. Scaling by it would
+    ///     compound macOS's acceleration with our own curve *and* the device magnitude. The line delta is the
+    ///     closest available proxy for the device's own unit count.
+    ///     (Caveat: we can't tell from CGEvent alone whether the line delta is raw HID counts or is itself lightly
+    ///     accelerated by IOHIDFamily. Confirming that needs an HID-level read.)
+    ///
+    /// Notched mice are unaffected: they report +-1 per detent, so this is a no-op factor of 1 for them.
+    /// The MAX() guards the case where a point delta arrives with a zero line delta (not observed, but it would
+    /// otherwise zero out the scroll).
+    int64_t unitsForThisTick = MAX(1, llabs(lineDelta));
     
     /// Return if suspended (so we dont' send any events)
 //    if (_isSuspended) {
@@ -450,17 +567,54 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// - I'm not totally sure if this is optimal for the UX, also code is a bit messy.
         timeBetweenTicks = CLIPLOW(timeBetweenTicks, _scrollConfig.consecutiveScrollTickInterval_AccelerationEnd);
         
-        /// Get speed
-        double scrollSpeed = 1/timeBetweenTicks; /// In tick/s
+        /// Get the TRUE scroll velocity, in units/s.
+        ///     Not `1/timeBetweenTicks` (events/s), which is what upstream used. That's only equal to velocity for a
+        ///     notched wheel, where every event carries exactly 1 unit. On the TB800, rate and magnitude climb
+        ///     together, so events/s spans ~10x (6 -> 67 Hz) while real velocity spans ~110x (5 -> 562 units/s).
+        /// Use the SMOOTHED unit count, not this event's raw one.
+        ///     `timeBetweenTicks` is a 3-tick rolling average (ScrollAnalyzer.m:251). Dividing a raw per-event unit
+        ///     count by it mixes time bases and makes velocity jump around during a decelerating spin. ScrollAnalyzer
+        ///     now averages units over the identical window and resets both smoothers together.
+        double smoothedUnits = MAX(1.0, scrollAnalysisResult.unitsPerTick);
+        double scrollSpeed = smoothedUnits / timeBetweenTicks; /// In units/s
 
-        /// Evaluate acceleration curve
-        Curve *accelerationCurve = _scrollConfig.accelerationCurve;
-        assert(accelerationCurve != nil);
-        double pxForThisTickDouble = [accelerationCurve evaluateAt:scrollSpeed]; /// In px/s
+        /// Fork: feed the trailing-detent check above. Recorded here rather than at the top of heavyProcessing so
+        /// it's the velocity we actually acted on.
+        _lastProcessedVelocity = scrollSpeed;
+
+        /// Apply the tuning model.
+        ///     pxPerUnit(v) = pxAtUnitSpeed * v^(gamma-1)   ->   px/s = pxAtUnitSpeed * v^gamma
+        ///
+        ///     gamma == 1 gives output exactly proportional to input velocity. gamma < 1 compresses the input's
+        ///     ~110x velocity range into a smaller output range; gamma > 1 genuinely accelerates. Both knobs come
+        ///     from the sliders in the Scrolling tab — see ScrollConfig.pxAtUnitSpeed / .gamma.
+        ///
+        ///     Why this replaces `accelerationCurve`: that curve is defined over an events/s domain and its output
+        ///     was px-per-event. Feeding it real velocity would silently invalidate its tuning, and multiplying its
+        ///     output by the unit count (what we did first) stacks a third multiplier on top of it and fastScroll —
+        ///     measured at ~100k px/s on a fast spin. This model has one meaning for "speed" and one for "distance".
+        double pxPerUnit = _scrollConfig.pxAtRefSpeed * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma - 1.0);
+        double pxForThisTickDouble = pxPerUnit * unitsForThisTick;
+
+        /// Cap the output.
+        ///     ScrollAnalyzer.m:45 documents that the input "sometimes randomly" delivers extremely small
+        ///     timeSinceLastTick values, which "overdrive the acceleration curve, producing extremely high
+        ///     pxToScrollForThisTick values at random" — and says the reason that stopped being noticable is that
+        ///     upstream *capped the acceleration curve's maximum output*. Our pow() model has no such ceiling, so a
+        ///     random short gap spikes the scroll and the next normal tick drops it back — which is exactly the
+        ///     intermittent "speeds up, then suddenly drops" symptom. Restore the safety net upstream relied on.
+        double maxPxPerTick = _scrollConfig.pxAtRefSpeed * 12.0;
+        if (pxForThisTickDouble > maxPxPerTick) {
+            DDLogDebug("Scroll.m: capping px %.0f -> %.0f (v=%.0f units/s)", pxForThisTickDouble, maxPxPerTick, scrollSpeed);
+            pxForThisTickDouble = maxPxPerTick;
+        }
+
         pxToScrollForThisTick = pxForThisTickDouble; /// We could use a SubPixelator balance out the rounding errors, but I don't think that'll be noticable
-        
+
         /// Debug
-        DDLogDebug("Scroll.m: Acceleration curve f(%f) = %lld", scrollSpeed, pxToScrollForThisTick);
+        DDLogDebug("Scroll.m: tuning v=%.1f units/s (units: %lld, dt: %.3f) -> pxPerUnit=%.1f -> px=%lld [ref=%.0f pxAtRef=%.0f gamma=%.2f]",
+                   scrollSpeed, unitsForThisTick, timeBetweenTicks, pxPerUnit, pxToScrollForThisTick,
+                   _scrollConfig.refSpeed, _scrollConfig.pxAtRefSpeed, _scrollConfig.gamma);
         
         /// Validate
         if (pxToScrollForThisTick <= 0) {
@@ -617,7 +771,12 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 Curve *baseTimeCurve    = pCurve.baseMsPerStepCurve;
                 double baseTimeStart    = [baseTimeCurve evaluateAt:0.0]; /// The non-sped-up/maximum duration for the baseCurve
                 double baseTimeEnd      = [baseTimeCurve evaluateAt:1.0];
-                double tickStart        = _scrollConfig.consecutiveScrollTickIntervalMax;
+                double tickStart        = _scrollConfig.animationTickStart;
+                /// ^ Fork: was `consecutiveScrollTickIntervalMax`. Those two were the same constant (160ms) but mean
+                ///     different things, and we've since raised the max to ~500ms so a slow ring counts as one
+                ///     continuous scroll. Left coupled, that would re-anchor this curve: a 260ms tick would sample
+                ///     mid-curve and get a *shorter* animation (~415ms -> ~172ms) exactly when it needs a longer one.
+                ///     `animationTickStart` keeps the duration mapping where upstream tuned it.
                 double tickEnd          = _scrollConfig.consecutiveScrollTickIntervalMin;
                 double tick             = scrollAnalysisResult.timeBetweenTicks;
                 
@@ -1148,7 +1307,15 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         /// --- Zoom ---
         
         double eventDelta = (dx + dy)/800.0; /// This works because, if dx != 0 -> dy == 0, and the other way around.
-        
+
+        /// Invert zoom
+        ///     Must happen here — *before* the Chromium hack below. That hack adds asymmetric, sign-dependent
+        ///     offsets (+380/800 vs -250/800), so negating after it would apply the wrong branch's correction and
+        ///     make zooming lopsided in Chromium browsers.
+        if (config.u_invertZoom) {
+            eventDelta = -eventDelta;
+        }
+
         /// HACK:
         ///     Chromium browsers need a ton of zooming deltas before they actually start zooming. So we send a bunch of deltas right away to make things more responsive.
         ///     Another way to combat this would be to only send the `end` event when the user releases the modifier.

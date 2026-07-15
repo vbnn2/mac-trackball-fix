@@ -181,6 +181,26 @@ static NSArray *getOneShotEffectsTable(NSDictionary *rowDict) {
               kMFActionDictKeyMouseButtonClicksVariantNumberOfClicks: @1,
             }
         },
+        @{
+            @"ui": MFLocalizedString(@"effect.scroll-zoom-mode", @""),
+            @"tool": MFLocalizedString(@"effect.scroll-zoom-mode.hint", @""),
+            @"dict": @{
+              kMFActionDictKeyType: kMFActionDictTypeToggleScrollAndZoomMode,
+            }
+        },
+        @{
+            @"ui": MFLocalizedString(@"effect.click.primary.shift", @""),
+            @"tool": MFLocalizedString(@"effect.click.primary.shift.hint", @""),
+            /// Deliberately NOT "hideable": that flag makes an entry an ⌥-alternate (see menuItemFromDataModel:),
+            /// i.e. invisible unless Option is held — which is how the plain click actions above are tucked away.
+            /// This is a headline feature of the fork, so it stays visible in the normal list.
+            @"dict": @{
+              kMFActionDictKeyType: kMFActionDictTypeMouseButtonClicks,
+              kMFActionDictKeyMouseButtonClicksVariantButtonNumber: @1,
+              kMFActionDictKeyMouseButtonClicksVariantNumberOfClicks: @1,
+              kMFActionDictKeyMouseButtonClicksVariantModifierFlags: @(kCGEventFlagMaskShift),
+            }
+        },
         @{@"ui": MFLocalizedString(@"effect.click.secondary", @""),
           @"tool": MFLocalizedString(@"effect.click.secondary.hint", @""),
           @"hideable": @YES,

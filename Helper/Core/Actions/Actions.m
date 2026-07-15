@@ -22,6 +22,7 @@
 #import "CGSHotKeys.h"
 */
 #import "SymbolicHotKeys.h"
+#import "Mac_Mouse_Fix_Helper-Swift.h" /// For HelperState (Scroll & Zoom Mode)
 #import <Carbon/Carbon.h>
 
 @implementation Actions
@@ -168,8 +169,14 @@
             
             NSNumber *button = actionDict[kMFActionDictKeyMouseButtonClicksVariantButtonNumber];
             NSNumber *nOfClicks = actionDict[kMFActionDictKeyMouseButtonClicksVariantNumberOfClicks];
-            [ModificationUtility postMouseButtonClicks:button.intValue nOfClicks:nOfClicks.intValue];
+            NSNumber *flags = actionDict[kMFActionDictKeyMouseButtonClicksVariantModifierFlags]; /// Optional -> nil gives 0
+            [ModificationUtility postMouseButtonClicks:button.intValue nOfClicks:nOfClicks.intValue modifierFlags:flags.unsignedLongLongValue];
         
+        } else if ([actionType isEqualToString:kMFActionDictTypeToggleScrollAndZoomMode]) {
+
+            /// Fork: latch/unlatch Scroll & Zoom Mode. All the actual work is in HelperState.
+            [HelperState.shared toggleScrollAndZoomMode];
+
         } else if ([actionType isEqualToString:kMFActionDictTypeAddModeFeedback]) {
             NSMutableDictionary *payload = ((NSMutableDictionary *)actionDict.mutableCopy);
             [payload removeObjectForKey:kMFActionDictKeyType];

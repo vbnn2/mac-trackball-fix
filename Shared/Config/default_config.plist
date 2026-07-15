@@ -15,8 +15,23 @@
 			<key>zoom</key>
 			<integer>1048576</integer>
 		</dict>
+		<key>invertZoom</key>
+		<false/>
 		<key>reverseDirection</key>
 		<true/>
+		<key>tuning</key>
+		<dict>
+			<key>sensitivity</key>
+			<real>0.5</real>
+			<key>acceleration</key>
+			<real>0.5</real>
+			<key>smoothness</key>
+			<real>0.5</real>
+			<key>fastScroll</key>
+			<real>0.0</real>
+			<key>glide</key>
+			<real>0.5</real>
+		</dict>
 		<key>trackpadSimulation</key>
 		<true/>
 		<key>precise</key>

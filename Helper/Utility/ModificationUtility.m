@@ -152,19 +152,31 @@ BOOL directionChanged(MFDirection direction1, MFDirection direction2) {
 #pragma mark - Button clicks
 
 + (void)postMouseButtonClicks:(MFMouseButtonNumber)button nOfClicks:(int64_t)nOfClicks {
-    
-    DDLogDebug("Posting %lld mouse button %u clicks", nOfClicks, button);
-    
+    [self postMouseButtonClicks:button nOfClicks:nOfClicks modifierFlags:0];
+}
++ (void)postMouseButtonClicks:(MFMouseButtonNumber)button nOfClicks:(int64_t)nOfClicks modifierFlags:(CGEventFlags)modifierFlags {
+
+    DDLogDebug("Posting %lld mouse button %u clicks with flags %llu", nOfClicks, button, modifierFlags);
+
     CGEventTapLocation tapLoc = kCGSessionEventTap;
-    
+
     CGPoint mouseLoc = getPointerLocation();
     CGEventType eventTypeDown = [SharedUtility CGEventTypeForButtonNumber:button isMouseDown:YES];
     CGEventType eventTypeUp = [SharedUtility CGEventTypeForButtonNumber:button isMouseDown:NO];
     CGMouseButton buttonCG = [SharedUtility CGMouseButtonFromMFMouseButtonNumber:button];
-    
+
     CGEventRef buttonDown = CGEventCreateMouseEvent(NULL, eventTypeDown, mouseLoc, buttonCG);
     CGEventRef buttonUp = CGEventCreateMouseEvent(NULL, eventTypeUp, mouseLoc, buttonCG);
-    
+
+    /// Apply modifier flags
+    ///     Note: Only set flags when non-zero. CGEventCreateMouseEvent() already populates the event's flags with the
+    ///     *currently held* physical modifiers, and unconditionally calling CGEventSetFlags(…, 0) would clear those —
+    ///     silently breaking a plain remapped click performed while the user happens to be holding a modifier.
+    if (modifierFlags != 0) {
+        CGEventSetFlags(buttonDown, modifierFlags);
+        CGEventSetFlags(buttonUp, modifierFlags);
+    }
+
     int clickLevel = 1;
     while (clickLevel <= nOfClicks) {
         

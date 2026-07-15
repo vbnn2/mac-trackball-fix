@@ -41,6 +41,7 @@
         /// Setup smoothing algorithm for `timeBetweenTicks`
         
         _tickTimeSmoother = [[RollingAverage alloc] initWithCapacity: 3]; /// Capacity 1 turns off smoothing
+        _unitsSmoother = [[RollingAverage alloc] initWithCapacity: 3]; /// Fork: keep the capacity identical to _tickTimeSmoother
         /// ^ No smoothing feels the best.
         ///     - Without smoothing, there will somemtimes randomly be extremely small `timeSinceLastTick` values. I was worried that these would overdrive the acceleration curve, producing extremely high `pxToScrollForThisTick` values at random. But since we've capped the acceleration curve to a maximum `pxToScrollForThisTick` this isn't a noticable issue anymore.
         ///     - No smoothing is way more responsive than RollingAverage
@@ -59,6 +60,10 @@
 /// Constant
 
 static NSObject<Smoother> *_tickTimeSmoother;
+static NSObject<Smoother> *_unitsSmoother;
+/// ^ Fork: smooths the per-tick unit count over the same window as `_tickTimeSmoother`, and is reset in lockstep
+///     with it. Velocity is `units/second`, so both halves of that fraction have to come from the same time base —
+///     otherwise a spin whose magnitude and interval change at different rates produces an erratic velocity.
 
 /// Dynamic
 
@@ -113,7 +118,7 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
 }
 
 /// This is the main input function which should be called on each scrollwheel tick event
-+ (ScrollAnalysisResult)updateWithTickOccuringAt:(CFTimeInterval)thisScrollTickTimeStamp direction:(MFDirection)direction config:(ScrollConfig *)scrollConfig {
++ (ScrollAnalysisResult)updateWithTickOccuringAt:(CFTimeInterval)thisScrollTickTimeStamp direction:(MFDirection)direction units:(int64_t)units config:(ScrollConfig *)scrollConfig {
     
     /// Update scrollDirectionDidChange
     ///     Checks whether the scrolling direction is different from when this function was last called.
@@ -218,6 +223,7 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         
         /// Reset smoother:
         [_tickTimeSmoother reset];
+        [_unitsSmoother reset]; /// Fork: reset in lockstep, or a new scroll inherits the previous one's magnitudes
         
         /// Initialize smoother with tickMax
         /// Notes:
@@ -245,6 +251,11 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         assert(secondsSinceLastTick <= scrollConfig.consecutiveScrollTickIntervalMax);
         smoothedTimeBetweenTicks = [_tickTimeSmoother smoothWithValue:secondsSinceLastTick];
     }
+
+    /// Fork: smooth the unit count on the same window.
+    ///     Fed unconditionally (unlike the tickTime above, which has a first-tick special case) because a unit count
+    ///     is always a real measurement — there's no "no previous tick" problem for it.
+    double smoothedUnits = [_unitsSmoother smoothWithValue:(double)MAX(1, units)];
     
     /// Update `_previousScrollTickTimeStamp` for next call
     ///     This needs to be executed after `updateConsecutiveScrollSwipeCounterWithSwipeOccuringNow()`, because that function uses `_previousScrollTickTimeStamp`
@@ -259,6 +270,7 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         .consecutiveScrollSwipeCounter = _consecutiveScrollSwipeCounter_ForFreeScrollWheel,
         .scrollDirectionDidChange = scrollDirectionDidChange,
         .timeBetweenTicks = smoothedTimeBetweenTicks,
+        .unitsPerTick = smoothedUnits,
         .DEBUG_timeBetweenTicksRaw = secondsSinceLastTick, /// Unsmoothed timeBetweenTicks
         .DEBUG_consecutiveScrollSwipeCounterRaw = _consecutiveScrollSwipeCounter,
     };

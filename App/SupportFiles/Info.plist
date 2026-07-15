@@ -26,7 +26,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.nuebling.mac-mouse-fix</string>
+			<string>com.pixeption.mac-mouse-fix</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>macmousefix</string>

@@ -27,6 +27,9 @@ import Cocoa
     
     /// Init
     private static var isInitialized = false
+
+    /// Fork: the button whose mouseUp we still owe a swallow, after its mouseDown exited Scroll & Zoom Mode.
+    private static var swallowUpForButton: NSNumber? = nil
     private static func coolInitialize() {
         isInitialized = true
         clickCycle = ClickCycle(buttonQueue: queue)
@@ -37,9 +40,31 @@ import Cocoa
     @objc static func handleInput(device: Device, button: NSNumber, downNotUp mouseDown: Bool, event: CGEvent) -> MFEventPassThroughEvaluation {
         
         let passThroughEvaluation = kMFEventPassThroughRefusal
-        
+
             /// Init
         if !isInitialized { coolInitialize() }
+
+        /// Fork: any button click exits Scroll & Zoom Mode.
+        ///     Placed above the `maxClickLevel == 0` early-return below, so that buttons with no remap assigned exit
+        ///     the mode too — "click any button" has to mean any button.
+        ///     We swallow the click that exits (refusing passthrough and returning before the clickCycle) so it only
+        ///     leaves the mode rather than also firing whatever that button normally does. That also makes the
+        ///     toggle button itself behave as "press again to go back", without needing to special-case it.
+        ///
+        ///     Note this only ever sees buttons 3+: ButtonInputReceiver's tap mask is OtherMouseDown|OtherMouseUp
+        ///     (ButtonInputReceiver.m:59). MB1/MB2 are handled by HelperState's own exit tap.
+        if HelperState.shared.scrollAndZoomModeIsActive, mouseDown {
+            HelperState.shared.setScrollAndZoomMode(false)
+            /// Remember to swallow this button's mouseUp as well. We can't just test `scrollAndZoomModeIsActive` on
+            /// the up, because the line above has already turned it off — which would let the up through and leave
+            /// the app with a mouseUp that has no matching mouseDown.
+            swallowUpForButton = button
+            return kMFEventPassThroughRefusal
+        }
+        if !mouseDown, let pending = swallowUpForButton, pending == button {
+            swallowUpForButton = nil
+            return kMFEventPassThroughRefusal
+        }
         
         /// Get remaps
         /// Accessing the dict like this is super slow. Casting to NSDictionary and using NSDictionary API to access it's values might fix that. See https://stackoverflow.com/questions/57555444/accessing-object-c-nsdictionary-values-in-swift-is-slow

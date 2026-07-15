@@ -42,13 +42,154 @@ class GeneralTabController: NSViewController {
     @IBOutlet weak var updatesHint: NSTextField!
     @IBOutlet weak var menuBarHint: NSTextField!
     
+    /// Fork: config export / import
+
+    private func addConfigRow() {
+
+        /// Append an "Export… / Import…" button row to the bottom of the masterStack.
+        ///     Notes:
+        ///     - Added in code rather than in IB, like the NSSwitch swap below. Keeps the storyboard diff at zero.
+        ///     - Appended to `masterStack`, NOT to `mainHidableSection`: that section is bound to
+        ///       `EnabledState` (`mainHidableSection.reactive.isCollapsed <~ EnabledState.shared.producer.negate()`)
+        ///       and collapses when MMF is disabled. Export/import should stay reachable when the app is off.
+        ///     - `masterStack` is a CollapsingStackView, but it doesn't override addArrangedSubview(), and we don't
+        ///       need this row to be collapsible, so a plain add is fine.
+
+        let exportButton = NSButton(title: MFLocalizedString("general.config.export", comment: ""),
+                                    target: self, action: #selector(exportConfig(_:)))
+        let importButton = NSButton(title: MFLocalizedString("general.config.import", comment: ""),
+                                    target: self, action: #selector(importConfig(_:)))
+        for b in [exportButton, importButton] {
+            b.bezelStyle = .rounded
+            b.setAccessibilityIdentifier(b === exportButton ? "axExportConfig" : "axImportConfig")
+        }
+
+        let row = NSStackView(views: [exportButton, importButton])
+        row.orientation = .horizontal
+        row.spacing = 8
+
+        /// Make the row hug its content vertically.
+        ///     Required, not cosmetic: masterStack is `distribution = fill` along its vertical axis, so an
+        ///     arranged subview with the default (250) hugging gets stretched to fill. TabViewController measures
+        ///     tab size by growing the window to 99999x99999 (TabViewController.swift:551-566), so a stretchy row
+        ///     makes the *measured* height 99999 and the window opens ~100079pt tall (observed before this fix).
+        ///     The storyboard's own 'Enable section' row sets both of these to 1000 for exactly this reason —
+        ///     we mirror it. (`setHuggingPriority` == IB's verticalStackHuggingPriority;
+        ///     `setContentHuggingPriority` == IB's verticalHuggingPriority.)
+        row.setHuggingPriority(.required, for: .vertical)
+        row.setContentHuggingPriority(.required, for: .vertical)
+
+        /// masterStack.spacing is 4 — tuned for the toggle+hint pairs above, and cramped for a detached button row.
+        /// Pad via this row's own insets rather than masterStack.setCustomSpacing(_:after:): CollapsingStackView
+        /// overrides `arrangedSubviews` to unwrap its NoClipWrappers (Collapse.swift:140), so the view we'd read
+        /// back from it may not be the real arranged subview that setCustomSpacing() requires.
+        row.edgeInsets = NSEdgeInsets(top: 14, left: 0, bottom: 0, right: 0)
+
+        masterStack.addArrangedSubview(row)
+    }
+
+    @objc private func exportConfig(_ sender: Any) {
+
+        /// Flush pending UI state to disk first, so we export what the user currently sees rather than the
+        /// last-written state. commitConfig() = writeConfigToFile + notify helper + updateDerivedStates.
+        commitConfig()
+
+        guard let window = self.view.window else { assert(false); return }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.propertyList]
+        panel.nameFieldStringValue = "mac-trackball-fix-config.plist"
+        panel.canCreateDirectories = true
+
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let destination = panel.url else { return }
+            do {
+                /// NSSavePanel already confirmed the overwrite with the user, but copyItem() won't overwrite.
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try FileManager.default.copyItem(at: Locator.configURL(), to: destination)
+            } catch {
+                DDLogError("Config export failed: \(error)")
+                self.showConfigAlert(window: window,
+                                     title: MFLocalizedString("general.config.export-failed", comment: ""),
+                                     body: error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func importConfig(_ sender: Any) {
+
+        guard let window = self.view.window else { assert(false); return }
+
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.propertyList]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let source = panel.url else { return }
+
+            /// Validate BEFORE touching the live config.
+            ///     Import overwrites the user's real settings, so a bad file must fail before we destroy anything.
+            ///     `_loadAndRepair` (Config.m:439) heals a *structurally valid* config against default_config.plist,
+            ///     but it is not a defense against arbitrary files — so we do the type check ourselves.
+            guard let data = try? Data(contentsOf: source),
+                  let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+                  let dict = plist as? [String: Any],
+                  !dict.isEmpty
+            else {
+                self.showConfigAlert(window: window,
+                                     title: MFLocalizedString("general.config.import-invalid", comment: ""),
+                                     body: source.lastPathComponent)
+                return
+            }
+
+            let configURL = Locator.configURL()
+            do {
+                /// Back up what we're about to replace.
+                let backupURL = configURL.deletingLastPathComponent().appendingPathComponent("config.backup.plist")
+                try? FileManager.default.removeItem(at: backupURL)
+                try? FileManager.default.copyItem(at: configURL, to: backupURL)
+
+                /// Replace.
+                try? FileManager.default.removeItem(at: configURL)
+                try FileManager.default.copyItem(at: source, to: configURL)
+            } catch {
+                DDLogError("Config import failed: \(error)")
+                self.showConfigAlert(window: window,
+                                     title: MFLocalizedString("general.config.import-failed", comment: ""),
+                                     body: error.localizedDescription)
+                return
+            }
+
+            /// Reload, and tell the Helper.
+            ///     Both are required. Writing the file is NOT enough on its own: the FSEventStream that used to
+            ///     auto-reload external edits is disabled (Config.m:262 is `#if 0`), so nothing would notice the
+            ///     new file and the Helper would keep applying the old remaps until it restarted.
+            Config.loadFileAndUpdateStates()
+            MFMessagePort.sendMessage("configFileChanged", withPayload: nil, waitForReply: false)
+        }
+    }
+
+    private func showConfigAlert(window: NSWindow, title: String, body: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = body
+        alert.beginSheetModal(for: window)
+    }
+
     /// Init
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        
+
         /// Determine width for this tab
         applyHardcodedTabWidth("general", self, widthControllingTextFields: [enabledHint, updatesHint, menuBarHint]);
+
+        /// Fork: config export/import buttons
+        addConfigRow()
         
         /// Replace enable checkBox with NSSwitch on newer macOS versions
         var usingSwitch = false

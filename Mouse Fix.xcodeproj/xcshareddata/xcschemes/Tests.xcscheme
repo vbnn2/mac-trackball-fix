@@ -17,6 +17,7 @@
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "4FDB94192FE743AA001E05CB"
                BuildableName = "Tests.app"
+               BlueprintName = "Tests"
                ReferencedContainer = "container:Mouse Fix.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -46,6 +47,7 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "4FDB94192FE743AA001E05CB"
             BuildableName = "Tests.app"
+            BlueprintName = "Tests"
             ReferencedContainer = "container:Mouse Fix.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -62,6 +64,7 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "4FDB94192FE743AA001E05CB"
             BuildableName = "Tests.app"
+            BlueprintName = "Tests"
             ReferencedContainer = "container:Mouse Fix.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

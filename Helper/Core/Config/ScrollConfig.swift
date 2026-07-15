@@ -262,9 +262,74 @@ import Cocoa
     
     @objc lazy var u_invertDirection: MFScrollInversion = {
         /// This can be used as a factor to invert things. kMFScrollInversionInverted is -1.
-        
+
 //        if HelperState.shared.isLockedDown { return kMFScrollInversionNonInverted }
         return c("reverseDirection") as! Bool ? kMFScrollInversionInverted : kMFScrollInversionNonInverted
+    }()
+
+    // MARK: Tuning sliders (fork)
+
+    /// Raw 0...1 slider values. Absent -> the documented default, for the same reason as `u_invertZoom` below:
+    /// `_loadAndRepair` is a configVersion migration, not a key-merger, and the Helper doesn't repair at all.
+
+    private func slider(_ key: String, _ fallback: Double) -> Double {
+        let v = (c("tuning.\(key)") as? NSNumber)?.doubleValue ?? fallback
+        return SharedUtilitySwift.clip(v, betweenLow: 0.0, high: 1.0)
+    }
+
+    @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.5) }()
+    @objc lazy var u_acceleration: Double = { slider("acceleration", 0.5) }()
+    @objc lazy var u_smoothnessAmount: Double = { slider("smoothness", 0.5) }()
+    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.0) }()
+    @objc lazy var u_glide: Double = { slider("glide", 0.5) }()
+
+    /// How long the scroll keeps gliding after your finger leaves the ring.
+    ///     The animator hands off from the base curve to a drag curve, which models `v'(t) = -a*v(t)^b`
+    ///     (DragCurve.swift). `dragExponent` (b) is 1.0 for the scrolling curves, so that's plain exponential decay:
+    ///     `v(t) = v0 * e^(-a*t)`, with a time constant of exactly `1/dragCoefficient` seconds.
+    ///     Upstream's a=23 means the speed collapses to 37% in 43ms — abrupt on a trackball, where you expect the
+    ///     ring's inertia to carry.
+    ///     0.5 == 22.5 ~= upstream. Higher = less friction = longer glide (a=5 -> a 200ms time constant).
+    @objc lazy var dragCoefficientForGlide: Double = { 40.0 - (u_glide * 35.0) }() /// 40 (abrupt) ... 5 (floaty)
+
+    /// Derived engine parameters
+    ///     The model (see Scroll.m):  pxPerUnit(v) = pxAtRefSpeed * (v/refSpeed)^(gamma - 1),  px = pxPerUnit * units
+    ///     ...so that  px/s = pxAtRefSpeed * refSpeed * (v/refSpeed)^gamma, where v is true velocity in units/s.
+    ///
+    ///     gamma is the knob that decides "is fast scrolling too fast":
+    ///       gamma = 1.0 -> output exactly proportional to input velocity (perfectly linear).
+    ///       gamma < 1.0 -> compresses the input's ~110x velocity range into less output range. This is roughly
+    ///                      what upstream's rate-only curve did by accident.
+    ///       gamma > 1.0 -> genuine acceleration; fast spins gain disproportionately.
+    ///
+    ///     Why anchor at `refSpeed` instead of at v = 1:
+    ///       It makes the two sliders orthogonal. pxPerUnit == pxAtRefSpeed at v == refSpeed for *any* gamma, so
+    ///       Sensitivity sets the overall scale and Acceleration only tilts the curve around that pivot. Anchoring
+    ///       at v = 1 instead means changing Acceleration also changes how fast slow scrolling is, which makes the
+    ///       sliders fight each other and the whole thing untunable.
+
+    /// Measured on the TB800: slow steady ~5 units/s, hard spin ~562 units/s. The geometric mean (~53) is the
+    /// natural pivot — it's the middle of the actual usable range rather than an arbitrary constant.
+    @objc let refSpeed: Double = 50.0
+
+    @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...150
+    @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...1.2
+
+    // MARK: Invert Zoom
+
+    @objc lazy var u_invertZoom: Bool = {
+        /// Inverts zoom independently of `u_invertDirection`.
+        ///     Context: zoom's direction is derived from `scrollDirection`, which already has `u_invertDirection`
+        ///     applied — so without this the two cannot be set independently.
+        ///
+        /// Why `as?` + fallback instead of `as! Bool` like the settings around it:
+        ///     This key is additive, so configs written before it exists simply don't have it. Nothing backfills it:
+        ///     `_loadAndRepair` (Config.m:439) is a configVersion *migration*, not a key-merger — when the versions
+        ///     match (both 24) it takes the `dontReplace` path and adds no keys. And the Helper doesn't repair at
+        ///     all (`loadConfigFromFile` only calls `_loadAndRepair` `#if IS_MAIN_APP`), it reads the plist raw.
+        ///     So `as! Bool` here would crash the Helper against any pre-existing config. Absent == off; the key
+        ///     appears in the user's config as soon as the toggle is flipped, and in default_config for fresh ones.
+        return (c("invertZoom") as? Bool) ?? false
     }()
     
     // MARK: Old Invert Direction
@@ -311,13 +376,36 @@ import Cocoa
     
     @objc lazy var scrollSwipeMax_inTicks: Int = 11 /// Max number of ticks that we think can occur in a single swipe naturally (if the user isn't using a free-spinning scrollwheel). (See `consecutiveScrollSwipeCounter_ForFreeScrollWheel` definition for more info)
     
+    /// Fork: how sparse a tick stream still counts as ONE continuous scroll.
+    ///
+    /// Measured [Jul 15 2026], 36 ticks of deliberate slow scrolling on the TB800:
+    ///     gaps ran 99...1127ms with a **260ms median**, and 34/35 exceeded upstream's 160ms. So *every* tick of a
+    ///     slow scroll was classified as a separate, isolated scroll. Consequences, all bad:
+    ///       - `timeBetweenTicks` is discarded and replaced by the max, so all 36 ticks reported the same velocity
+    ///         (6.25 u/s) and the same distance (86px). The ring's actual speed was thrown away entirely and the
+    ///         acceleration curve had nothing to act on.
+    ///       - `consecutiveScrollTickCounter` stays 0, so Scroll.m:715 treats every tick as a swipe-sequence start
+    ///         and zeroes `pxLeftToScroll` — hard-resetting the animator and discarding in-flight motion each time.
+    ///     Net effect: constant 86px lurches at irregular intervals -> an instantaneous rate swinging 76...859 px/s.
+    ///     That is the "slow scroll stutters".
+    ///
+    /// 160ms is right for a *notched wheel*, where a 160ms silence really does mean you stopped. A free-spinning
+    /// ring at reading speed simply emits ticks further apart than that. 500ms covers the measured median (260ms)
+    /// with headroom, while the >500ms gaps in that capture (507/509/782/878/1127ms) still read as genuine new
+    /// scrolls.
+    ///
+    /// Note this is deliberately NOT the anchor for the animation-duration curve any more — see `animationTickStart`.
+    @objc lazy var trackballSlowScrollWindow: TimeInterval = 500.0/1000.0
+
     @objc lazy var consecutiveScrollTickIntervalMax: TimeInterval = SharedUtilitySwift.eval {
-        
+
         switch animationCurve {
-        case kMFScrollAnimationCurveNameNone:            160.0/1000
-        case kMFScrollAnimationCurveNameVeryLowInertia:  /*200.0*/160.0/1000 /// Increasing this to 200 (vs the 160 we're using everywhere else) since we want the acceleration curve to kick in at lower finger-speeds [Jun 4 2025] || Update: [Jul 2025] IIRC, I decided lowering to 200 didn't make sense and 160 was already the lowest thing that feels "consecutive" at all, and what we probably want to do instead is change the shape of the acceleration curve.
-        case kMFScrollAnimationCurveNameLowInertia:      160.0/1000
-        case kMFScrollAnimationCurveNameHighInertia, kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim: 160.0/1000
+        case kMFScrollAnimationCurveNameNone:            trackballSlowScrollWindow
+        case kMFScrollAnimationCurveNameVeryLowInertia:  trackballSlowScrollWindow
+        case kMFScrollAnimationCurveNameLowInertia:      trackballSlowScrollWindow
+        case kMFScrollAnimationCurveNameHighInertia, kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim: trackballSlowScrollWindow
+        /// Leave the effect/input-modification curves alone — they're for zoom, rotate, precise & quick scroll, which
+        /// upstream tuned deliberately and which aren't what this fork is fixing.
         case kMFScrollAnimationCurveNameTouchDriver, kMFScrollAnimationCurveNameTouchDriverLinear:          160.0/1000
         case kMFScrollAnimationCurveNamePreciseScroll, kMFScrollAnimationCurveNameQuickScroll:              160.0/1000
         default: { assert(false); return -1.0 }()
@@ -335,6 +423,13 @@ import Cocoa
     ///     - Update: This is not true for my Roccat Mouse connected via USB. The tick times go down to around 5ms on that mouse. I can reproduce the 15ms minimum using my Logitech M720 connected via Bluetooth. I guess it depends on the mouse hardware or on the transport (bluetooth vs USB).
     ///         - Action: We're lowering the `consecutiveScrollTickIntervalMax` from 15 -> 1. Primarily to be able to implement the `baseMsPerStepCurve` algorithm better, but also because our assumption that the lowest possible value is 15 is not true for all mice.
     ///         **HACK**: We need to keep the  the `consecutiveScrollTickInterval_AccelerationEnd` at 15ms for now, because lowering that to 5ms would change the behaviour or the acceleration algorithm and make scrolling slower, and we don't have time to adjust the acceleration curves right now.
+
+    /// Fork: the anchor for the animation-duration curve (Scroll.m:768).
+    ///     This used to *be* `consecutiveScrollTickIntervalMax`. They were the same 160ms number but answer different
+    ///     questions — "how long an animation does a tick this slow deserve" vs "is this still the same scroll" — and
+    ///     we've raised the latter to `trackballSlowScrollWindow`. Keeping this at 160ms preserves upstream's tuned
+    ///     mapping: a tick at or beyond 160ms samples the curve at 0 and gets the full-length animation.
+    @objc lazy var animationTickStart: TimeInterval = 160.0/1000.0
 
     @objc lazy var consecutiveScrollSwipeMaxInterval: TimeInterval = {
         /// If more than `_consecutiveScrollSwipeIntervalMax` seconds passes between two scrollwheel swipes, then they aren't deemed consecutive.
@@ -392,7 +487,16 @@ import Cocoa
     
     
     @objc lazy var fastScrollCurve: ScrollSpeedupCurve? = {
-        
+
+        /// Fork: gate fastScroll on the tuning slider.
+        ///     fastScroll multiplies pxToScrollForThisTick by an *exponentially* growing factor once you've made
+        ///     `swipeThreshold` consecutive scroll swipes (Scroll.m:532-547, clamped only at x100000). It's built
+        ///     for notched wheels, where consecutive swipes are deliberate and rare. A free-spinning ring produces
+        ///     them constantly, so it compounds with the acceleration curve *and* the multi-unit deltas — measured
+        ///     as a major contributor to the runaway fast-scroll. Default is 0 (off); Scroll.m treats nil as
+        ///     "disabled", so returning nil here is the whole switch.
+        if u_fastScrollAmount <= 0.0 { return nil }
+
         /// NOTES:
         /// - We're using swipeThreshold to configure how far the user must've scrolled before fastScroll starts kicking in.
         /// - It would probably be better to have an explicit mechanism that counts how many pixels the user has scrolled already and then lets fastScroll kick in after a threshold is reached. That would also scale with the scrollSpeed setting. These current `fastScrollSpeedup` values are chosen so you don't accidentally trigger it at the lowest scrollSpeed, but they could be higher at higher scrollspeeds.
@@ -404,16 +508,20 @@ import Cocoa
         /// - The `exponentialSpeedup` of the unanimated ScrollSpeedCurve is lower and the `initialSpeedup` is higher because without animation you quickly reach a speed where you can't tell how far or in which direction you scrolled. We want to have a few swipes in that window of speed where you can tell that it's speeding up but it's not yet so fast that you can't tell which direction you scrolled and how fast.
         
         
+        /// Fork: the slider scales `exponentialSpeedup`, so 1.0 == upstream's behaviour and anything lower is a
+        ///     gentler ramp. (0 already returned nil above.)
+        let s = u_fastScrollAmount
+
         switch animationCurve {
-            
-        case kMFScrollAnimationCurveNameNone:           return ScrollSpeedupCurve(swipeThreshold: 6, initialSpeedup: 1.4,  exponentialSpeedup: 3.0)
-        case kMFScrollAnimationCurveNameVeryLowInertia: return ScrollSpeedupCurve(swipeThreshold: 1, initialSpeedup: 1,    exponentialSpeedup: 7.5) /// Turn off fastScroll, since we want _maximum control_ and linear feeling for this setting.
-        case kMFScrollAnimationCurveNameLowInertia:     return ScrollSpeedupCurve(swipeThreshold: 3, initialSpeedup: 1.33, exponentialSpeedup: 7.5)
-            
-        case kMFScrollAnimationCurveNameHighInertia, kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim: return ScrollSpeedupCurve(swipeThreshold: 2, initialSpeedup: 1.33, exponentialSpeedup: 7.5)
-        case kMFScrollAnimationCurveNameTouchDriver, kMFScrollAnimationCurveNameTouchDriverLinear:          return ScrollSpeedupCurve(swipeThreshold: 3, initialSpeedup: 1.33, exponentialSpeedup: 7.5)
+
+        case kMFScrollAnimationCurveNameNone:           return ScrollSpeedupCurve(swipeThreshold: 6, initialSpeedup: 1.4,  exponentialSpeedup: 3.0 * s)
+        case kMFScrollAnimationCurveNameVeryLowInertia: return ScrollSpeedupCurve(swipeThreshold: 1, initialSpeedup: 1,    exponentialSpeedup: 7.5 * s) /// Turn off fastScroll, since we want _maximum control_ and linear feeling for this setting.
+        case kMFScrollAnimationCurveNameLowInertia:     return ScrollSpeedupCurve(swipeThreshold: 3, initialSpeedup: 1.33, exponentialSpeedup: 7.5 * s)
+
+        case kMFScrollAnimationCurveNameHighInertia, kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim: return ScrollSpeedupCurve(swipeThreshold: 2, initialSpeedup: 1.33, exponentialSpeedup: 7.5 * s)
+        case kMFScrollAnimationCurveNameTouchDriver, kMFScrollAnimationCurveNameTouchDriverLinear:          return ScrollSpeedupCurve(swipeThreshold: 3, initialSpeedup: 1.33, exponentialSpeedup: 7.5 * s)
         case kMFScrollAnimationCurveNamePreciseScroll, kMFScrollAnimationCurveNameQuickScroll:              return nil as ScrollSpeedupCurve? /// Will be overriden
-        
+
         default:
             assert(false)
             return nil as ScrollSpeedupCurve?
@@ -454,13 +562,75 @@ import Cocoa
         
         set {
             _animationCurveName = newValue
-            self.animationCurveParams = animationCurveParamsMap(name: animationCurve)
+            self.animationCurveParams = tuned(animationCurveParamsMap(name: animationCurve))
         } get {
             return _animationCurveName
         }
     }
-    
-    @objc private(set) lazy var animationCurveParams: MFScrollAnimationCurveParameters? = { animationCurveParamsMap(name: animationCurve) }() /// Updates automatically to match `self.animationCurveName
+
+    @objc private(set) lazy var animationCurveParams: MFScrollAnimationCurveParameters? = { tuned(animationCurveParamsMap(name: animationCurve)) }() /// Updates automatically to match `self.animationCurveName
+
+    /// Fork: apply the Smoothness slider to whichever animation curve was selected.
+    ///     Overrides the step duration only; everything else is copied from what upstream chose.
+    private func tuned(_ p: MFScrollAnimationCurveParameters?) -> MFScrollAnimationCurveParameters? {
+
+        guard let p = p else { return nil }  /// kMFScrollAnimationCurveNameNone -> no animation
+
+        /// Only tune the *plain scrolling* curves.
+        ///     TouchDriver/TouchDriverLinear (zoom, rotate, four-finger-pinch, ...), PreciseScroll and QuickScroll
+        ///     are effect/input-modification curves that upstream tuned deliberately for those gestures. The
+        ///     Smoothness slider is about how plain scrolling feels; it has no business reshaping zoom.
+        switch animationCurve {
+        case kMFScrollAnimationCurveNameTouchDriver, kMFScrollAnimationCurveNameTouchDriverLinear,
+             kMFScrollAnimationCurveNamePreciseScroll, kMFScrollAnimationCurveNameQuickScroll:
+            return p
+        default:
+            break
+        }
+
+        /// SCALE the step duration; don't replace it.
+        ///     `baseMsPerStepCurve` is speed-adaptive: Scroll.m:743 maps timeBetweenTicks onto 0...1 and samples it,
+        ///     so the animation shortens (180 -> 110ms on LowInertia) as ticks arrive faster, letting the animator
+        ///     keep up with fast scrolling. An earlier version of this pinned a single fixed duration and dropped
+        ///     the curve, which flattened that adaptation and made fast scrolling animate over a long fixed step.
+        ///     Keep the shape upstream tuned; just stretch or squash it.
+        ///
+        ///     0.5 (the default) == 1.0x == exactly upstream. 0 -> 0.4x (snappy), 1 -> 1.6x (smooth/laggy).
+        let factor = 0.4 + (u_smoothnessAmount * 1.2)
+
+        var scaledCurve: Curve? = nil
+        var scaledMs: Int = -1
+        if let c = p.baseMsPerStepCurve {
+            scaledCurve = Curve(rawCurve: CurveTools.transformCurve({ x in c.evaluate(at: x) }, { y in y * factor }))
+        } else {
+            scaledMs = Int(Double(p.baseMsPerStep) * factor)
+        }
+        /// ^ The inits assert `(baseMsPerStep == -1) ^ (baseMsPerStepCurve == nil)` — exactly one may be set — so
+        ///   whichever one `p` used, we keep using.
+
+        /// Pick the initialiser that MATCHES how `p` was built.
+        ///     `init(justBaseCurve:)` sets useDragCurve=false and fills dragExponent/dragCoefficient/stopSpeed with
+        ///     -1 sentinels. The full init hardcodes useDragCurve=true. So rebuilding a justBaseCurve params object
+        ///     through the full init silently turns the sentinels into *real* drag parameters (coefficient -1) and
+        ///     switches the drag simulation on — which is exactly how this broke zoom.
+        if p.useDragCurve {
+            return MFScrollAnimationCurveParameters(baseCurve: p.baseCurve,
+                                                    speedSmoothing: p.speedSmoothing,
+                                                    baseMsPerStep: scaledMs,
+                                                    baseMsPerStepCurve: scaledCurve,
+                                                    dragExponent: p.dragExponent,
+                                                    dragCoefficient: dragCoefficientForGlide, /// Fork: the Glide slider
+                                                    stopSpeed: p.stopSpeed,
+                                                    sendGestureScrolls: p.sendGestureScrolls,
+                                                    sendMomentumScrolls: p.sendMomentumScrolls)
+        } else {
+            return MFScrollAnimationCurveParameters(justBaseCurve: p.baseCurve,
+                                                    speedSmoothing: p.speedSmoothing,
+                                                    baseMsPerStep: scaledMs,
+                                                    baseMsPerStepCurve: scaledCurve,
+                                                    sendGestureScrolls: p.sendGestureScrolls)
+        }
+    }
     
     // MARK: Acceleration
     

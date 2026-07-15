@@ -96,6 +96,9 @@ class AboutTabController: NSViewController {
         let versionFormatExists = versionFormat.count != 0 && versionFormat != "app-version"
         let versionNumbers = "\(Locator.bundleVersionShort()) (\(Locator.bundleVersion()))"
         versionField.stringValue = versionFormatExists ? String(format: versionFormat, versionNumbers) : versionNumbers
+
+        /// Fork: strip the AboutTab down to the header (app name, icon, version, attribution)
+        stripToHeaderRow()
         
         /// Init trialSectionManager
         ///     The manager swaps out the trialSection and stuff, so always access the trialSection through the manager!
@@ -127,8 +130,66 @@ class AboutTabController: NSViewController {
         
     }
     
+    /// Fork additions
+
+    private func stripToHeaderRow() {
+
+        /// This fork ships none of upstream's donation / support / trial UI, so the AboutTab keeps only its
+        /// header row and drops the rest.
+        ///
+        /// The AboutTab is one vertical NSStackView (storyboard id `ugH-B2-Fh0`) of labelled rows:
+        ///     `Header` (app name, icon, version, attribution) | `Divider` | 4x `LinkRow` | `BottomStack` (trial).
+        /// We keep `Header` and hide the rest. The `LinkRow`s hold every link — Submit Feedback, GitHub,
+        /// Help Translate, Website, Send Me an Email, Get Help, Acknowledgements, and `moneyCellLink`
+        /// ("Buy Me a Milkshake") — so hiding them covers the money cell and the FORCE_LICENSED banner
+        /// (see updateUI_WithIsLicensedTrue) without needing an outlet per link.
+        ///
+        /// Why hide instead of editing the storyboard: keeps the diff small and upstream merges cheap.
+        /// Why this survives `updateUIToCurrentLicense()` re-running on every viewDidAppear: that path only
+        /// un-hides views *inside* a row (e.g. `moneyCellLink` at :198), never a row itself.
+
+        /// Find the row owning versionField, and the stack it lives in.
+        var headerRow: NSView = versionField
+        while let parent = headerRow.superview, !(parent is NSStackView) {
+            headerRow = parent
+        }
+        guard let masterStack = headerRow.superview as? NSStackView else {
+            assert(false, "AboutTab layout changed: versionField is not inside an NSStackView row.")
+            return
+        }
+
+        /// `ugH-B2-Fh0` does NOT set detachesHiddenViews in the storyboard (unlike the trial stacks), so a
+        /// hidden row would keep its space and leave the tab full of gaps. Turn it on so rows actually collapse.
+        masterStack.detachesHiddenViews = true
+
+        for row in masterStack.arrangedSubviews where row !== headerRow {
+            row.isHidden = true
+        }
+
+        /// Restore the bottom padding.
+        ///     The stack is pinned flush to the ContentView on all 4 sides and carries its own insets
+        ///     (top: 18, bottom: 0 in the storyboard). Upstream gets away with a 0 bottom inset because the
+        ///     `BottomStack` (trial section) brought its own padding — which we just hid, leaving the
+        ///     attribution text flush against the window edge. Mirror the top inset for symmetry.
+        masterStack.edgeInsets.bottom = masterStack.edgeInsets.top
+
+        /// Pin the tab width.
+        ///     Required, not cosmetic: `TabViewController.resizeWindowToFit()` measures a tab's natural size by
+        ///     temporarily setting the window to 99999x99999 and reading back `tabViewItem.view.frame.size`
+        ///     (TabViewController.swift:551-566). The AboutTab's width used to be pinned by the widest `LinkRow`;
+        ///     the header's content is centre-aligned and constrains no width of its own. So once the rows are
+        ///     detached, nothing bounds the width, the tab stretches to the full 99999 probe, and *that* gets
+        ///     stored as the tab size — giving a 99999pt-wide window (verified: 546x498 before, 99999x209 after).
+        ///
+        ///     Hardcoding is what this codebase already does for tab widths — see applyHardcodedTabWidth(), which
+        ///     fatalErrors for any tab but 'general'/'scrolling', so we can't reuse it here. 350 matches the
+        ///     general tab's English width. Locale-safe: the header is only the app name, the version, and a
+        ///     proper noun.
+        self.view.widthAnchor.constraint(equalToConstant: 350).isActive = true
+    }
+
     /// Did appear
-    
+
     override func viewDidAppear() {
         /// Step 2: Get real values and update UI
         ///     Notes:
