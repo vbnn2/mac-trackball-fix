@@ -257,6 +257,16 @@ import Cocoa
     @objc var useAppleAcceleration: Bool {
         return accelerationCurve == nil
     }
+    /// Experimental display-synchronized target follower for the trackpad-style high-smoothness curve.
+    ///
+    /// This is intentionally limited to the plain High + Trackpad Simulation path. Gesture effects and the
+    /// low/regular/precise/quick curves keep using TouchAnimator until the new controller has been validated for
+    /// those very different phase and duration requirements. Existing configs don't contain the new key, so the
+    /// fallback is part of the compatibility contract.
+    @objc var useTargetedScrollEngine: Bool {
+        let enabled = (c("targetedScrollEngine") as? NSNumber)?.boolValue ?? true
+        return enabled && animationCurve == kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim
+    }
     
     // MARK: Invert Direction
     

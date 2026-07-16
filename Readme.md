@@ -13,6 +13,8 @@ is an independent fork and does not use the upstream update channel.
 
 - Reworked the scroll engine around the magnitude of the device's line deltas, rather than treating
   every event as a single mouse-wheel detent.
+- Added a display-synchronized target follower for the trackpad-style high-smoothness mode, so new
+  reports preserve motion velocity instead of restarting a separate animation curve.
 - Added trackball-tuned **Sensitivity**, **Acceleration**, **Smoothness**, **Glide**, and
   **Fast Scroll** controls.
 - Increased the slow-scroll continuity window for sparse free-spinning ring input.

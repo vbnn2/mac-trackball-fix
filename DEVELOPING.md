@@ -165,7 +165,7 @@ Helper/
   Core/
     Scroll/                  ← the scroll engine
       Scroll.m               Event tap + main processing pipeline (~1300 lines, the core)
-      ScrollAnalyzer.m       Tick timing plus smoothed units-per-tick
+      ScrollAnalyzer.m       Tick timing plus time-aware velocity estimation
       ScrollModifiers.swift  Maps keyboard/button mods → input/effect modifications
       ScrollUtility.m        Axis + direction helpers
     Buttons/                 Click/hold state machine (ClickCycle.swift, Buttons.swift)
@@ -190,12 +190,18 @@ eventTapCallback()                     ← CGEventTap, kCGEventScrollWheel
   ├── records line + point deltas and rejects unsupported event types
   └── dispatch_async(_scrollQueue) → heavyProcessing()
         ├── ScrollUtility axisForVerticalDelta:horizontalDelta:  → picks ONE axis
-        ├── ScrollAnalyzer → smoothed interval + line-delta units
-        ├── velocity = units / interval
+        ├── ScrollAnalyzer → filtered line-unit velocity
         ├── trackball tuning → pixels for this tick
-        ├── Animator + drag/Bezier curve                         → smooth interpolation
+        ├── High + Trackpad Simulation → display-synced target follower
+        ├── Other curves/effects → legacy TouchAnimator + drag/Bezier curve
         └── sendOutputEvents() → sendScroll() / TouchSimulator
 ```
+
+The target follower keeps one critically damped motion session alive across input reports. New
+reports move its target without resetting velocity; release drains only the remaining distance,
+and direction reversal cancels the stale target before accepting the reversing report. It is
+currently restricted to the plain `high` + `trackpadSimulation` path. Set
+`Scroll.targetedScrollEngine` to `false` in the config to compare against the legacy animator.
 
 ### Fork feature map
 
