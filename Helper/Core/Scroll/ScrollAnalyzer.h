@@ -24,14 +24,14 @@ typedef struct {
     BOOL scrollDirectionDidChange;
     CFTimeInterval timeBetweenTicks;
 
-    double unitsPerTick;
-    /// ^ Fork: the scroll units this tick carried, smoothed over the *same* rolling window as `timeBetweenTicks`.
-    ///     Use this — not the raw per-event unit count — to compute velocity. `timeBetweenTicks` is a 3-tick rolling
-    ///     average, so dividing an instantaneous unit count by it mixes two different time bases and reads
-    ///     erratically exactly when units and interval change at different rates (i.e. a decelerating spin).
+    double velocityInUnitsPerSecond;
+    /// ^ Fork: time-filtered input velocity. This is estimated jointly from each report's unit count and interval,
+    ///     rather than dividing two independently smoothed signals.
 
     CFTimeInterval DEBUG_timeBetweenTicksRaw;
     /// ^ Unsmoothed time between ticks. For debugging, don't use this.
+    double DEBUG_velocityInUnitsPerSecondRaw;
+    /// ^ Instantaneous units/second before time-based filtering.
     int64_t DEBUG_consecutiveScrollSwipeCounterRaw;
     /// ^ Mice with free scrollwheels (e.g. MX Master) make it hard to input several consecutive scroll swipes, because the swipes will bleed into each other and will be registered as a very long sequence of consecutive ticks instead.
     ///     `consecutiveScrollSwipeCounter` will count these long tick sequences as several consecutive swipes, while `DEBUG_consecutiveScrollSwipeCounterRaw` will not

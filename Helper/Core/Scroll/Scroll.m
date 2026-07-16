@@ -284,40 +284,8 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     
     /// Declare stuff for later
     static DriverUnsuspender unsuspendDrivers = ^{}; /// This is old stuff that should be removed I think [Jun 2 2025]
+    double inputQueueDelayMs = MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0);
     
-    /// Debug
-    if (runningPreRelease()) { /// if-statement because hidEvent.description is very slow
-        
-        /// Get HIDEvent
-        HIDEvent *hidEvent = CGEventGetHIDEvent(event);
-        DDLogDebug("Scroll.m: event: %@", hidEvent.description);
-        
-        
-        /// Get sending device
-        IOHIDDeviceRef sendingDev = CGEventGetSendingDevice(event);
-        
-        /// Debug
-        assert(sendingDev != NULL);
-        
-        /// Print info on sendingDev
-        if (sendingDev != NULL) {
-            
-            CFStringRef name = IOHIDDeviceGetProperty(sendingDev, CFSTR(kIOHIDProductKey));
-            CFStringRef manufacturer = IOHIDDeviceGetProperty(sendingDev, CFSTR(kIOHIDManufacturerKey));
-            /// ^ [May 2025] Just saw a crash here See `Crash Reports > Mac Mouse Fix Helper-2025-05-29-112149.ips`
-            ///     Location: `Scroll.m:279 [[[CFStringRef manufacturer = IOHIDDeviceGetProperty(sendingDev, CFSTR(kIOHIDManufacturerKey))]]] > IOHIDDeviceGetProperty+120 > _os_unfair_lock_unlock_slow + 92 > ...`:
-            ///     Thread: Thread 3 (Dispatch queue: com.nuebling.mac-mouse-fix.helper.scroll)
-            ///     Message: BUG IN CLIENT OF LIBPLATFORM: Unlock of an `os_unfair_lock` not owned by current thread
-            ///     Possibly related: Thread 1 (Dispatch queue: com.apple.main-thread) was currently at `ButtonInputReceiver.m:142 > DeviceManager.m:71 > Device.m:258 (-[Device wrapsIOHIDDevice:]+0`)
-            ///     Interpretations:
-            ///         - Maybe Thread 1 and 3 tried to access the device at the same time causing issues. However thread 1 wasn't actually inside IOHIDDeviceGetProperty() according to the crash report. It was just at `-[Device wrapsIOHIDDevice:]+0`, which is right *before* accessing the device, but not accessing it, yet I think. Also, the presence of the `os_unfair_lock` suggests that IOHIDDevice *is* supposed to be thread-safe, but just had a bug right there.
-            ///             - After thinking a bit more, this makes no sense, looking at IOHIDDeviceRef.c > IOHIDDeviceGetProperty(), it just locks at the start and unlocks at the end and I have no clue how the unlocking thread can end up being different from the locking one.
-            ///         - Claude suggests that the IOHIDDevice must be memory-corrupted or used-after-free/used-after-close. Seems sorta plausible since CGEventGetSendingDevice() never cleans up its cache and could theoretically return pointer to a IOHIDDeviceRef that has disconnected. ... But it seems sort of unlikely that the device would get disconnected between sending the scroll events and the processing of the scroll events (which we're doing here). Also just because the device is disconnected it shouldn't mean that the whole IOHIDDeviceRef instance becomes memory-corrupted. I think it should still be safe to use, just fail read/write operations and so on (but I haven't tested this). Perhaps it's a thread-safety bug inside IOHIDDevice. When we put all this stuff on one 'IOThread' that should help with this bug. Also see this conversation with Claude: https://claude.ai/share/77e528bf-2908-4fa0-a14c-4a924b0198de
-            
-            DDLogDebug("Scroll.m: Device sending scroll: %@ %@", manufacturer, name);
-        }
-    }
-
     /// Get axis
     
     MFAxis inputAxis = [ScrollUtility axisForVerticalDelta:scrollDeltaAxis1 horizontalDelta:scrollDeltaAxis2];
@@ -439,8 +407,6 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         ///     the way the old `!isRunning`-gated relink was.
         [_animator.displayLink linkToDisplayUnderMousePointerWithEvent:event];
 
-        NSLog(@"MMFSCROLL fresh scroll: pointerDisplay=%u mainDisplay=%u animatorRunning=%d", displayID, CGMainDisplayID(), [_animator isRunning]);
-
         /// Get scrollConfig
         _scrollConfig = [ScrollConfig scrollConfigWithModifiers:newMods inputAxis:inputAxis display:displayID];
         
@@ -455,8 +421,8 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     /// Run full scrollAnalysis
     ScrollAnalysisResult scrollAnalysisResult = [ScrollAnalyzer updateWithTickOccuringAt:tickTS direction:scrollDirection units:llabs(lineDelta) config:_scrollConfig];
 
-    /// Note [Jul 16 2026]: there used to be a "drop the lone trailing detent" heuristic here. It's been removed —
-    ///     see PLAN.md. Short version: a settling detent and the first tick of a *resumed* scroll are identical at
+    /// Note [Jul 16 2026]: there used to be a "drop the lone trailing detent" heuristic here. It's been removed.
+    ///     Short version: a settling detent and the first tick of a *resumed* scroll are identical at
     ///     the moment they arrive, and differ only in what comes after, which an event tap can't see. Measured over
     ///     1464 real events, it dropped 112 ticks of which **87 were the start of a scroll, not a trailing detent**
     ///     — the user felt that as "it sticks for a bit, then starts scrolling". The gap distributions overlap
@@ -482,7 +448,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     /// Why this exists [Jul 2026]:
     ///     `ScrollAnalyzer` models input as a notched wheel: one event == one detent, and the only signal is how
     ///     fast detents arrive. That's wrong for a free-spinning ring like the TB800, which reports multi-unit
-    ///     deltas. Measured over 346 real events (see PLAN.md): |line| ranges 1...9, and only 35 of 260 vertical
+    ///     deltas. Measured over 346 real events: |line| ranges 1...9, and only 35 of 260 vertical
     ///     events were |line| == 1 — the mode is 9. Report rate and magnitude climb *together*, so the curve's
     ///     input (1/timeBetweenTicks) spans only ~10x (6.2 -> 66.7 Hz) while true scroll velocity
     ///     (rate * |line|) spans ~97x. Everything past that 10x was being thrown away.
@@ -540,15 +506,9 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         timeBetweenTicks = CLIPLOW(timeBetweenTicks, _scrollConfig.consecutiveScrollTickInterval_AccelerationEnd);
         
         /// Get the TRUE scroll velocity, in units/s.
-        ///     Not `1/timeBetweenTicks` (events/s), which is what upstream used. That's only equal to velocity for a
-        ///     notched wheel, where every event carries exactly 1 unit. On the TB800, rate and magnitude climb
-        ///     together, so events/s spans ~10x (6 -> 67 Hz) while real velocity spans ~110x (5 -> 562 units/s).
-        /// Use the SMOOTHED unit count, not this event's raw one.
-        ///     `timeBetweenTicks` is a 3-tick rolling average (ScrollAnalyzer.m:251). Dividing a raw per-event unit
-        ///     count by it mixes time bases and makes velocity jump around during a decelerating spin. ScrollAnalyzer
-        ///     now averages units over the identical window and resets both smoothers together.
-        double smoothedUnits = MAX(1.0, scrollAnalysisResult.unitsPerTick);
-        double scrollSpeed = smoothedUnits / timeBetweenTicks; /// In units/s
+        ///     ScrollAnalyzer estimates this directly with a time-based filter. This avoids dividing independently
+        ///     smoothed unit and interval values, and keeps the filter's latency stable across changing report rates.
+        double scrollSpeed = scrollAnalysisResult.velocityInUnitsPerSecond;
 
         /// Apply the tuning model.
         ///     pxPerUnit(v) = pxAtUnitSpeed * v^(gamma-1)   ->   px/s = pxAtUnitSpeed * v^gamma
@@ -564,32 +524,6 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         double pxPerUnit = _scrollConfig.pxAtRefSpeed * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma - 1.0);
         double pxForThisTickDouble = pxPerUnit * unitsForThisTick;
 
-        /// Cap the output.
-        ///     ScrollAnalyzer.m:45 documents that the input "sometimes randomly" delivers extremely small
-        ///     timeSinceLastTick values, which "overdrive the acceleration curve, producing extremely high
-        ///     pxToScrollForThisTick values at random" — and says the reason that stopped being noticable is that
-        ///     upstream *capped the acceleration curve's maximum output*. Our pow() model has no such ceiling, so a
-        ///     random short gap spikes the scroll and the next normal tick drops it back — which is exactly the
-        ///     intermittent "speeds up, then suddenly drops" symptom. Restore the safety net upstream relied on.
-        double maxPxPerTick = _scrollConfig.pxAtRefSpeed * 12.0;
-        if (pxForThisTickDouble > maxPxPerTick) {
-            DDLogDebug("Scroll.m: capping px %.0f -> %.0f (v=%.0f units/s)", pxForThisTickDouble, maxPxPerTick, scrollSpeed);
-            pxForThisTickDouble = maxPxPerTick;
-        }
-
-        pxToScrollForThisTick = pxForThisTickDouble; /// We could use a SubPixelator balance out the rounding errors, but I don't think that'll be noticable
-
-        /// Debug
-        DDLogDebug("Scroll.m: tuning v=%.1f units/s (units: %lld, dt: %.3f) -> pxPerUnit=%.1f -> px=%lld [ref=%.0f pxAtRef=%.0f gamma=%.2f]",
-                   scrollSpeed, unitsForThisTick, timeBetweenTicks, pxPerUnit, pxToScrollForThisTick,
-                   _scrollConfig.refSpeed, _scrollConfig.pxAtRefSpeed, _scrollConfig.gamma);
-        
-        /// Validate
-        if (pxToScrollForThisTick <= 0) {
-            DDLogError("Scroll.m: pxForThisTick is smaller equal 0. This is invalid. Exiting. scrollSpeed: %f, pxForThisTick: %lld", scrollSpeed, pxToScrollForThisTick);
-            assert(false);
-        }
-        
         ///
         /// Apply fast scroll to pxToScrollForThisTick
         ///
@@ -609,7 +543,29 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             if (fastScrollFactor > 100000) fastScrollFactor = 100000;
             
             /// Apply fastScroll
-            pxToScrollForThisTick *= fastScrollFactor;
+            pxForThisTickDouble *= fastScrollFactor;
+        }
+
+        /// Cap the FINAL output, after every acceleration layer.
+        ///     Capping before fastScroll let the exponential multiplier bypass the safety limit entirely.
+        double maxPxPerTick = _scrollConfig.pxAtRefSpeed * 12.0;
+        if (pxForThisTickDouble > maxPxPerTick) {
+            DDLogDebug("Scroll.m: capping px %.0f -> %.0f (v=%.0f units/s)", pxForThisTickDouble, maxPxPerTick, scrollSpeed);
+            pxForThisTickDouble = maxPxPerTick;
+        }
+
+        pxToScrollForThisTick = llround(pxForThisTickDouble);
+
+        /// Debug
+        DDLogDebug("Scroll.m: tuning v=%.1f rawV=%.1f units/s (units: %lld, dt: %.3f) -> pxPerUnit=%.1f -> px=%lld [ref=%.0f pxAtRef=%.0f gamma=%.2f]",
+                   scrollSpeed, scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
+                   unitsForThisTick, timeBetweenTicks, pxPerUnit, pxToScrollForThisTick,
+                   _scrollConfig.refSpeed, _scrollConfig.pxAtRefSpeed, _scrollConfig.gamma);
+
+        /// Validate
+        if (pxToScrollForThisTick <= 0) {
+            DDLogError("Scroll.m: pxForThisTick is smaller equal 0. This is invalid. Exiting. scrollSpeed: %f, pxForThisTick: %lld", scrollSpeed, pxToScrollForThisTick);
+            assert(false);
         }
         
         ///
@@ -926,6 +882,11 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             }
             
             /// Send scroll
+            if (animationPhase == kMFAnimationCallbackPhaseStart) {
+                DDLogDebug("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f",
+                           MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0),
+                           inputQueueDelayMs);
+            }
             sendScroll(distanceDelta, scrollDirection, YES, animationPhase, momentumHint, config);
             
         }];

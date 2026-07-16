@@ -572,7 +572,7 @@ import QuartzCore
             /// Do get momentumHint
             
             let timeSinceAnimationStart = frameTime - animationStartTime
-            let minBaseCurveTime = ScrollConfig().consecutiveScrollTickIntervalMax
+            let minBaseCurveTime = ScrollConfig.gesturePhaseMinDuration
             
             /// DEBUG
 //            minBaseCurveTime = 0.0
@@ -683,4 +683,3 @@ import QuartzCore
     /// Helper functions
         
 }
-

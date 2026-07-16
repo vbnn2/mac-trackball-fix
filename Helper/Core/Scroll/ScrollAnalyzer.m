@@ -41,7 +41,6 @@
         /// Setup smoothing algorithm for `timeBetweenTicks`
         
         _tickTimeSmoother = [[RollingAverage alloc] initWithCapacity: 3]; /// Capacity 1 turns off smoothing
-        _unitsSmoother = [[RollingAverage alloc] initWithCapacity: 3]; /// Fork: keep the capacity identical to _tickTimeSmoother
         /// ^ No smoothing feels the best.
         ///     - Without smoothing, there will somemtimes randomly be extremely small `timeSinceLastTick` values. I was worried that these would overdrive the acceleration curve, producing extremely high `pxToScrollForThisTick` values at random. But since we've capped the acceleration curve to a maximum `pxToScrollForThisTick` this isn't a noticable issue anymore.
         ///     - No smoothing is way more responsive than RollingAverage
@@ -60,15 +59,13 @@
 /// Constant
 
 static NSObject<Smoother> *_tickTimeSmoother;
-static NSObject<Smoother> *_unitsSmoother;
-/// ^ Fork: smooths the per-tick unit count over the same window as `_tickTimeSmoother`, and is reset in lockstep
-///     with it. Velocity is `units/second`, so both halves of that fraction have to come from the same time base —
-///     otherwise a spin whose magnitude and interval change at different rates produces an erratic velocity.
 
 /// Dynamic
 
 static double _previousScrollTickTimeStamp = 0;
 static MFDirection _previousDirection = kMFDirectionNone;
+static double _filteredVelocityInUnitsPerSecond = 0;
+static BOOL _velocityFilterIsInitialized = NO;
 
 static int _consecutiveScrollTickCounter;
 
@@ -88,6 +85,9 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
     
     _previousDirection = kMFDirectionNone;
     /// ^ This needs to be set to 0, so that scrollDirectionDidChange will definitely evaluate to NO on the next tick
+
+    _filteredVelocityInUnitsPerSecond = 0;
+    _velocityFilterIsInitialized = NO;
     
     /// The following are probably not necessary to reset, because the above resets will indirectly cause them to be reset on the next tick
     _consecutiveScrollTickCounter = 0;
@@ -223,7 +223,6 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         
         /// Reset smoother:
         [_tickTimeSmoother reset];
-        [_unitsSmoother reset]; /// Fork: reset in lockstep, or a new scroll inherits the previous one's magnitudes
         
         /// Initialize smoother with tickMax
         /// Notes:
@@ -252,10 +251,36 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         smoothedTimeBetweenTicks = [_tickTimeSmoother smoothWithValue:secondsSinceLastTick];
     }
 
-    /// Fork: smooth the unit count on the same window.
-    ///     Fed unconditionally (unlike the tickTime above, which has a first-tick special case) because a unit count
-    ///     is always a real measurement — there's no "no previous tick" problem for it.
-    double smoothedUnits = [_unitsSmoother smoothWithValue:(double)MAX(1, units)];
+    /// Fork: estimate velocity with a time-based filter.
+    ///
+    /// A fixed three-report average has a variable time horizon: it is very laggy during slow scrolling and barely
+    /// filters anything during a fast spin. A continuous-time EMA keeps the response characteristics stable:
+    ///
+    ///     alpha = 1 - exp(-dt / tau)
+    ///
+    /// Faster attack keeps intentional acceleration responsive. Slower release suppresses packet-to-packet jitter
+    /// while the ring decelerates. At sparse report rates alpha naturally approaches 1, avoiding long slow-scroll lag.
+    double velocityInterval;
+    if (_consecutiveScrollTickCounter == 0 || !_velocityFilterIsInitialized) {
+        velocityInterval = scrollConfig.isolatedTickVelocityInterval;
+    } else {
+        velocityInterval = MAX(secondsSinceLastTick, scrollConfig.consecutiveScrollTickInterval_AccelerationEnd);
+    }
+
+    double rawVelocity = ((double)MAX(1, units)) / velocityInterval;
+
+    if (!_velocityFilterIsInitialized || _consecutiveScrollTickCounter == 0) {
+        _filteredVelocityInUnitsPerSecond = rawVelocity;
+        _velocityFilterIsInitialized = YES;
+    } else {
+        double tau = rawVelocity >= _filteredVelocityInUnitsPerSecond
+            ? scrollConfig.velocityFilterAttackTimeConstant
+            : scrollConfig.velocityFilterReleaseTimeConstant;
+        assert(tau > 0);
+
+        double alpha = 1.0 - exp(-velocityInterval / tau);
+        _filteredVelocityInUnitsPerSecond += alpha * (rawVelocity - _filteredVelocityInUnitsPerSecond);
+    }
     
     /// Update `_previousScrollTickTimeStamp` for next call
     ///     This needs to be executed after `updateConsecutiveScrollSwipeCounterWithSwipeOccuringNow()`, because that function uses `_previousScrollTickTimeStamp`
@@ -270,8 +295,9 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
         .consecutiveScrollSwipeCounter = _consecutiveScrollSwipeCounter_ForFreeScrollWheel,
         .scrollDirectionDidChange = scrollDirectionDidChange,
         .timeBetweenTicks = smoothedTimeBetweenTicks,
-        .unitsPerTick = smoothedUnits,
+        .velocityInUnitsPerSecond = _filteredVelocityInUnitsPerSecond,
         .DEBUG_timeBetweenTicksRaw = secondsSinceLastTick, /// Unsmoothed timeBetweenTicks
+        .DEBUG_velocityInUnitsPerSecondRaw = rawVelocity,
         .DEBUG_consecutiveScrollSwipeCounterRaw = _consecutiveScrollSwipeCounter,
     };
     
@@ -302,7 +328,7 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
     
     NSString *tickTimeStr = analysis.timeBetweenTicks == DBL_MAX ? @"9999" : stringf(@"%f", analysis.timeBetweenTicks); /// 9999 signals that the analyzed tick is the first consecutive tick.
     
-    return stringf(@"dirChange: %d, ticks: %lld, swipes: %f, tickTime: %@, rawTickTime: %f, rawSwipes: %lld", analysis.scrollDirectionDidChange, analysis.consecutiveScrollTickCounter, analysis.consecutiveScrollSwipeCounter, tickTimeStr, analysis.DEBUG_timeBetweenTicksRaw, analysis.DEBUG_consecutiveScrollSwipeCounterRaw);
+    return stringf(@"dirChange: %d, ticks: %lld, swipes: %f, tickTime: %@, rawTickTime: %f, velocity: %f, rawVelocity: %f, rawSwipes: %lld", analysis.scrollDirectionDidChange, analysis.consecutiveScrollTickCounter, analysis.consecutiveScrollSwipeCounter, tickTimeStr, analysis.DEBUG_timeBetweenTicksRaw, analysis.velocityInUnitsPerSecond, analysis.DEBUG_velocityInUnitsPerSecondRaw, analysis.DEBUG_consecutiveScrollSwipeCounterRaw);
 }
 
 @end

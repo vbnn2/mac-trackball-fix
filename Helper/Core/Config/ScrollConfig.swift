@@ -282,12 +282,13 @@ import Cocoa
     /// them — and the Helper never repairs at all. These values are what actually runs in that case.
     ///
     /// [Jul 16 2026] Tuned by hand on the TB800 and adopted as the defaults. The shape is: a very low base
-    /// sensitivity so slow scrolling moves in small steps rather than lurching, with strong acceleration and
-    /// fastScroll to get the distance back on a fast spin.
+    /// sensitivity so slow scrolling moves in small steps rather than lurching, with strong but bounded acceleration
+    /// to get distance back on a fast spin. Burst-history-based fastScroll stays off by default because it makes
+    /// identical physical input behave differently depending on how reports happen to be grouped.
     @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.10) }()
     @objc lazy var u_acceleration: Double = { slider("acceleration", 1.0) }()
     @objc lazy var u_smoothnessAmount: Double = { slider("smoothness", 0.5) }()
-    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.67) }()
+    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.0) }()
     @objc lazy var u_glide: Double = { slider("glide", 0.75) }()
 
     /// How long the scroll keeps gliding after your finger leaves the ring.
@@ -453,6 +454,25 @@ import Cocoa
     ///     we've raised the latter to `trackballSlowScrollWindow`. Keeping this at 160ms preserves upstream's tuned
     ///     mapping: a tick at or beyond 160ms samples the curve at 0 and gets the full-length animation.
     @objc lazy var animationTickStart: TimeInterval = 160.0/1000.0
+
+    /// Keep gesture/momentum phase classification independent from input grouping.
+    ///     The trackball continuity window is intentionally 500ms, but that does not mean the first 500ms of every
+    ///     animation should be forced into the gesture phase. A real direct-manipulation gesture transitions based
+    ///     on the animation itself, not on the timeout used to decide whether two hardware reports belong together.
+    static let gesturePhaseMinDuration: TimeInterval = 160.0/1000.0
+
+    /// Velocity estimator parameters.
+    ///
+    /// The estimator is time-based instead of averaging a fixed number of reports. A three-report window represents
+    /// hundreds of milliseconds during careful scrolling but only a few dozen milliseconds during a fast spin,
+    /// which makes its latency depend on the user's speed. These constants keep the response time stable across
+    /// report rates.
+    ///
+    /// The first report has no measured interval. Treat it as an explicit isolated movement rather than pretending
+    /// it arrived after the full 500ms continuity timeout.
+    @objc let isolatedTickVelocityInterval: TimeInterval = 200.0/1000.0
+    @objc let velocityFilterAttackTimeConstant: TimeInterval = 20.0/1000.0
+    @objc let velocityFilterReleaseTimeConstant: TimeInterval = 40.0/1000.0
 
     @objc lazy var consecutiveScrollSwipeMaxInterval: TimeInterval = {
         /// If more than `_consecutiveScrollSwipeIntervalMax` seconds passes between two scrollwheel swipes, then they aren't deemed consecutive.

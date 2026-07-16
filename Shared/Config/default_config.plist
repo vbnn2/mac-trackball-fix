@@ -30,7 +30,7 @@
 			<key>smoothness</key>
 			<real>0.5</real>
 			<key>fastScroll</key>
-			<real>0.67</real>
+			<real>0.0</real>
 			<key>glide</key>
 			<real>0.75</real>
 		</dict>

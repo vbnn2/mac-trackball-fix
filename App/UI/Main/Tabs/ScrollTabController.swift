@@ -117,7 +117,7 @@ class ScrollTabController: NSViewController {
             ("Scroll.tuning.acceleration", "scroll.tuning.acceleration", 1.0),
             ("Scroll.tuning.smoothness",   "scroll.tuning.smoothness",   0.5),
             ("Scroll.tuning.glide",        "scroll.tuning.glide",        0.75),
-            ("Scroll.tuning.fastScroll",   "scroll.tuning.fast-scroll",  0.67),
+            ("Scroll.tuning.fastScroll",   "scroll.tuning.fast-scroll",  0.0),
         ]
 
         let section = NSStackView()
