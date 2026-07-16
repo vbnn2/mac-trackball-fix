@@ -189,6 +189,13 @@ static NSArray *getOneShotEffectsTable(NSDictionary *rowDict) {
             }
         },
         @{
+            @"ui": MFLocalizedString(@"effect.zoom-mode", @""),
+            @"tool": MFLocalizedString(@"effect.zoom-mode.hint", @""),
+            @"dict": @{
+              kMFActionDictKeyType: kMFActionDictTypeToggleZoomMode,
+            }
+        },
+        @{
             @"ui": MFLocalizedString(@"effect.click.primary.shift", @""),
             @"tool": MFLocalizedString(@"effect.click.primary.shift.hint", @""),
             /// Deliberately NOT "hideable": that flag makes an entry an ⌥-alternate (see menuItemFromDataModel:),

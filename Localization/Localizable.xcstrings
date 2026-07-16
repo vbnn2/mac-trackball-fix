@@ -1934,6 +1934,83 @@
         }
       }
     },
+    "buttons.scope.add-app" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Add App…"
+          }
+        }
+      }
+    },
+    "buttons.scope.all-apps" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All Apps"
+          }
+        }
+      }
+    },
+    "buttons.scope.remove-app" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove “%@”…"
+          }
+        }
+      }
+    },
+    "buttons.scope.remove-app.body" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "That app will go back to using your All Apps buttons. Your All Apps buttons aren’t affected."
+          }
+        }
+      }
+    },
+    "buttons.scope.remove-app.cancel-button" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel"
+          }
+        }
+      }
+    },
+    "buttons.scope.remove-app.confirm" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove the custom buttons for “%@”?"
+          }
+        }
+      }
+    },
+    "buttons.scope.remove-app.confirm-button" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove"
+          }
+        }
+      }
+    },
     "buy-mouse-alert.body" : {
       "comment" : "",
       "localizations" : {
@@ -7148,6 +7225,28 @@
         }
       }
     },
+    "effect.zoom-mode" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zoom Mode"
+          }
+        }
+      }
+    },
+    "effect.zoom-mode.hint" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Turns the scroll ring into a zoom control, as if you were holding the zoom modifier. The ball keeps moving the pointer as usual. Click any button to go back to normal."
+          }
+        }
+      }
+    },
     "enable-timeout-toast" : {
       "comment" : ".",
       "localizations" : {
@@ -12044,6 +12143,28 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在Safari、地圖和其他應用程式中放大或縮小\n \n效果相當於在Apple觸控板上兩指分開或收合"
+          }
+        }
+      }
+    },
+    "scroll.invert-ball-scroll" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Invert Ball Scrolling"
+          }
+        }
+      }
+    },
+    "scroll.invert-ball-scroll.hint" : {
+      "comment" : "",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reverses the direction the ball scrolls while Scroll & Zoom Mode is on. Off, the page follows the ball like a trackpad; on, it moves the opposite way, like dragging a scrollbar."
           }
         }
       }

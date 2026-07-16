@@ -162,7 +162,11 @@ void commitConfig(void) {
     
     /// Force update of internal state, (even the active app hastn't changed)
     ///     (Not sure if we need to always do this or only after loading from file)
-    [self.shared loadOverridesForApp:@""];
+    /// Fork: re-apply the CURRENT app's overrides, not `@""`.
+    ///     Upstream hardcoded `@""` here, which drops any override every time the config changes. That was harmless
+    ///     while the feature was dead, but is fatal now: writing a remap in the app sends `configFileChanged`, which
+    ///     lands here — and would immediately revert the Helper to the global config.
+    [self.shared loadOverridesForApp:self.shared.currentAppOverrideBundleID];
     
     /// Notify other modules
     [Remap reload];
@@ -212,6 +216,10 @@ void commitConfig(void) {
 }
 
 /// Applies AppOverrides from app with `bundleIdentifier` to `self->_config` and writes the result into `_configWithAppOverridesApplied`.
+- (NSString *)currentAppOverrideBundleID {
+    return _bundleIDOfAppWhichCausesAppOverride ?: @"";
+}
+
 - (void)loadOverridesForApp:(NSString *)bundleID {
     
     /// Validate

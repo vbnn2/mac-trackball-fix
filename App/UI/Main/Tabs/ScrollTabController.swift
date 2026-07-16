@@ -19,6 +19,7 @@ class ScrollTabController: NSViewController {
     var trackpad = ConfigValue<Bool>(configPath: "Scroll.trackpadSimulation")
     var reverseDirection = ConfigValue<Bool>(configPath: "Scroll.reverseDirection")
     var invertZoom = ConfigValue<Bool>(configPath: "Scroll.invertZoom")
+    var invertBallScroll = ConfigValue<Bool>(configPath: "Scroll.invertBallScroll")
 
     /// Fork: tuning sliders. keyPath -> (slider, readout label)
     private var tuningSliders: [NSSlider: (keyPath: String, readout: NSTextField)] = [:]
@@ -231,7 +232,30 @@ class ScrollTabController: NSViewController {
             invertZoom.bindingTarget <~ toggle.reactive.boolValues
             toggle.reactive.boolValue <~ invertZoom.producer
         }
-        
+
+        /// Fork: Invert ball scrolling (Scroll & Zoom Mode)
+        ///     Sits with the other direction toggles even though it's driven by a Buttons-tab action — this is where
+        ///     you look when something scrolls the wrong way.
+        do {
+            let toggle = NSButton(checkboxWithTitle: MFLocalizedString("scroll.invert-ball-scroll", comment: ""),
+                                  target: nil, action: nil)
+            toggle.toolTip = MFLocalizedString("scroll.invert-ball-scroll.hint", comment: "")
+            toggle.setAccessibilityIdentifier("axInvertBallScrollToggle")
+            toggle.setContentHuggingPriority(.init(750), for: .vertical) /// See the note above re: the 99999 probe
+
+            /// Below the Invert Zoom toggle we just inserted (which is itself below Reverse Direction).
+            if let i = masterStack.arrangedSubviews.firstIndex(where: { $0.accessibilityIdentifier() == "axInvertZoomToggle" }) {
+                masterStack.insertArrangedSubview(toggle, at: i + 1)
+            } else {
+                assert(false, "ScrollTab layout changed: invert zoom toggle not found.")
+                masterStack.addArrangedSubview(toggle)
+            }
+
+            invertBallScroll.bindingTarget <~ toggle.reactive.boolValues
+            toggle.reactive.boolValue <~ invertBallScroll.producer
+        }
+
+
         /// Scroll speed
         scrollSpeed.bindingTarget <~ speedPicker.reactive.selectedIdentifiers.map({ identifier in
             identifier!.rawValue

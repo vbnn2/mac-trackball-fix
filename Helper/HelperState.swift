@@ -12,6 +12,18 @@
 import Foundation
 import CoreGraphics
 
+/// Fork: latched trackball modes. See `HelperState.trackballMode`.
+///     File scope rather than nested in HelperState so ObjC gets `MFTrackballModeZoomOnly` rather than
+///     `HelperStateMFTrackballModeZoomOnly`.
+@objc enum MFTrackballMode: Int {
+    case off = 0
+    /// Ball scrolls in any direction (upstream's `TwoFingerSwipe` modifiedDrag — the same effect as the
+    /// "Scroll & Navigate" drag effect, just latched on rather than held with a button), ring zooms.
+    case scrollAndZoom = 1
+    /// Ball keeps moving the pointer as normal; only the ring changes. Effectively a latched zoom modifier.
+    case zoomOnly = 2
+}
+
 @objc class HelperState: NSObject {
     
     // MARK: Singleton & init
@@ -19,48 +31,113 @@ import CoreGraphics
     override init() {
         super.init()
         initUserIsActive()
+        initFrontmostAppTracking()
         DispatchQueue.main.async { /// Need to do this to avoid strange Swift crashes when this is triggered from `SwitchMaster.load_Manual()`
             SwitchMaster.shared.helperStateChanged()
         }
     }
-    
-    // MARK: Scroll & Zoom Mode (fork)
 
-    /// A latched mode for trackballs. While it's on:
-    ///     - moving the ball scrolls in any direction, instead of moving the pointer
-    ///       (this is upstream's `TwoFingerSwipe` modifiedDrag — the same thing as the "Scroll & Navigate" drag
-    ///        effect, just latched on rather than held with a button)
+    // MARK: App overrides (fork)
+
+    /// Which app's overrides are currently applied. "" == global / no override.
+    ///
+    /// Scoped to the FRONTMOST app deliberately. Upstream's only resolver keys off the app under the mouse
+    /// *pointer* (`loadOverridesForAppUnderMousePointerWithEvent:`, whose sole caller is disabled at
+    /// Scroll.m:375). That suits scrolling — you scroll what you point at — but not buttons, which belong to
+    /// whatever has focus. This fork is button-first, so: frontmost only.
+    ///
+    /// Why a notification rather than polling on the input path: upstream's pointer resolver calls
+    /// `HelperUtility appUnderMousePointer` (an AX/CG lookup) and had to be gated behind
+    /// `mouseDidMove || frontMostAppDidChange` to stay off the scroll hot path. NSWorkspace tells us for free.
+    @objc private(set) var frontmostAppBundleID: String = ""
+
+    private func initFrontmostAppTracking() {
+
+        applyOverrides(forApp: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "", isInitial: true)
+
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                          object: nil, queue: .main) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.applyOverrides(forApp: app?.bundleIdentifier ?? "", isInitial: false)
+        }
+    }
+
+    private func applyOverrides(forApp bundleID: String, isInitial: Bool) {
+
+        if !isInitial && bundleID == frontmostAppBundleID { return }
+        frontmostAppBundleID = bundleID
+
+        /// Cheap when there's no override for this app: loadOverridesForApp: just points
+        /// `configWithAppOverridesApplied` back at the base config.
+        Config.shared().loadOverrides(forApp: bundleID)
+
+        /// Rebuild the remaps from the newly-merged config, and let SwitchMaster re-decide which taps it needs
+        /// (Remap.reload() notifies it). Skipped on the initial call — Config/Remap aren't loaded yet at
+        /// HelperState.init() time, and updateDerivedStates() will do it as part of normal startup.
+        if !isInitial {
+            DDLogDebug("HelperState: frontmost app -> \(bundleID.isEmpty ? "<none>" : bundleID)")
+            Remap.reload()
+        }
+    }
+    
+    // MARK: Trackball modes (fork)
+
+    /// Latched modes for trackballs. In *any* active mode:
     ///     - the scroll ring zooms, as though Control were held (see Scroll.m)
-    ///     - clicking any button exits (see Buttons.swift)
+    ///     - clicking any button exits (see Buttons.swift, plus `primaryClickExitTap` below for MB1/MB2)
+    /// The modes differ only in what the ball does.
     ///
     /// Lives on HelperState because Scroll.m (objc), Buttons.swift and Actions.m all need to reach it, and
     /// HelperState is already imported by all three. Avoids adding a file to the .xcodeproj.
+    ///
+    /// `MFTrackballMode` is declared at file scope, not nested here — a nested @objc enum would be exported to
+    /// ObjC as `HelperStateMFTrackballMode`, and Actions.m wants plain `MFTrackballModeZoomOnly`.
+    ///
+    /// The property is deliberately NOT @objc: `@objc private(set) var trackballMode` synthesises a
+    /// `setTrackballMode:` selector that collides with `setTrackballMode(_:)` below. Nothing in ObjC needs the raw
+    /// mode anyway — Scroll.m asks `trackballModeIsActive`, Actions.m calls `toggleTrackballMode:`.
+    private(set) var trackballMode: MFTrackballMode = .off
 
-    @objc private(set) var scrollAndZoomModeIsActive: Bool = false
+    /// Everything except the drag keys off this, not off a specific mode — so adding a third mode later doesn't
+    /// mean hunting down every reader.
+    @objc var trackballModeIsActive: Bool { trackballMode != .off }
 
-    @objc func toggleScrollAndZoomMode() {
-        setScrollAndZoomMode(!scrollAndZoomModeIsActive)
+    /// For ObjC readers that need the specific mode. (`trackballMode` itself can't be @objc — see above.)
+    @objc var trackballModeIsScrollAndZoom: Bool { trackballMode == .scrollAndZoom }
+
+    /// Pressing a mode's own button while that mode is on turns it off. Note this is rarely reached: Buttons.swift
+    /// intercepts *any* button press while a mode is active and exits, so in practice the button never gets as far
+    /// as running its action. Kept correct anyway for MB1/MB2 and for direct callers.
+    @objc func toggleTrackballMode(_ mode: MFTrackballMode) {
+        setTrackballMode(trackballMode == mode ? .off : mode)
     }
 
-    @objc func setScrollAndZoomMode(_ active: Bool) {
+    @objc func setTrackballMode(_ mode: MFTrackballMode) {
 
-        if active == scrollAndZoomModeIsActive { return }
-        scrollAndZoomModeIsActive = active
+        if mode == trackballMode { return }
 
-        DDLogInfo("HelperState: Scroll & Zoom Mode -> \(active ? "ON" : "OFF")")
+        let wasDragging = (trackballMode == .scrollAndZoom)
+        let willDrag = (mode == .scrollAndZoom)
+        trackballMode = mode
 
-        if active {
-            /// Latch the two-finger-swipe drag. Its own eventTap then turns ball movement into scrolls.
+        DDLogInfo("HelperState: trackball mode -> \(mode == .off ? "OFF" : (mode == .scrollAndZoom ? "SCROLL & ZOOM" : "ZOOM ONLY"))")
+
+        /// Only `.scrollAndZoom` latches the drag. `.zoomOnly` deliberately leaves the ball alone — the whole point
+        /// is that the pointer still works while the ring zooms.
+        if willDrag && !wasDragging {
             ModifiedDrag.initializeDrag(withDict: [kMFModifiedDragDictKeyType: kMFModifiedDragTypeTwoFingerSwipe])
-            /// Don't carry a stale 'owed mouseUp' into a new session — it would swallow an unrelated click.
-            awaitingPrimaryClickUp = false
-        } else {
+        } else if wasDragging && !willDrag {
             ModifiedDrag.deactivate()
         }
 
-        setPrimaryClickExitTapEnabled(active)
+        if mode != .off {
+            /// Don't carry a stale 'owed mouseUp' into a new session — it would swallow an unrelated click.
+            awaitingPrimaryClickUp = false
+        }
 
-        /// The scroll tap has to be on while the mode is active, so the ring can be turned into zoom even with no
+        setPrimaryClickExitTapEnabled(mode != .off)
+
+        /// The scroll tap has to be on while a mode is active, so the ring can be turned into zoom even with no
         /// modifiers held. SwitchMaster decides tap state, so tell it something changed.
         SwitchMaster.shared.helperStateChanged()
     }
@@ -107,7 +184,7 @@ import CoreGraphics
 
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 /// Only resurrect the tap if we still have a use for it.
-                if state.scrollAndZoomModeIsActive || state.awaitingPrimaryClickUp,
+                if state.trackballModeIsActive || state.awaitingPrimaryClickUp,
                    let tap = state.primaryClickExitTap {
                     CGEvent.tapEnable(tap: tap, enable: true)
                 }
@@ -116,12 +193,12 @@ import CoreGraphics
 
             if type == .leftMouseDown || type == .rightMouseDown {
 
-                guard state.scrollAndZoomModeIsActive else {
+                guard state.trackballModeIsActive else {
                     return Unmanaged.passUnretained(event) /// Not ours -> hands off.
                 }
 
-                state.setScrollAndZoomMode(false)
-                /// setScrollAndZoomMode(false) just disabled this tap, but we still need the matching mouseUp so the
+                state.setTrackballMode(.off)
+                /// setTrackballMode(.off) just disabled this tap, but we still need the matching mouseUp so the
                 /// app doesn't get an up without a down. Keep it alive; the up branch below retires it.
                 state.awaitingPrimaryClickUp = true
                 if let tap = state.primaryClickExitTap {
@@ -137,7 +214,7 @@ import CoreGraphics
                 }
 
                 state.awaitingPrimaryClickUp = false
-                if !state.scrollAndZoomModeIsActive, let tap = state.primaryClickExitTap {
+                if !state.trackballModeIsActive, let tap = state.primaryClickExitTap {
                     CGEvent.tapEnable(tap: tap, enable: false)
                 }
                 return nil /// Swallow the up belonging to the down we swallowed above.

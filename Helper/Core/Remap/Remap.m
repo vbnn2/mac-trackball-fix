@@ -206,7 +206,14 @@ static NSDictionary *_remaps;
             
         /// Convert remaps table to remaps dict
         
-        NSArray *remapsTable = [Config.shared.config objectForKey:kMFConfigKeyRemaps];
+        /// Fork: read the override-applied config so per-app remaps take effect.
+        ///     `configWithAppOverridesApplied` is the base config with `AppOverrides[<frontmost bundleID>][Root]`
+        ///     merged over it (Config.m:loadOverridesForApp:). It equals the base config when there's no override
+        ///     for the current app, so the global case is unchanged.
+        ///     Falls back to the base config: the property is only populated on the helper side and only once
+        ///     `loadOverridesForApp:` has run — don't let a reload ordering quirk wipe every remap.
+        NSDictionary *configForRemaps = Config.shared.configWithAppOverridesApplied ?: Config.shared.config;
+        NSArray *remapsTable = [configForRemaps objectForKey:kMFConfigKeyRemaps];
         
         for (NSDictionary *tableEntry in remapsTable) {
             /// Get modification precondition section of keypath

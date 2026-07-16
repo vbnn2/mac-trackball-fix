@@ -60,15 +60,78 @@
 
 #pragma mark Interact with config
 
+/// Fork: app-override plumbing.
+///
+/// These two methods are the *only* places the remap table touches the config, which is what makes per-app remaps
+/// a small change rather than a rewrite. Everything routes through `-remapsKeyArray`.
+///
+/// Why a key ARRAY and not a `setConfig()` keyPath: bundleIDs contain dots, and the config's "coolKeyPath" API
+/// splits on them — `setConfig(@"AppOverrides.com.apple.finder.Root.Remaps", ...)` would build
+/// `{AppOverrides:{com:{apple:{finder:...}}}}`. `-setObject:forCoolKeyArray:` takes the keys pre-split and creates
+/// the intermediate dictionaries for us.
+
+static NSString *const kMFAppOverrideRootKey = @"Root"; /// The nesting level `Config.m > loadOverridesForApp:` reads
+
+- (BOOL)isGlobalScope {
+    return self.appScopeBundleID == nil || self.appScopeBundleID.length == 0;
+}
+
+- (NSArray *)remapsKeyArray {
+    if (self.isGlobalScope) return @[kMFConfigKeyRemaps];
+    return @[kMFConfigKeyAppOverrides, self.appScopeBundleID, kMFAppOverrideRootKey, kMFConfigKeyRemaps];
+}
+
++ (NSArray *)remapsForBundleID:(NSString *)bundleID {
+    /// Read without keyPaths, for the same dots-in-bundleID reason.
+    NSDictionary *overrides = Config.shared.config[kMFConfigKeyAppOverrides];
+    return overrides[bundleID][kMFAppOverrideRootKey][kMFConfigKeyRemaps];
+}
+
++ (BOOL)hasOverrideForBundleID:(NSString *)bundleID {
+    return [self remapsForBundleID:bundleID] != nil; /// An empty table is still an override
+}
+
++ (NSArray<NSString *> *)bundleIDsWithOverrides {
+    NSDictionary *overrides = Config.shared.config[kMFConfigKeyAppOverrides];
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSString *bundleID in overrides.allKeys) {
+        if ([self remapsForBundleID:bundleID] != nil) [result addObject:bundleID];
+    }
+    [result sortUsingSelector:@selector(caseInsensitiveCompare:)];
+    return result;
+}
+
++ (void)removeOverrideForBundleID:(NSString *)bundleID {
+    NSMutableDictionary *overrides = ((NSDictionary *)Config.shared.config[kMFConfigKeyAppOverrides]).mutableCopy;
+    if (overrides == nil) return;
+    [overrides removeObjectForKey:bundleID];
+    /// Drop the whole AppOverrides key once it's empty, so a config with no overrides looks exactly like one that
+    /// never had any.
+    setConfig(kMFConfigKeyAppOverrides, overrides.count > 0 ? overrides : nil);
+    commitConfig();
+}
+
 - (void)loadDataModelFromConfig {
     [Config.shared loadConfigFromFile]; /// Not sure if necessary. Other than this, the only caller of `loadConfigFromFile` is `handleConfigFileChange`. Edit: Think this is unnecessary. Remove.
-    self.dataModel = Config.shared.config[kMFConfigKeyRemaps];
+
+    if (self.isGlobalScope) {
+        self.dataModel = Config.shared.config[kMFConfigKeyRemaps];
+        return;
+    }
+
+    NSArray *appRemaps = [RemapTableController remapsForBundleID:self.appScopeBundleID];
+    if (appRemaps == nil) {
+        /// No override yet -> seed the editor from the global table, so "add an app" starts from what you already
+        /// have rather than an empty screen. Nothing is written until the user actually edits something.
+        appRemaps = Config.shared.config[kMFConfigKeyRemaps];
+    }
+    self.dataModel = appRemaps;
 }
 - (void)writeDataModelToConfig {
-    
+
     DDLogDebug("TRM remap table store remaps"); /// Currently looks like this is never called? That can't be true.
-    
-    setConfig(kMFConfigKeyRemaps, self.dataModel);
+
+    [Config.shared.config setObject:self.dataModel forCoolKeyArray:[self remapsKeyArray]];
     commitConfig();
 }
 

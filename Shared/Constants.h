@@ -190,7 +190,8 @@ typedef NSString*                                                       MFString
 #define kMFActionDictTypeSystemDefinedEvent                             @"systemDefinedEvent"
 #define kMFActionDictTypeMouseButtonClicks                              @"mouseButton"
 #define kMFActionDictTypeAddModeFeedback                                @"addModeAction"
-#define kMFActionDictTypeToggleScrollAndZoomMode                        @"toggleScrollAndZoomMode" /// Fork: see HelperState.scrollAndZoomModeIsActive
+#define kMFActionDictTypeToggleScrollAndZoomMode                        @"toggleScrollAndZoomMode" /// Fork: see HelperState.MFTrackballMode
+#define kMFActionDictTypeToggleZoomMode                                 @"toggleZoomMode"          /// Fork: as above, but the ball keeps moving the pointer
 
 // Variant keys
 

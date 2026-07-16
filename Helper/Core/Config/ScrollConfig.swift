@@ -322,6 +322,22 @@ import Cocoa
     @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...150
     @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...1.2
 
+    // MARK: Invert ball scrolling (fork)
+
+    @objc lazy var u_invertBallScroll: Bool = {
+        /// Inverts the direction the ball scrolls while Scroll & Zoom Mode is latched.
+        ///     Default off == upstream's `TwoFingerSwipe` behaviour, where the content follows the ball like a
+        ///     trackpad (`twoFingerScale = 1.0`, see ModifiedDragOutputTwoFingerSwipe.m). On == the content moves
+        ///     the opposite way, like dragging a scrollbar.
+        ///
+        ///     Independent of `u_invertDirection` (which is the scroll *ring*) — they're different physical inputs
+        ///     and there's no reason one implies the other.
+        ///
+        ///     `as?` + fallback, not `as!`: see u_invertZoom below for why every new key in this fork must be read
+        ///     nil-tolerantly.
+        return (c("invertBallScroll") as? Bool) ?? false
+    }()
+
     // MARK: Invert Zoom
 
     @objc lazy var u_invertZoom: Bool = {

@@ -228,9 +228,173 @@ import Foundation
         }
         /// Add trackingArea
         createTrackingArea()
-        
+
         /// Init AddField visuals
         addField.coolInit()
+
+        /// Fork: per-app remaps
+        addAppScopeDropdown()
+    }
+
+    // MARK: App scope dropdown (fork)
+
+    /// Picks which app's remaps the table below is editing. "All Apps" (global) is the default and is the normal
+    /// MMF behaviour; picking an app edits `config[AppOverrides][<bundleID>][Root][Remaps]`, which the Helper
+    /// merges over the global config whenever that app is frontmost (HelperState.applyOverrides(forApp:)).
+
+    private var appScopePopUp: NSPopUpButton? = nil
+
+    private static let kAddAppTag = 1
+    private static let kRemoveAppTag = 2
+
+    private func addAppScopeDropdown() {
+
+        let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        popUp.target = self
+        popUp.action = #selector(appScopeChanged(_:))
+        popUp.setAccessibilityIdentifier("axAppScopePopUp")
+        /// Hug, or a fill-distribution stack stretches it — and TabViewController measures tabs by growing the
+        /// window to 99999x99999, which turns a stretchy subview into a nonsense tab size.
+        popUp.setContentHuggingPriority(.required, for: .vertical)
+        popUp.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        /// Sit next to Options / Restore Defaults in the bottom bar.
+        guard let bar = optionsButton.superview as? NSStackView else {
+            assert(false, "ButtonTab layout changed: optionsButton is not in an NSStackView.")
+            return
+        }
+        bar.insertArrangedSubview(popUp, at: 0)
+
+        appScopePopUp = popUp
+        rebuildAppScopeMenu()
+    }
+
+    private func appDisplayName(_ bundleID: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: url.path)
+        }
+        return bundleID /// App not installed (or was uninstalled) — show the raw ID rather than hiding the entry
+    }
+
+    private func rebuildAppScopeMenu() {
+
+        guard let popUp = appScopePopUp else { return }
+        let selected = tableController.appScopeBundleID
+
+        let menu = NSMenu()
+
+        let global = NSMenuItem(title: MFLocalizedString("buttons.scope.all-apps", comment: ""), action: nil, keyEquivalent: "")
+        global.representedObject = nil
+        menu.addItem(global)
+
+        let configured = RemapTableController.bundleIDsWithOverrides()
+        if !configured.isEmpty {
+            menu.addItem(.separator())
+            for bundleID in configured {
+                let item = NSMenuItem(title: appDisplayName(bundleID), action: nil, keyEquivalent: "")
+                item.representedObject = bundleID
+                if let icon = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+                    .map({ NSWorkspace.shared.icon(forFile: $0.path) }) {
+                    icon.size = NSSize(width: 16, height: 16)
+                    item.image = icon
+                }
+                menu.addItem(item)
+            }
+        }
+        /// An app being edited but not yet saved (no edits made) won't be in `configured` — keep it selectable so
+        /// the popup doesn't silently jump back to Global while you're looking at it.
+        if let selected = selected, !selected.isEmpty, !configured.contains(selected) {
+            menu.addItem(.separator())
+            let item = NSMenuItem(title: appDisplayName(selected), action: nil, keyEquivalent: "")
+            item.representedObject = selected
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+        let add = NSMenuItem(title: MFLocalizedString("buttons.scope.add-app", comment: ""), action: nil, keyEquivalent: "")
+        add.tag = Self.kAddAppTag
+        menu.addItem(add)
+
+        if let selected = selected, !selected.isEmpty {
+            let remove = NSMenuItem(title: String(format: MFLocalizedString("buttons.scope.remove-app", comment: ""),
+                                                 appDisplayName(selected)),
+                                    action: nil, keyEquivalent: "")
+            remove.tag = Self.kRemoveAppTag
+            menu.addItem(remove)
+        }
+
+        popUp.menu = menu
+
+        /// Restore the selection
+        let index = menu.items.firstIndex { ($0.representedObject as? String) == selected && $0.tag == 0 } ?? 0
+        popUp.selectItem(at: index)
+    }
+
+    @objc private func appScopeChanged(_ sender: NSPopUpButton) {
+
+        guard let item = sender.selectedItem else { return }
+
+        if item.tag == Self.kAddAppTag {
+            presentAddAppPanel()
+            return
+        }
+        if item.tag == Self.kRemoveAppTag {
+            presentRemoveApp()
+            return
+        }
+
+        tableController.appScopeBundleID = item.representedObject as? String
+        tableController.reloadAll()
+        rebuildAppScopeMenu()
+    }
+
+    private func presentAddAppPanel() {
+
+        guard let window = self.view.window else { rebuildAppScopeMenu(); return }
+
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+
+        panel.beginSheetModal(for: window) { response in
+            defer { self.rebuildAppScopeMenu() } /// Always resync the popup — it currently shows "Add App…" selected
+
+            guard response == .OK,
+                  let url = panel.url,
+                  let bundleID = Bundle(url: url)?.bundleIdentifier
+            else { return }
+
+            self.tableController.appScopeBundleID = bundleID
+            self.tableController.reloadAll()
+            /// Nothing is written to config yet — the override is created on the first edit. See
+            /// RemapTableController.loadDataModelFromConfig, which seeds the editor from the global table.
+        }
+    }
+
+    private func presentRemoveApp() {
+
+        guard let bundleID = tableController.appScopeBundleID, !bundleID.isEmpty,
+              let window = self.view.window
+        else { rebuildAppScopeMenu(); return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(format: MFLocalizedString("buttons.scope.remove-app.confirm", comment: ""),
+                                   appDisplayName(bundleID))
+        alert.informativeText = MFLocalizedString("buttons.scope.remove-app.body", comment: "")
+        alert.addButton(withTitle: MFLocalizedString("buttons.scope.remove-app.confirm-button", comment: ""))
+        alert.addButton(withTitle: MFLocalizedString("buttons.scope.remove-app.cancel-button", comment: ""))
+
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                RemapTableController.removeOverride(forBundleID: bundleID)
+                self.tableController.appScopeBundleID = nil
+            }
+            self.tableController.reloadAll()
+            self.rebuildAppScopeMenu()
+        }
     }
     
     func createTrackingArea() {

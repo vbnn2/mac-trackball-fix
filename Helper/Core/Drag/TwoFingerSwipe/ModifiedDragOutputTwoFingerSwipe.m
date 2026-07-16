@@ -75,7 +75,20 @@ static dispatch_group_t _momentumScrollWaitGroup;
 + (void)handleBecameInUse {
     
     /// Freeze pointer
-    if (GeneralConfig.freezePointerDuringModifiedDrag) {
+    ///
+    /// Fork: always freeze the pointer outright in Scroll & Zoom Mode.
+    ///     `General.lockPointerDuringDrag` is off by default, so the else-branch runs:
+    ///     `freezeEventDispatchPointAtPosition:` pins where *events* get delivered but lets the pointer keep
+    ///     travelling across the screen. For a held drag that's a sane default — it's transient and you can see
+    ///     where you'll end up. For a *latched* mode it's just wrong: the ball is the scroller, so a pointer
+    ///     wandering off (and eventually parking against a screen edge) is pure noise.
+    ///
+    ///     Not exposed as a setting — this is what the mode means. `lockPointerDuringDrag` still governs held
+    ///     drags, so upstream's behaviour there is untouched.
+    ///
+    ///     Safe to force: both deactivation paths below call `[PointerFreeze unfreeze]`, and leaving the mode goes
+    ///     through `ModifiedDrag.deactivate()`.
+    if (GeneralConfig.freezePointerDuringModifiedDrag || HelperState.shared.trackballModeIsScrollAndZoom) {
         [PointerFreeze freezePointerAtPosition:_drag->usageOrigin];
     } else {
         [PointerFreeze freezeEventDispatchPointAtPosition:_drag->usageOrigin];
@@ -87,7 +100,22 @@ static dispatch_group_t _momentumScrollWaitGroup;
 }
 
 + (void)handleMouseInputWhileInUseWithDeltaX:(double)deltaX deltaY:(double)deltaY event:(CGEventRef)event {
-    
+
+    /// Fork: invert ball scrolling in Scroll & Zoom Mode.
+    ///     Applied at the top so every downstream consumer (the smoothing animator, the gesture-scroll deltas, and
+    ///     the momentum that GestureScrollSimulator spins up from them) sees consistently inverted input. Negating
+    ///     later would invert the visible scroll but leave momentum flying the original way.
+    ///
+    ///     Deliberately gated on `.scrollAndZoom` rather than applying to every TwoFingerSwipe drag: this output is
+    ///     shared with upstream's held "Scroll & Navigate" drag effect, which isn't what the setting is about and
+    ///     shouldn't silently flip. If you later map that effect and want it inverted too, widen this to
+    ///     `trackballModeIsActive` — or drop the mode check entirely.
+    if (HelperState.shared.trackballModeIsScrollAndZoom && ScrollConfig.shared.u_invertBallScroll) {
+        deltaX = -deltaX;
+        deltaY = -deltaY;
+    }
+
+
     /**
      scrollSwipe scaling
      A scale of 1.0 will make the pixel based animations (normal scrolling) follow the mouse pointer.

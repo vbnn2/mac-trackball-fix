@@ -409,12 +409,12 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// Update modfications
         MFScrollModificationResult newMods = [ScrollModifiers currentModificationsWithEvent:event];
 
-        /// Fork: while Scroll & Zoom Mode is latched, the ring zooms with no modifier held.
+        /// Fork: while ANY trackball mode is latched (Scroll & Zoom / Zoom), the ring zooms with no modifier held.
         ///     Forced here rather than in ScrollModifiers so it beats whatever the keyboard says: the whole point of
         ///     the mode is that you don't have to hold anything. Note this deliberately overrides any *effect*
         ///     modification (horizontal scroll, rotate, ...) but leaves input modifications (precise/quick) alone,
         ///     so Option-to-be-precise still works while zooming.
-        if (HelperState.shared.scrollAndZoomModeIsActive) {
+        if (HelperState.shared.trackballModeIsActive) {
             newMods.effectMod = kMFScrollEffectModificationZoom;
         }
 

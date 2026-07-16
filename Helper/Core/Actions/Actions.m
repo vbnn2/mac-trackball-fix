@@ -175,7 +175,12 @@
         } else if ([actionType isEqualToString:kMFActionDictTypeToggleScrollAndZoomMode]) {
 
             /// Fork: latch/unlatch Scroll & Zoom Mode. All the actual work is in HelperState.
-            [HelperState.shared toggleScrollAndZoomMode];
+            [HelperState.shared toggleTrackballMode:MFTrackballModeScrollAndZoom];
+
+        } else if ([actionType isEqualToString:kMFActionDictTypeToggleZoomMode]) {
+
+            /// Fork: same latch, ball left alone — see HelperState.MFTrackballMode.
+            [HelperState.shared toggleTrackballMode:MFTrackballModeZoomOnly];
 
         } else if ([actionType isEqualToString:kMFActionDictTypeAddModeFeedback]) {
             NSMutableDictionary *payload = ((NSMutableDictionary *)actionDict.mutableCopy);

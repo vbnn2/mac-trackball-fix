@@ -43,6 +43,14 @@ void commitConfig(void);
 
 /// Overrides
 - (BOOL)loadOverridesForAppUnderMousePointerWithEvent:(CGEventRef)event;
+
+/// Fork: app overrides, keyed on the FRONTMOST app.
+///     Upstream only ever resolved overrides via the app under the *mouse pointer* (the method above, whose only
+///     caller is disabled at Scroll.m:375). That's arguably right for scrolling — you scroll what you point at —
+///     but wrong for buttons, which belong to whatever app has focus. This fork only does frontmost.
+///     `HelperState` owns the tracking and calls this on NSWorkspace.didActivateApplicationNotification.
+- (void)loadOverridesForApp:(NSString *)bundleID;
+@property (strong, nonatomic, readonly) NSString *currentAppOverrideBundleID; /// "" == no override / global
 @property (strong, nonatomic, readonly) NSMutableDictionary *configWithAppOverridesApplied; /// [Aug 2025] This could just be an ivar
 
 /// React

@@ -28,7 +28,7 @@ import Cocoa
     /// Init
     private static var isInitialized = false
 
-    /// Fork: the button whose mouseUp we still owe a swallow, after its mouseDown exited Scroll & Zoom Mode.
+    /// Fork: the button whose mouseUp we still owe a swallow, after its mouseDown exited a trackball mode.
     private static var swallowUpForButton: NSNumber? = nil
     private static func coolInitialize() {
         isInitialized = true
@@ -44,7 +44,7 @@ import Cocoa
             /// Init
         if !isInitialized { coolInitialize() }
 
-        /// Fork: any button click exits Scroll & Zoom Mode.
+        /// Fork: any button click exits whichever trackball mode is latched (Scroll & Zoom / Zoom).
         ///     Placed above the `maxClickLevel == 0` early-return below, so that buttons with no remap assigned exit
         ///     the mode too — "click any button" has to mean any button.
         ///     We swallow the click that exits (refusing passthrough and returning before the clickCycle) so it only
@@ -53,9 +53,9 @@ import Cocoa
         ///
         ///     Note this only ever sees buttons 3+: ButtonInputReceiver's tap mask is OtherMouseDown|OtherMouseUp
         ///     (ButtonInputReceiver.m:59). MB1/MB2 are handled by HelperState's own exit tap.
-        if HelperState.shared.scrollAndZoomModeIsActive, mouseDown {
-            HelperState.shared.setScrollAndZoomMode(false)
-            /// Remember to swallow this button's mouseUp as well. We can't just test `scrollAndZoomModeIsActive` on
+        if HelperState.shared.trackballModeIsActive, mouseDown {
+            HelperState.shared.setTrackballMode(.off)
+            /// Remember to swallow this button's mouseUp as well. We can't just test `trackballModeIsActive` on
             /// the up, because the line above has already turned it off — which would let the up through and leave
             /// the app with a mouseUp that has no matching mouseDown.
             swallowUpForButton = button

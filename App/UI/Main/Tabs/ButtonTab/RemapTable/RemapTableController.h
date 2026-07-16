@@ -32,6 +32,17 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 - (void)reloadAll;
 
+/// Fork: which app's remaps this table is editing.
+///     `nil` or `@""` == global (`config[Remaps]`, the normal MMF behaviour).
+///     A bundleID    == that app's override (`config[AppOverrides][<id>][Root][Remaps]`).
+///     Set it, then call `-reloadAll`.
+@property (nonatomic, strong, nullable) NSString *appScopeBundleID;
+
+/// Does an override table exist for `bundleID`? (An *empty* table still counts — that's a meaningful override.)
++ (BOOL)hasOverrideForBundleID:(NSString *)bundleID;
++ (NSArray<NSString *> *)bundleIDsWithOverrides;
++ (void)removeOverrideForBundleID:(NSString *)bundleID;
+
 @end
 
 NS_ASSUME_NONNULL_END
