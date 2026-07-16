@@ -11,8 +11,10 @@ Kensington Expert Mouse TB800 trackball.
 
 ## 1. Quick start
 
+Requirements: macOS 12 or later, Apple Silicon for the provided script, and Xcode with the macOS
+SDK and Command Line Tools installed.
+
 ```bash
-git submodule update --init --recursive   # required once; the repo ships this empty
 ./dev.sh run                              # build + run the Helper with live logs
 ```
 
@@ -20,13 +22,51 @@ Then grant **Accessibility** permission when macOS prompts (System Settings → 
 Security → Accessibility). Without it the Helper starts but installs no event tap, so
 nothing happens and you get no error.
 
-`./dev.sh` commands: `build`, `run`, `app`, `test`, `install`, `logs`, `stop`, `clean`.
+`./dev.sh` commands: `build`, `run`, `app`, `test`, `install`, `publish-check`, `publish`,
+`logs`, `logs-dump`, `stop`, `clean`.
 
 > **Run it in the foreground.** `./dev.sh run &` dies instantly with
 > `Assertion failed: (!signal_handler_did_exist), UNIXSignals.m, line 133`. That's not a bug in
 > the script: `UNIXSignals.m:133` asserts SIGTERM's previous disposition is `SIG_DFL` and
 > deliberately rejects `SIG_IGN` — and bash sets `SIGINT`/`SIGQUIT` to `SIG_IGN` for
 > backgrounded jobs, which `exec` inherits. Give it its own terminal tab.
+
+### Publishing
+
+`./dev.sh publish` creates an arm64 Release archive, signs it with a Developer ID Application
+certificate, submits it to Apple for notarization, staples the ticket, verifies it with Gatekeeper,
+and writes a distributable ZIP plus SHA-256 checksum under `dist/publish-<timestamp>/`.
+
+Prerequisites:
+
+1. Install a `Developer ID Application` certificate and its private key in the login Keychain.
+2. Store notarization credentials in the Keychain:
+
+   ```bash
+   xcrun notarytool store-credentials mac-trackball-fix \
+     --apple-id you@example.com \
+     --team-id YOUR_TEAM_ID
+   ```
+
+3. Validate local prerequisites, then publish:
+
+   ```bash
+   NOTARY_PROFILE=mac-trackball-fix ./dev.sh publish-check
+   NOTARY_PROFILE=mac-trackball-fix ./dev.sh publish
+   ```
+
+Optional environment variables:
+
+- `DEVELOPER_ID_APPLICATION`: exact Keychain identity when more than one Developer ID certificate
+  is installed. The script otherwise selects the first matching identity.
+- `PUBLISH_TEAM_ID`: overrides the Team ID derived from the certificate name.
+- `PUBLISH_DIR`: overrides the timestamped output directory.
+- `NOTARY_TIMEOUT`: notarization wait timeout, default `30m`.
+
+The command produces the signed and notarized artifact locally. It does not create a GitHub release,
+upload files, generate a Sparkle appcast, or sign a Sparkle update feed. No Apple credentials are
+stored in the repository. The existing Release build phase increments `CFBundleVersion` in both
+source Info.plists; keep that version bump when the release is accepted.
 
 ---
 
@@ -69,7 +109,7 @@ schemes you build are:
   for launchd (or you) to start the Helper, then attaches. Useful for debugging the real
   launchd-managed install; overkill for day-to-day work.
 
-### Two things that break `./run`
+### The upstream `./run` script
 
 The upstream `./run` script is **not** the build system — it's a localization/markdown tool.
 It's also doubly broken here:
@@ -78,7 +118,9 @@ It's also doubly broken here:
 2. `run.py:189` asserts the checkout directory is named `mac-mouse-fix`. This fork is
    `mac-trackball-fix`, so it throws `AssertionError` even after the submodule is restored.
 
-Use `./dev.sh` / `xcodebuild` for building. Only reach for `./run` if you touch localization.
+Use `./dev.sh` / `xcodebuild` for building. The `mac-mouse-fix-scripts` submodule is not required
+for normal builds; initialize it only if you need to repair and use the upstream localization
+workflow.
 
 ---
 
@@ -95,17 +137,35 @@ Use `./dev.sh` / `xcodebuild` for building. Only reach for `./run` if you touch 
 So verification for scroll/button work is **manual**: run the Helper, use the trackball, read
 the logs. Debug builds log scroll internals via `DDLogDebug` (see §5).
 
+Minimum regression pass for input changes:
+
+1. Slow and fast vertical ring scrolling, including stopping and resuming within 500 ms.
+2. Horizontal scrolling and an immediate direction reversal at a content boundary.
+3. Normal zoom and **Invert Zoom Direction**.
+4. **Scroll & Zoom Mode** and **Zoom Mode**, exiting with left, right, and another mouse button.
+5. Global and per-app button mappings while switching the frontmost application.
+6. Export settings, change a visible setting, import, and confirm both the UI and Helper reload.
+7. If multiple displays are attached, start a fresh scroll on each display without moving the
+   pointer first.
+
 ---
 
 ## 4. Code map
 
 ```
+App/
+  UI/Main/Tabs/
+    GeneralTabController.swift  Config import/export; update UI is disabled
+    ScrollTabController.swift   Trackball tuning and direction controls
+    ButtonTab/                  Global and per-app remap editor
+    AboutTabController.swift    Header-only About tab
 Helper/
   AccessibilityCheck.m       Entry point; polls for Accessibility, then boots everything
+  HelperState.swift          Frontmost-app overrides and latched trackball modes
   Core/
     Scroll/                  ← the scroll engine
       Scroll.m               Event tap + main processing pipeline (~1300 lines, the core)
-      ScrollAnalyzer.m       Tick timing: consecutive ticks, swipes, direction changes
+      ScrollAnalyzer.m       Tick timing plus smoothed units-per-tick
       ScrollModifiers.swift  Maps keyboard/button mods → input/effect modifications
       ScrollUtility.m        Axis + direction helpers
     Buttons/                 Click/hold state machine (ClickCycle.swift, Buttons.swift)
@@ -118,6 +178,7 @@ Helper/
 Shared/
   Constants.h                Bundle IDs, action-dict string keys, launchd labels
   Config/default_config.plist  Default remaps + scroll params
+  Config/Config.m            Persistence, repair, and per-app override merging
   MessagePort/               App ↔ Helper IPC (CFMessagePort)
   HelperServices/            launchd / SMAppService registration
 ```
@@ -126,14 +187,72 @@ Shared/
 
 ```
 eventTapCallback()                     ← CGEventTap, kCGEventScrollWheel
-  ├── early-outs (see §6 — this is where trackball events get dropped)
+  ├── records line + point deltas and rejects unsupported event types
   └── dispatch_async(_scrollQueue) → heavyProcessing()
         ├── ScrollUtility axisForVerticalDelta:horizontalDelta:  → picks ONE axis
-        ├── ScrollAnalyzer updateWithTickOccuringAt:direction:   → tick timing
-        ├── accelerationCurve evaluateAt:(1/timeBetweenTicks)    → px for this tick
+        ├── ScrollAnalyzer → smoothed interval + line-delta units
+        ├── velocity = units / interval
+        ├── trackball tuning → pixels for this tick
         ├── Animator + drag/Bezier curve                         → smooth interpolation
         └── sendOutputEvents() → sendScroll() / TouchSimulator
 ```
+
+### Fork feature map
+
+| Feature | UI/config | Runtime implementation |
+|---|---|---|
+| Five scroll-tuning sliders | `ScrollTabController.swift`, `Scroll.tuning.*` | `ScrollConfig.swift`, `Scroll.m`, `ScrollAnalyzer.m` |
+| Invert zoom / ball scroll | `Scroll.invertZoom`, `Scroll.invertBallScroll` | `Scroll.m`, `ModifiedDragOutputTwoFingerSwipe.m` |
+| Scroll & Zoom / Zoom modes | Button action dictionaries | `HelperState.swift`, `Actions.m`, `Buttons.swift` |
+| Shift + Primary Click | Remap effects table; optional `flags` key | `ModificationUtility.m`, `Actions.m` |
+| Per-app button mappings | `AppOverrides.<bundleID>.Root.Remaps` | `RemapTableController.m`, `Config.m`, `HelperState.swift` |
+| Config import/export | General tab | `GeneralTabController.swift`, `Config`, `MFMessagePort` |
+| Header-only About tab | About tab | `AboutTabController.swift`, `FORCE_LICENSED` build flag |
+| Disabled upstream updates | General/menu UI | `AppDelegate.m`, `CoolSUUpdater.m`, `SparkleUpdaterController.m` |
+
+### Config and override behavior
+
+The live config is a property list under:
+
+```text
+~/Library/Application Support/com.pixeption.mac-mouse-fix/config.plist
+```
+
+The main app owns edits and persistence; it sends `configFileChanged` over `MFMessagePort`, and the
+Helper reloads the file. The old external-file FSEvent reload path is disabled, so copying a plist
+over the live config without the reload/message sequence does not update a running Helper.
+
+Per-app mappings are sparse overrides under `AppOverrides.<bundleID>.Root.Remaps`. They are merged
+over the global remap table by trigger and modification precondition. `HelperState` follows
+`NSWorkspace.didActivateApplicationNotification`, applies the frontmost app's merged config, and
+reloads remaps. These are button overrides; scroll tuning remains global.
+
+New config keys must be nil-tolerant. Existing configs are not automatically backfilled merely
+because a key was added to `default_config.plist`. For the five tuning values, keep all three
+fallback sources synchronized:
+
+1. `Shared/Config/default_config.plist`
+2. `Helper/Core/Config/ScrollConfig.swift`
+3. `App/UI/Main/Tabs/ScrollTabController.swift`
+
+### Rules for coding agents
+
+- Build the `App` scheme so the Helper is embedded. Do not run the standalone Helper product.
+- Use `./dev.sh`; do not treat the upstream `./run` localization tool as the build entry point.
+- Preserve unrelated work in a dirty tree and keep fork changes marked with `Fork:` where the
+  surrounding source uses that convention.
+- Keep `PRODUCT_BUNDLE_IDENTIFIER`, `Shared/Constants.h`, `sm_launchd.plist`, URL metadata, and
+  entitlement/keychain groups synchronized.
+- Changes to config normally need both app-side UI/persistence and Helper-side reload/runtime
+  handling. Confirm the IPC path rather than assuming the file watcher will reload it.
+- Add user-facing strings to `Localization/Localizable.xcstrings`; programmatic UI still needs
+  localization and Accessibility identifiers.
+- Programmatic views inside the tab stacks need explicit vertical hugging. The tab controller
+  measures content using a temporary 99999×99999 window, and flexible views otherwise produce a
+  nonsense tab size.
+- There is no behavioral XCTest suite. Do not report `xcodebuild test` as a valid verification
+  command; use the manual regression pass above.
+- Keep scroll-path logging scalar where possible. `%@` values are private-redacted by `os_log`.
 
 ---
 
@@ -181,7 +300,10 @@ live-tuning constants without rebuilding.
 
 ---
 
-## 6. Fork-specific notes
+## 6. Fork-specific and local test-machine notes
+
+The bundle-ID rules below apply to every checkout. The Trash, SteerMouse, and Karabiner observations
+describe the current development machine and may become stale.
 
 ### Bundle ID drift — FIXED (it was not latent; it was the "can't enable" bug)
 
@@ -256,7 +378,7 @@ Read off the live device (`ioreg -c IOHIDDevice -r -l`), not from a datasheet:
 | GD 0x38 | **Wheel** (scroll ring) | −127…127 | 8 |
 | Consumer 0x238 | **AC Pan** (horizontal) | −127…127 | 8 |
 
-Two conclusions that drive everything in `PLAN.md`:
+Two conclusions that shaped the implemented scroll engine:
 
 1. **No Resolution Multiplier (GD 0x48).** The TB800 does *not* negotiate HID hi-res
    scrolling, so macOS reports its scroll as **line-based, not continuous** —
@@ -264,7 +386,8 @@ Two conclusions that drive everything in `PLAN.md`:
    The "smooth" feel comes from the free-spinning ring emitting many reports quickly,
    and from **multi-unit deltas** (the 8-bit field carries far more than ±1) — not from
    pixel-precise scrolling.
-2. **Wheel and AC Pan share Report ID 1**, so a single report can carry both axes at once.
+2. **Wheel and AC Pan share Report ID 1**, although captured macOS events presented them as
+   separate single-axis scroll events rather than diagonal events.
 
 The receiver also exposes keyboard (page 7) and consumer (page 12) collections that
 enumerate their full usage ranges — those are arrays, not real axes. Don't read the presence

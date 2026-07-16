@@ -15,6 +15,8 @@
 #   app       Build, then launch the main app GUI
 #   test      Build + run the "Tests" scratch app (there is NO unit test suite)
 #   install   Build, then copy the app to /Applications (stable path for permissions)
+#   publish-check  Validate Developer ID and notarization prerequisites
+#   publish   Archive, notarize, staple, verify, and package an arm64 Release build
 #   stop      Kill any running Helper / app instances
 #   logs      Stream the App's + Helper's own logs live (MMF_LOG_ALL=1 to include system logs)
 #   logs-dump [since]  Show past logs (default 15m). Sparse: os_log doesn't persist info/debug.
@@ -28,13 +30,26 @@ APP_NAME="Mac Mouse Fix"    # product name (.app on disk)
 HELPER_NAME="Mac Mouse Fix Helper"
 TEST_SCHEME="Tests"
 CONFIG="${CONFIG:-Debug}"
+DESTINATION="platform=macOS,arch=arm64"
+ARCH_SETTINGS=("ARCHS=arm64" "ONLY_ACTIVE_ARCH=YES")
+RELEASE_SCHEME="App - Release"
 
 cd "$(dirname "$0")"
+
+die() {
+  echo "!! $*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
 
 # Ask xcodebuild where the products actually land, rather than hardcoding the
 # DerivedData hash (it changes if the project path changes).
 build_dir() {
   xcodebuild -project "$PROJECT" -scheme "$APP_SCHEME" -configuration "$CONFIG" \
+    -destination "$DESTINATION" "${ARCH_SETTINGS[@]}" \
     -showBuildSettings 2>/dev/null \
     | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}'
 }
@@ -46,7 +61,7 @@ do_build() {
   echo "==> Building '$APP_SCHEME' ($CONFIG)…"
   # The App scheme has the Helper as a dependency and embeds it, so this builds both.
   xcodebuild -project "$PROJECT" -scheme "$APP_SCHEME" -configuration "$CONFIG" \
-    -destination 'platform=macOS' build \
+    -destination "$DESTINATION" "${ARCH_SETTINGS[@]}" build \
     | grep -E "error:|warning: (unused|unin)|BUILD (SUCCEEDED|FAILED)" || true
   # xcodebuild's exit code is swallowed by the pipe above; re-check the product exists.
   [ -x "$(HELPER_BIN)" ] || { echo "!! Build did not produce a Helper binary"; exit 1; }
@@ -58,6 +73,158 @@ do_stop() {
   pkill -f "$HELPER_NAME" 2>/dev/null || true
   pkill -f "/$APP_NAME.app/Contents/MacOS/" 2>/dev/null || true
   sleep 0.3
+}
+
+PUBLISH_IDENTITY_RESOLVED=""
+PUBLISH_TEAM_ID_RESOLVED=""
+
+resolve_publish_credentials() {
+  require_command security
+  require_command xcodebuild
+  require_command xcrun
+  require_command codesign
+  require_command spctl
+  require_command ditto
+  require_command lipo
+  require_command plutil
+  require_command shasum
+
+  local identities requested_identity
+  identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  requested_identity="${DEVELOPER_ID_APPLICATION:-}"
+
+  if [ -n "$requested_identity" ]; then
+    printf '%s\n' "$identities" | grep -F "$requested_identity" >/dev/null \
+      || die "Developer ID identity not found in the keychain: $requested_identity"
+    PUBLISH_IDENTITY_RESOLVED="$requested_identity"
+  else
+    PUBLISH_IDENTITY_RESOLVED="$(
+      printf '%s\n' "$identities" \
+        | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
+        | head -n 1
+    )"
+  fi
+
+  if [ -z "$PUBLISH_IDENTITY_RESOLVED" ]; then
+    die "No 'Developer ID Application' signing identity found. Install its certificate and private key, or set DEVELOPER_ID_APPLICATION to its exact keychain identity."
+  fi
+
+  PUBLISH_TEAM_ID_RESOLVED="${PUBLISH_TEAM_ID:-}"
+  if [ -z "$PUBLISH_TEAM_ID_RESOLVED" ]; then
+    PUBLISH_TEAM_ID_RESOLVED="$(
+      printf '%s\n' "$PUBLISH_IDENTITY_RESOLVED" \
+        | sed -n 's/.*(\([A-Z0-9][A-Z0-9]*\))$/\1/p'
+    )"
+  fi
+  [ -n "$PUBLISH_TEAM_ID_RESOLVED" ] \
+    || die "Could not derive the Apple Developer Team ID. Set PUBLISH_TEAM_ID explicitly."
+
+  [ -n "${NOTARY_PROFILE:-}" ] || die "NOTARY_PROFILE is required. Create one with: xcrun notarytool store-credentials mac-trackball-fix --apple-id <apple-id> --team-id $PUBLISH_TEAM_ID_RESOLVED"
+}
+
+do_publish_check() {
+  resolve_publish_credentials
+
+  echo "==> Publish prerequisites found"
+  echo "    Scheme: $RELEASE_SCHEME"
+  echo "    Architecture: arm64"
+  echo "    Signing identity: $PUBLISH_IDENTITY_RESOLVED"
+  echo "    Team ID: $PUBLISH_TEAM_ID_RESOLVED"
+  echo "    Notary profile: $NOTARY_PROFILE"
+  echo
+  echo "    Note: the Keychain profile is validated by Apple when notarization is submitted."
+}
+
+do_publish() {
+  resolve_publish_credentials
+
+  local timestamp publish_dir archive_path archive_app
+  local main_binary helper_binary version build_number safe_version
+  local submission_zip final_zip notary_result notary_status submission_id
+  local notary_exit checksum_file
+
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  publish_dir="${PUBLISH_DIR:-$PWD/dist/publish-$timestamp}"
+  archive_path="$publish_dir/$APP_NAME.xcarchive"
+  archive_app="$archive_path/Products/Applications/$APP_NAME.app"
+
+  mkdir -p "$publish_dir"
+
+  echo "==> Archiving '$RELEASE_SCHEME' (Release, arm64)…"
+  xcodebuild -project "$PROJECT" -scheme "$RELEASE_SCHEME" -configuration Release \
+    -destination "$DESTINATION" "${ARCH_SETTINGS[@]}" \
+    -archivePath "$archive_path" \
+    "CODE_SIGN_STYLE=Manual" \
+    "CODE_SIGN_IDENTITY=$PUBLISH_IDENTITY_RESOLVED" \
+    "DEVELOPMENT_TEAM=$PUBLISH_TEAM_ID_RESOLVED" \
+    "OTHER_CODE_SIGN_FLAGS=--timestamp" \
+    archive | tee "$publish_dir/archive.log"
+
+  [ -d "$archive_app" ] || die "Archive did not contain $APP_NAME.app"
+
+  main_binary="$archive_app/Contents/MacOS/$APP_NAME"
+  helper_binary="$archive_app/Contents/Library/LoginItems/$HELPER_NAME.app/Contents/MacOS/$HELPER_NAME"
+  [ "$(lipo -archs "$main_binary")" = "arm64" ] || die "Main app is not arm64-only"
+  [ "$(lipo -archs "$helper_binary")" = "arm64" ] || die "Helper is not arm64-only"
+
+  echo "==> Verifying Developer ID signatures…"
+  codesign --verify --deep --strict --verbose=2 "$archive_app"
+  codesign --display --verbose=4 "$archive_app" 2>"$publish_dir/codesign.txt"
+  grep -F "Authority=Developer ID Application:" "$publish_dir/codesign.txt" >/dev/null \
+    || die "Archive is not signed with a Developer ID Application certificate"
+
+  version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$archive_app/Contents/Info.plist")"
+  build_number="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$archive_app/Contents/Info.plist")"
+  safe_version="$(printf '%s' "$version" | tr ' /' '--' | tr -cd '[:alnum:]._-')"
+
+  submission_zip="$publish_dir/$APP_NAME-notary-upload.zip"
+  final_zip="$publish_dir/$APP_NAME-$safe_version-$build_number-arm64.zip"
+  notary_result="$publish_dir/notary-result.json"
+
+  echo "==> Packaging notarization upload…"
+  ditto -c -k --sequesterRsrc --keepParent "$archive_app" "$submission_zip"
+
+  echo "==> Submitting to Apple notary service…"
+  set +e
+  xcrun notarytool submit "$submission_zip" \
+    --keychain-profile "$NOTARY_PROFILE" \
+    --wait \
+    --timeout "${NOTARY_TIMEOUT:-30m}" \
+    --output-format json \
+    --no-progress | tee "$notary_result"
+  notary_exit=${PIPESTATUS[0]}
+  set -e
+
+  notary_status="$(plutil -extract status raw -o - "$notary_result" 2>/dev/null || true)"
+  submission_id="$(plutil -extract id raw -o - "$notary_result" 2>/dev/null || true)"
+
+  if [ "$notary_exit" -ne 0 ] || [ "$notary_status" != "Accepted" ]; then
+    if [ -n "$submission_id" ]; then
+      xcrun notarytool log "$submission_id" "$publish_dir/notary-log.json" \
+        --keychain-profile "$NOTARY_PROFILE" || true
+    fi
+    die "Notarization failed with status '${notary_status:-unknown}'. See $notary_result"
+  fi
+
+  echo "==> Stapling and validating notarization ticket…"
+  xcrun stapler staple -v "$archive_app"
+  xcrun stapler validate -v "$archive_app"
+
+  echo "==> Running final signature and Gatekeeper checks…"
+  codesign --verify --deep --strict --verbose=2 "$archive_app"
+  spctl --assess --type execute --verbose=4 "$archive_app"
+
+  echo "==> Creating final distributable ZIP…"
+  ditto -c -k --sequesterRsrc --keepParent "$archive_app" "$final_zip"
+  checksum_file="$final_zip.sha256"
+  shasum -a 256 "$final_zip" >"$checksum_file"
+
+  echo
+  echo "==> Publish artifact ready"
+  echo "    App: $archive_app"
+  echo "    ZIP: $final_zip"
+  echo "    SHA-256: $checksum_file"
+  echo "    Notary submission: $submission_id"
 }
 
 case "${1:-run}" in
@@ -97,7 +264,7 @@ case "${1:-run}" in
     echo "==> Building + running the 'Tests' scratch app…"
     echo "    (This project has no unit tests; this is a manual playground target.)"
     xcodebuild -project "$PROJECT" -scheme "$TEST_SCHEME" -configuration "$CONFIG" \
-      -destination 'platform=macOS' build \
+      -destination "$DESTINATION" "${ARCH_SETTINGS[@]}" build \
       | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
     open "$(build_dir)/$TEST_SCHEME.app"
     ;;
@@ -110,6 +277,14 @@ case "${1:-run}" in
     cp -R "$(APP_PATH)" /Applications/
     echo "==> Installed. Launching…"
     open "/Applications/$APP_NAME.app"
+    ;;
+
+  publish-check)
+    do_publish_check
+    ;;
+
+  publish)
+    do_publish
     ;;
 
   logs)
@@ -169,7 +344,11 @@ case "${1:-run}" in
     ;;
 
   *)
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    awk '
+      NR < 3 { next }
+      !/^#/ { exit }
+      { sub(/^# ?/, ""); print }
+    ' "$0"
     exit 1
     ;;
 esac
