@@ -302,13 +302,22 @@ import Cocoa
     @objc lazy var u_glide: Double = { slider("glide", 0.75) }()
 
     /// How long the scroll keeps gliding after your finger leaves the ring.
-    ///     The animator hands off from the base curve to a drag curve, which models `v'(t) = -a*v(t)^b`
-    ///     (DragCurve.swift). `dragExponent` (b) is 1.0 for the scrolling curves, so that's plain exponential decay:
-    ///     `v(t) = v0 * e^(-a*t)`, with a time constant of exactly `1/dragCoefficient` seconds.
-    ///     Upstream's a=23 means the speed collapses to 37% in 43ms — abrupt on a trackball, where you expect the
-    ///     ring's inertia to carry.
+    ///     The legacy animator hands off from the base curve to a drag curve, which models
+    ///     `v'(t) = -a*v(t)^b` (DragCurve.swift). `dragExponent` (b) is 1.0 for the scrolling curves, so that's plain
+    ///     exponential decay: `v(t) = v0 * e^(-a*t)`, with a time constant of exactly `1/dragCoefficient` seconds.
+    ///     The targeted engine uses the same slider below to control its release delay and settling response.
     ///     0.5 == 22.5 ~= upstream. Higher = less friction = longer glide (a=5 -> a 200ms time constant).
     @objc lazy var dragCoefficientForGlide: Double = { 40.0 - (u_glide * 35.0) }() /// 40 (abrupt) ... 5 (floaty)
+
+    /// Targeted-engine response parameters.
+    ///
+    /// A critically damped target follower tracking a constant-speed target trails it by approximately `2 / omega`.
+    /// The original experimental value (`omega = 65`) therefore added about 31ms of steady-state lag on top of the
+    /// velocity estimator and display-frame latency. These ranges keep the output visibly smooth while making the
+    /// default feel much more attached to the ring.
+    @objc lazy var targetedScrollActiveResponse: Double = { 110.0 - (u_smoothnessAmount * 40.0) }() /// 110...70 rad/s
+    @objc lazy var targetedScrollReleaseDelay: TimeInterval = { (35.0 + (u_glide * 35.0)) / 1000.0 }() /// 35...70ms
+    @objc lazy var targetedScrollReleaseResponse: Double = { 44.0 - (u_glide * 24.0) }() /// 44...20 rad/s
 
     /// Derived engine parameters
     ///     The model (see Scroll.m):  pxPerUnit(v) = pxAtRefSpeed * (v/refSpeed)^(gamma - 1),  px = pxPerUnit * units
@@ -481,8 +490,15 @@ import Cocoa
     /// The first report has no measured interval. Treat it as an explicit isolated movement rather than pretending
     /// it arrived after the full 500ms continuity timeout.
     @objc let isolatedTickVelocityInterval: TimeInterval = 200.0/1000.0
-    @objc let velocityFilterAttackTimeConstant: TimeInterval = 20.0/1000.0
-    @objc let velocityFilterReleaseTimeConstant: TimeInterval = 40.0/1000.0
+    /// Keep acceleration and deceleration similarly responsive. The earlier 20ms attack / 40ms release pair made
+    /// output speed continue drifting after the ring had already slowed. Smoothness can still add a small amount of
+    /// filtering, but it no longer doubles the release latency.
+    @objc lazy var velocityFilterAttackTimeConstant: TimeInterval = {
+        (8.0 + (u_smoothnessAmount * 16.0)) / 1000.0
+    }() /// 8...24ms; default 16ms
+    @objc lazy var velocityFilterReleaseTimeConstant: TimeInterval = {
+        (10.0 + (u_smoothnessAmount * 20.0)) / 1000.0
+    }() /// 10...30ms; default 20ms
 
     @objc lazy var consecutiveScrollSwipeMaxInterval: TimeInterval = {
         /// If more than `_consecutiveScrollSwipeIntervalMax` seconds passes between two scrollwheel swipes, then they aren't deemed consecutive.

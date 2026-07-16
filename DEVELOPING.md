@@ -202,6 +202,8 @@ reports move its target without resetting velocity; release drains only the rema
 and direction reversal cancels the stale target before accepting the reversing report. It is
 currently restricted to the plain `high` + `trackpadSimulation` path. Set
 `Scroll.targetedScrollEngine` to `false` in the config to compare against the legacy animator.
+The Smoothness slider controls its active response, while Glide controls release detection and
+settling; these parameters are derived in `ScrollConfig.swift`.
 
 ### Fork feature map
 

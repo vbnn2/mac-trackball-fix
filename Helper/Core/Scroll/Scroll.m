@@ -154,9 +154,10 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
 
     /// While reports are arriving, a fast critical response keeps the page attached to the ring. Once reports stop,
     /// a gentler response drains only the remaining target error: it glides without inventing distance or overshoot.
-    static const CFTimeInterval releaseDelay = 70.0 / 1000.0;
-    BOOL inputIsActive = CACurrentMediaTime() - _motionLastInputTime <= releaseDelay;
-    double omega = inputIsActive ? 65.0 : 18.0;
+    BOOL inputIsActive = CACurrentMediaTime() - _motionLastInputTime <= _motionConfig.targetedScrollReleaseDelay;
+    double omega = inputIsActive
+        ? _motionConfig.targetedScrollActiveResponse
+        : _motionConfig.targetedScrollReleaseResponse;
     if (!inputIsActive) {
         /// Lowering omega while the controller still has high forward velocity can make an otherwise critically
         /// damped system cross its target. Keep enough damping to satisfy v <= omega * distanceRemaining, which
@@ -167,7 +168,7 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
             double speedTowardTarget = dotProduct(_motionVelocity, remaining) / distanceRemaining;
             if (speedTowardTarget > 0) {
                 omega = MAX(omega, 1.05 * speedTowardTarget / distanceRemaining);
-                omega = MIN(omega, 80.0);
+                omega = MIN(omega, 160.0);
             }
         }
     }
