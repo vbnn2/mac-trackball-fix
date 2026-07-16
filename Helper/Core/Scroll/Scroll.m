@@ -616,19 +616,17 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// Make direction change stop scroll animation
         ///
         /// Notes:
-        /// - We implemented this here without much consideration to play around with it. I haven't really thought about the control flow and stuff - maybe it's not super clean to just return here? Maybe we should set pxToScrollForThisTick to zero? Idk. But I've been using it for a while and it works well.
-        /// - We used to have a threshold for the currentAnimationSpeed of 200 to actually cancel the animator, but it seems to feel nicer to just set the threshold to 0. At this point it might be simpler or more efficient to not use the `currentAnimationSpeed` here or use something else instead. Buttt the performance impact reallyyy shouldn't be significant and it works fine so it's whatever.
-        /// - Improvement idea: [Aug 2025]
-        ///     - Swallow the first 2 or 3 ticks of the scrollSwipe instead of just the 1st one.
-        ///         - Benefit:                  This would make it physically easier to avoid accidentally scrolling in the opposite direction
-        ///         - Implementation:     Should probably implement this in ScrollAnalyzer.m instead of doing a hack here
-        ///         - Credit for idea:       This email by 'A day of Software Engineer': (message:<510CF7AC-5BE0-4CED-BF9A-A3A3327EE2A5@gmail.com>)
+        /// The old-direction animation must stop immediately, especially at a content boundary,
+        /// but the physical tick that requested the reversal must still be delivered.
         
         double currentAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
         if (_lastScrollAnalysisResult.scrollDirectionDidChange && currentAnimationSpeed > 0) {
-            DDLogDebug("Scroll.m: Direction change – cancel scroll.");
+            /// Cancel the old-direction coast, but keep processing this tick. The animator serializes
+            /// cancel() and startWithParams() on the same queue, so the new-direction animation starts
+            /// after the old one has stopped. Returning here used to discard the exact tick that should
+            /// make scrolling responsive again at a content boundary.
+            DDLogDebug("Scroll.m: Direction change – cancel scroll and keep current tick.");
             [_animator cancel];
-            return;
         }
         
         /// Debug
@@ -1159,13 +1157,15 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         
         /// --- ContinuousScroll ---
         
-        if (dx+dy == 0) return; /// Copied from lineScroll
-        
         /// Create base event
         
-        CGEventRef event = CGEventCreate(NULL);
-        CGEventSetIntegerValueField(event, 55, 22); /// Set type to `kCGEventScrollWheel`
-        CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+        /// Use the public scroll-event constructor instead of mutating a null event into type 22.
+        /// Do not override its location: HID-posted events can move the cursor to the supplied point.
+        /// Always post the animator phase, including zero-delta Ended events. Dropping the end event
+        /// leaves some scroll views latched until unrelated pointer or click input resets their state.
+        CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitPixel, 2, 0, 0);
+        CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
+        CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, eventPhase);
         
         /// Setup subpixelator
         
@@ -1211,8 +1211,12 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         }
         
         /// Post event
-        
-        CGEventPost(kCGSessionEventTap, event);
+
+        /// Post at the HID tap so the event follows the same routing path as physical wheel input.
+        /// Our own HID tap immediately passes continuous events through, so this does not recurse into
+        /// the scroll engine. Session-tap injection can bypass routing/gesture state that some apps use,
+        /// which matches the captured failure: events were posted, but the target view stayed stuck.
+        CGEventPost(kCGHIDEventTap, event);
         CFRelease(event);
         
     } else if (outputType == kMFScrollOutputTypeLineScroll) {
@@ -1223,17 +1227,9 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         
         if (dx+dy == 0) return;
         
-        /// Create base event
-        
-        /// Sol 1: Use `CGEventCreateScrollWheelEvent()`
-        ///     - Mysterious: In the real events, `kCGScrollWheelEventIsContinuous` is false. But we have to set it true (through `kCGScrollEventUnitPixel`) to make the scroll distance match the real events.
-        ///     - Safari makes the scroll distance larger than the pixels that are specified in lineScrollEvents. But that doesn't work here. Maybe it's becuase we're setting `kCGScrollWheelEventIsContinuous` true? We're just using
-//        CGEventRef event = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 1, 0);
-        
-        /// Sol 2: Just use `CGEventCreate`
-        ///     - This is based on analysis of real events
-        CGEventRef event = CGEventCreate(NULL);
-        CGEventSetIntegerValueField(event, 55, 22); /// Set type to `kCGEventScrollWheel`
+        /// Create a real line-based scroll event.
+        CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitLine, 2, 0, 0);
+        CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
         
         /// Get line deltas
         ///     Line deltas are 1/10 of pixel deltas. See CGEventSource pixelsPerLine - it's 10
