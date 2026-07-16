@@ -121,9 +121,10 @@ static NSString *const kMFAppOverrideRootKey = @"Root"; /// The nesting level `C
 
     NSArray *appRemaps = [RemapTableController remapsForBundleID:self.appScopeBundleID];
     if (appRemaps == nil) {
-        /// No override yet -> seed the editor from the global table, so "add an app" starts from what you already
-        /// have rather than an empty screen. Nothing is written until the user actually edits something.
-        appRemaps = Config.shared.config[kMFConfigKeyRemaps];
+        /// No override yet -> start empty. The app inherits every button from the global table (the Helper merges
+        /// per-entry in `Config.m > loadOverridesForApp:`), so the per-app table only lists the buttons you actually
+        /// change here. Anything you don't add falls back to the global config. Nothing is written until you edit.
+        appRemaps = @[];
     }
     self.dataModel = appRemaps;
 }

@@ -426,7 +426,21 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// Get display  under mouse pointer
         CGDirectDisplayID displayID;
         [HelperUtility displayUnderMousePointer:&displayID withEvent:event];
-        
+
+        /// Fork: drive the scroll animation from the display the pointer is actually on.
+        ///     `_animator`'s CVDisplayLink has to be bound to an *active* display, or its callback stops firing
+        ///     and no scroll events get posted at all — a total freeze that only clears when you move the mouse.
+        ///     Upstream bound it to `NSScreen.mainScreen` (the menu-bar display) via `linkToMainScreen`. On a
+        ///     multi-monitor setup that's frequently NOT the display being scrolled, and if that display's vsync
+        ///     is parked (adaptive-sync / idle), the animation freezes. Re-binding to the display under the
+        ///     pointer on each fresh scroll keeps the link on a live display.
+        ///     `linkToDisplayUnderMousePointerWithEvent:` no-ops when the display hasn't changed, so it's cheap,
+        ///     and it runs on every gesture start (this block) — including mid-momentum — so it isn't stranded
+        ///     the way the old `!isRunning`-gated relink was.
+        [_animator.displayLink linkToDisplayUnderMousePointerWithEvent:event];
+
+        NSLog(@"MMFSCROLL fresh scroll: pointerDisplay=%u mainDisplay=%u animatorRunning=%d", displayID, CGMainDisplayID(), [_animator isRunning]);
+
         /// Get scrollConfig
         _scrollConfig = [ScrollConfig scrollConfigWithModifiers:newMods inputAxis:inputAxis display:displayID];
         
@@ -657,10 +671,11 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             ///     - (Sep 2024) This code was dead in MMF 3.0.0 - 3.0.2. It was re-activated in 3.0.3 by adding `[ScrollUtility updateMouseDidMoveWithEvent:]` in Scroll.m which was commented out. I really hope this doesn't lead to any new race-conditions / crashes. I tested it superficially, and I tried to think it through and didn't find issues, also people who used the 3.0.2-vcoba-2 build didn't seem to experience crashes, and that build had this change. That makes me relatively confident.
             ///     - (Sep 2024) There's a race condition on `ScrollUtility.mouseDidMove`, since `startWithParams:` dispatches async to another queue than the queue where .mouseDidMove is updated. (The heavyProcessing queue.)
             ///                         However, this should not lead to grave problems. Worst case, the `[_animator linkToMainScreen_Unsafe]` is not called even though the mouse moved, or it might be called several times in a row, even though the mouse didn't actually move in between.
-            if (ScrollUtility.mouseDidMove && !isRunning) {
-                /// Update animator to currently used display
-                [_animator linkToMainScreen_Unsafe];
-            }
+            /// Fork: the display-link is now re-bound to the display under the pointer on every fresh scroll
+            ///     (see the `linkToDisplayUnderMousePointerWithEvent:` call in the `firstConsecutive` block above),
+            ///     so the old `mouseDidMove && !isRunning -> linkToMainScreen_Unsafe` relink is removed. It bound to
+            ///     the wrong display (`NSScreen.mainScreen`) and, being gated on `!isRunning`, couldn't relink
+            ///     mid-momentum — which is exactly the multi-monitor freeze it was supposed to prevent.
             
             /// Declare result dict (animator start params)
             NSMutableDictionary *p = [NSMutableDictionary dictionary];

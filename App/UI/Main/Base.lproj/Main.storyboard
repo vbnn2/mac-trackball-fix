@@ -49,17 +49,7 @@
                                                 <action selector="buyMMF:" target="Voe-Tx-rLC" id="LM6-60-RNE"/>
                                             </connections>
                                         </menuItem>
-                                        <menuItem isSeparatorItem="YES" id="er1-Mw-t0o"/>
-                                        <menuItem title="Check for Updates..." id="3pt-ka-lxV">
-                                            <modifierMask key="keyEquivalentModifierMask"/>
-                                            <attributedString key="userComments">
-                                                <fragment content="Main Menu &gt; Mac Mouse Fix &gt; Check for Updates..."/>
-                                            </attributedString>
-                                            <accessibility identifier="axMenuItemCheckForUpdates"/>
-                                            <connections>
-                                                <action selector="checkForUpdates:" target="0Vp-JG-nY6" id="M6c-Iz-PQZ"/>
-                                            </connections>
-                                        </menuItem>
+                                        <!-- Fork: "Check for Updates..." menu item removed — updates are disabled in this fork. -->
                                         <menuItem isSeparatorItem="YES" id="CAj-ay-L50"/>
                                         <menuItem title="Services" id="Gr8-qh-oGd">
                                             <modifierMask key="keyEquivalentModifierMask"/>

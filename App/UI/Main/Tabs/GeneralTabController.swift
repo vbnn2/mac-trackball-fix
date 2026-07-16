@@ -169,6 +169,15 @@ class GeneralTabController: NSViewController {
             ///     new file and the Helper would keep applying the old remaps until it restarted.
             Config.loadFileAndUpdateStates()
             MFMessagePort.sendMessage("configFileChanged", withPayload: nil, waitForReply: false)
+
+            /// Refresh the Button tab's table.
+            ///     `loadFileAndUpdateStates()` re-reads the file into `Config.shared.config` and updates
+            ///     ReactiveConfig, but the RemapTable's `dataModel` is a one-time snapshot taken in
+            ///     `loadDataModelFromConfig` — it isn't bound to config changes. Without this, the imported
+            ///     button remaps are loaded in memory but the table keeps showing the pre-import state.
+            ///     `?.` handles the case where the Button tab hasn't been instantiated yet: it then reads
+            ///     the fresh config on first appearance anyway.
+            MainAppState.shared.remapTableController?.reloadAll()
         }
     }
 
@@ -363,21 +372,33 @@ class GeneralTabController: NSViewController {
         /// UI <-> data bindings
         
         showInMenuBar <~ menuBarToggle.reactive.boolValues
-        checkForUpdates <~ updatesToggle.reactive.boolValues
-        getBetaVersions <~ betaToggle.reactive.boolValues
-        
+
+        /// Fork: Updates are disabled.
+        ///     Collapse the "Check for Updates" toggle and its beta sub-section out of the layout, and skip all
+        ///     update-related bindings/side-effects. Both are arranged subviews of `mainHidableSection` (a
+        ///     CollapsingStackView), so we use its `setCollapsedWithoutAnimation(_:)` — the same mechanism the
+        ///     `.reactive.isCollapsed` bindings use — which also removes their vertical space. Collapsing
+        ///     without animation avoids jank on first tab open. The actual update checks are disabled in
+        ///     AppDelegate / CoolSUUpdater / SparkleUpdaterController.
+        ///
+        ///     ORDER MATTERS: collapse the LATER subview (`updatesExtraSection`, the last one) BEFORE the
+        ///     earlier one (`updatesToggle`). `collapseSubView` wraps the view in a NoClipWrapper and removes it
+        ///     as a direct arranged subview; collapsing the last subview reads `customSpacing(after:)` of its
+        ///     previous sibling, so that sibling must still be a direct arranged subview at that point. Doing
+        ///     `updatesToggle` first wraps it and makes the `updatesExtraSection` collapse throw in
+        ///     `-[NSStackView customSpacingAfterView:]` (SIGABRT).
+        updatesExtraSection.setCollapsedWithoutAnimation(true)
+        updatesToggle.setCollapsedWithoutAnimation(true)
+
         if usingSwitch, #available(macOS 10.15, *) {
             (enableToggle as? NSSwitcherino)?.reactive.boolValue <~ EnabledState.shared
         } else {
             enableToggle.reactive.boolValue <~ EnabledState.shared
         }
         menuBarToggle.reactive.boolValue <~ showInMenuBar
-        updatesToggle.reactive.boolValue <~ checkForUpdates
-        betaToggle.reactive.boolValue <~ getBetaVersions
-        
+
         mainHidableSection.reactive.isCollapsed <~ EnabledState.shared.producer.negate()
-        updatesExtraSection.reactive.isCollapsed <~ checkForUpdates.producer.negate()
-        
+
         /// Alert on betaToggle
         /// Notes:
         ///     - Disabling this now, because it's kind of unnecessary, and I don't know how this alert will interact, when a beta Version is acutally available and Sparkle wants to present a sheet as well. Ideally, we would want to present this sheet **before** we toggle the betaToggle, but right now we're just toggling it back if the user doesn't want to toggle it, so Sparkle still gets the message that it's been enabled.
@@ -409,22 +430,9 @@ class GeneralTabController: NSViewController {
 //            }
 //        }
         
-        /// Side effects: Sparkle
-        ///     See `applicationDidFinishLaunching` for context
-        
-        checkForUpdates.producer.skip(first: 1).startWithValues { doCheckUpdates in
-            SparkleUpdaterController.resetSkippedVersions()
-            if doCheckUpdates {
-                SUUpdater.shared().checkForUpdatesInBackground()
-            }
-        }
-        getBetaVersions.producer.skip(first: 1).startWithValues { doCheckBetas in
-            SparkleUpdaterController.resetSkippedVersions()
-            SparkleUpdaterController.enablePrereleaseChannel(doCheckBetas)
-            if doCheckBetas {
-                SUUpdater.shared().checkForUpdatesInBackground()
-            }
-        }
+        /// Fork: Updates are disabled.
+        ///     The Sparkle side-effects that used to run when `checkForUpdates` / `getBetaVersions` changed have
+        ///     been removed — the toggles are hidden and update checking is disabled app-wide.
     }
 }
 

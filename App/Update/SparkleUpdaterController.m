@@ -337,6 +337,14 @@ int getMajorVersion(NSString *version) {
     return NO;
 }
 
+- (BOOL)updaterMayCheckForUpdates:(SUUpdater *)updater {
+    /// Fork: Updates are disabled.
+    ///     This is a fork, so we never want to contact upstream's appcast. Returning NO here blocks Sparkle's
+    ///     background checks (`checkForUpdatesInBackground`). The launch-time check and the menu-bar
+    ///     `Check for Updates...` action are disabled separately (AppDelegate + CoolSUUpdater).
+    return NO;
+}
+
 - (void)updater:(SUUpdater *)updater willInstallUpdate:(SUAppcastItem *)update {
 
     DDLogInfo("UPDATER: About to install update");

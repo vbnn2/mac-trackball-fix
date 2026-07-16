@@ -344,14 +344,20 @@ static NSDictionary *sideButtonActions;
     commitConfig();
     
     /// Check for udates
-    
-    if (checkForUpdates) {
-        
-        [SparkleUpdaterController enablePrereleaseChannel:checkForPrereleases];
-        
-        [up checkForUpdatesInBackground];
-    }
-    
+
+    /// Fork: Updates are disabled.
+    ///     This is a fork, so we never check upstream's appcast on launch — that could offer the user a build
+    ///     from a different project. The `checkForUpdates` / `checkForPrereleases` config values are computed
+    ///     above (and still written to disk) but intentionally not acted on. The `SparkleUpdaterController`
+    ///     delegate also blocks background checks via `updaterMayCheckForUpdates:`.
+    (void)checkForUpdates;
+//    if (checkForUpdates) {
+//
+//        [SparkleUpdaterController enablePrereleaseChannel:checkForPrereleases];
+//
+//        [up checkForUpdatesInBackground];
+//    }
+
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     DDLogInfo("Mac Mouse Fix should terminate");

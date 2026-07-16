@@ -100,24 +100,32 @@ static NSDictionary *_remaps;
 #pragma mark - Reload
 
 + (void)reload {
-    
+
     /// The main app uses an array of dicts (aka a table) to represent the remaps in a way that is easy to present in a table view.
     /// The remaps are also stored to file in this format and therefore what `Config.config` contains.
     /// The helper was made to handle a dictionary format which should be more effictient among other perks.
     /// This function takes the remaps in table format from config, then converts it to dict format and makes that available to all the other Input modification classes to base their behaviour off of through self.remaps.
     
     DDLogDebug("TRM set remaps to config");
-    
+
     ///
-    /// Disable addMode
+    /// Fork: don't cancel an in-progress recording (addMode).
     ///
-    /// We used to do this *after* loading the remaps from config into `_remaps`. Now we're doing it before. Not sure if that could break things.
-    
+    /// Upstream unconditionally disabled addMode here, on the assumption that reloads are rare while you're
+    /// recording. This fork broke that assumption: a config change (per-app remap write → `configFileChanged`
+    /// → `updateDerivedStates`) or a frontmost-app switch now calls `reload` frequently — and each one would
+    /// rebuild `_remaps` from config, which (a) drops the synthetic addMode capture table and (b) makes
+    /// SwitchMaster turn the button eventTap *off* (no button binds for the frontmost app), so the button you
+    /// press to record is never even received. That's the intermittent "recording does nothing".
+    ///
+    /// So while addMode is enabled we DEFER the reload: keep the capture table live and the tap on. The reload
+    /// isn't lost — `disableAddMode` runs `reload` when recording concludes (mouseExit / after a capture), so
+    /// the latest config is picked up then. `disableAddMode` clears `_addModeIsEnabled` before calling us, so
+    /// that concluding reload passes this guard.
     if (_addModeIsEnabled) {
-        _addModeIsEnabled = NO;
-//        [MFMessagePort sendMessage:@"addModeDisabled" withPayload:nil expectingReply:NO];
+        return;
     }
-    
+
     ///
     /// Load test remaps
     ///
@@ -258,7 +266,7 @@ BOOL _addModeIsEnabled = NO;
 }
 
 + (BOOL)enableAddMode {
-    
+
     /// \discussion  Add mode configures the helper such that it remaps to "add mode feedback effects" instead of normal effects.
     /// When "add mode feedback effects" are triggered, the helper will send information about how exactly the effect was triggered to the main app.
     /// This allows us to capture triggers that the user performs and use them in the main app to add new rows to the remaps table view
@@ -338,12 +346,16 @@ BOOL _addModeIsEnabled = NO;
 }
 
 + (BOOL)disableAddMode {
-    
+
     /// Reload
     if (_addModeIsEnabled) {
+        /// Clear the flag *before* reloading: `reload` now defers while addMode is enabled (so config changes
+        /// during recording don't cancel the capture), so we must turn addMode off here for the concluding
+        /// reload to actually rebuild `_remaps` from config.
+        _addModeIsEnabled = NO;
         [self reload];
     }
-    
+
     /// Return success
     return YES;
 }

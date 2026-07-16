@@ -76,6 +76,15 @@ import CoreGraphics
         /// HelperState.init() time, and updateDerivedStates() will do it as part of normal startup.
         if !isInitial {
             DDLogDebug("HelperState: frontmost app -> \(bundleID.isEmpty ? "<none>" : bundleID)")
+
+            /// Don't clobber an in-progress recording. `Remap.reload()` disables addMode (Remap.m), and a
+            /// frontmost-app change fires while you record a per-app remap: to click the add field you activate
+            /// the MMF window, which *is* an app switch, so reloading here would cancel addMode before the button
+            /// press is captured. That's why recording failed whenever another app was frontmost.
+            ///     We still updated `frontmostAppBundleID` and staged the override via `loadOverrides(forApp:)`
+            ///     above, so the right config is live once addMode concludes (`disableAddMode` reloads then).
+            if Remap.addModeIsEnabled { return }
+
             Remap.reload()
         }
     }

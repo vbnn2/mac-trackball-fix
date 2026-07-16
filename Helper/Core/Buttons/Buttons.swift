@@ -38,7 +38,7 @@ import Cocoa
     /// Handling input
     
     @objc static func handleInput(device: Device, button: NSNumber, downNotUp mouseDown: Bool, event: CGEvent) -> MFEventPassThroughEvaluation {
-        
+
         let passThroughEvaluation = kMFEventPassThroughRefusal
 
             /// Init

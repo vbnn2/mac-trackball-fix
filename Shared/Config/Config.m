@@ -239,12 +239,48 @@ void commitConfig(void) {
         }
     }
     if (overridesForThisApp) {
-        _configWithAppOverridesApplied = [[SharedUtility dictionaryWithOverridesAppliedFrom:overridesForThisApp to:self->_config] mutableCopy];
+        NSMutableDictionary *merged = [[SharedUtility dictionaryWithOverridesAppliedFrom:overridesForThisApp to:self->_config] mutableCopy];
+        /// Per-entry merge for `Remaps`.
+        ///     The generic dictionary merge above treats the `Remaps` array as an opaque leaf, so it would
+        ///     replace the global table wholesale — meaning a per-app override would have to re-list every
+        ///     button. Instead we keep the global remaps as the base and let the app override individual
+        ///     buttons (matched by trigger + modification precondition). Any button the app doesn't list
+        ///     falls back to its global remap.
+        NSArray *overrideRemaps = overridesForThisApp[kMFConfigKeyRemaps];
+        if (overrideRemaps != nil) {
+            merged[kMFConfigKeyRemaps] = mergeRemaps(self->_config[kMFConfigKeyRemaps], overrideRemaps);
+        }
+        _configWithAppOverridesApplied = merged;
     } else {
         _configWithAppOverridesApplied = self->_config;
     }
 #endif
 }
+
+#if IS_HELPER
+/// Merge two remap tables by (trigger, modification precondition): an override entry replaces the matching
+/// global entry, or is appended when it introduces a new trigger. Global entries the override doesn't touch
+/// are kept — so a per-app table only needs to list the buttons it actually changes.
+///     (Helper-only: `loadOverridesForApp:` — its sole caller — only does anything on the Helper.)
+static NSArray *mergeRemaps(NSArray *globalRemaps, NSArray *overrideRemaps) {
+
+    NSMutableArray *result = [globalRemaps mutableCopy] ?: [NSMutableArray array];
+
+    for (NSDictionary *overrideEntry in overrideRemaps) {
+        id trigger = overrideEntry[kMFRemapsKeyTrigger];
+        id precond = overrideEntry[kMFRemapsKeyModificationPrecondition];
+        NSUInteger existing = [result indexOfObjectPassingTest:^BOOL(NSDictionary *e, NSUInteger idx, BOOL *stop) {
+            BOOL triggerMatches = (trigger == nil && e[kMFRemapsKeyTrigger] == nil) || [e[kMFRemapsKeyTrigger] isEqual:trigger];
+            BOOL precondMatches = (precond == nil && e[kMFRemapsKeyModificationPrecondition] == nil) || [e[kMFRemapsKeyModificationPrecondition] isEqual:precond];
+            return triggerMatches && precondMatches;
+        }];
+        if (existing == NSNotFound) [result addObject:overrideEntry];
+        else                        result[existing] = overrideEntry;
+    }
+
+    return result;
+}
+#endif
 
 #pragma mark - Listen to filesystem changes
 /// This stuff is unused in MainApp (and can be removed entirely. Was just for testing.)
