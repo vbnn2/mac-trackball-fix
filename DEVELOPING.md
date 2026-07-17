@@ -15,21 +15,30 @@ Requirements: macOS 12 or later, Apple Silicon for the provided script, and Xcod
 SDK and Command Line Tools installed.
 
 ```bash
-./dev.sh run                              # build + run the Helper with live logs
+./dev.sh run                 # build + launch GUI + restart the embedded Helper
+./dev.sh logs                # optional: stream live logs in another terminal
 ```
 
 Then grant **Accessibility** permission when macOS prompts (System Settings → Privacy &
 Security → Accessibility). Without it the Helper starts but installs no event tap, so
 nothing happens and you get no error.
 
-`./dev.sh` commands: `build`, `run`, `app`, `test`, `install`, `publish-check`, `publish`,
-`logs`, `logs-dump`, `stop`, `clean`.
+`./dev.sh` commands: `build`, `run`, `run-target`, `run-stable`, `run-helper`, `app`, `test`, `install`, `publish-check`, `publish`,
+`logs`, `logs-record`, `logs-record-stop`, `logs-dump`, `stop`, `clean`.
 
-> **Run it in the foreground.** `./dev.sh run &` dies instantly with
-> `Assertion failed: (!signal_handler_did_exist), UNIXSignals.m, line 133`. That's not a bug in
-> the script: `UNIXSignals.m:133` asserts SIGTERM's previous disposition is `SIG_DFL` and
-> deliberately rejects `SIG_IGN` — and bash sets `SIGINT`/`SIGQUIT` to `SIG_IGN` for
-> backgrounded jobs, which `exec` inherits. Give it its own terminal tab.
+`./dev.sh run` uses the normal app lifecycle. It launches the GUI with a development argument that asks the app to
+unregister the previous Helper, register the newly built embedded Helper, and let launchd start it. The command does
+not need to stay open, and **Enable Mac Mouse Fix** remains available in the GUI.
+
+For diagnostic scroll-engine A/B testing, `./dev.sh run-target` explicitly selects High + Trackpad Simulation and
+enables the experimental reservoir engine. Real TB800 testing found that experiment bursty and capable of leaving
+scrolling inert on reversal, so it is not a candidate for normal use. `./dev.sh run-stable` restores Regular
+smoothness and disables it. Both commands rebuild and relaunch the complete app; no manual plist editing is needed.
+
+`./dev.sh run-helper` bypasses the GUI and runs the embedded Helper directly. Use it only for low-level debugging.
+The normal KeepAlive Helper must be disabled first, and this mode must run in the foreground. Backgrounding it causes
+`Assertion failed: (!signal_handler_did_exist), UNIXSignals.m, line 133`. Bash changes inherited signal handling for
+background jobs, which conflicts with the Helper's signal-handler assertion.
 
 ### Publishing
 
@@ -94,9 +103,9 @@ Assertion failed: (mainAppBundle != nil), function +[Locator mainAppBundle], fil
 ```
 
 This is almost certainly the "it requires Helper or something" failure. The fix is to build
-the **`App`** scheme (which embeds the Helper) and run the *embedded* copy — which is exactly
-what `./dev.sh run` does. It bypasses launchd/SMAppService entirely, so there's no
-enable-in-the-GUI dance and no 10-second launchd restart throttle.
+the **`App`** scheme, which embeds the Helper. `./dev.sh run` launches that complete app and lets
+the GUI register its embedded Helper through SMAppService. `./dev.sh run-helper` is the separate
+mode that bypasses launchd for debugger-focused work.
 
 ### Schemes
 
@@ -192,24 +201,58 @@ eventTapCallback()                     ← CGEventTap, kCGEventScrollWheel
         ├── ScrollUtility axisForVerticalDelta:horizontalDelta:  → picks ONE axis
         ├── ScrollAnalyzer → filtered line-unit velocity
         ├── trackball tuning → pixels for this tick
-        ├── High + Trackpad Simulation → display-synced target follower
+        ├── Experimental target flag + High/Trackpad → display-synced target follower
+        ├── Regular stable path → rate limit + bounded carry + legacy TouchAnimator
         ├── Other curves/effects → legacy TouchAnimator + drag/Bezier curve
         └── sendOutputEvents() → sendScroll() / TouchSimulator
 ```
 
-The target follower keeps one critically damped motion session alive across input reports. New
-reports move its target without resetting velocity; release drains only the remaining distance,
-and direction reversal cancels the stale target before accepting the reversing report. It is
-currently restricted to the plain `high` + `trackpadSimulation` path. Set
-`Scroll.targetedScrollEngine` to `false` in the config to compare against the legacy animator.
-The Smoothness slider controls its active response, while Glide controls release detection and
-settling; these parameters are derived in `ScrollConfig.swift`.
+The target follower keeps one critically damped motion session alive across input reports. It is
+restricted to the plain `high` + `trackpadSimulation` path and is disabled by default through
+`Scroll.targetedScrollEngine = false`. Hardware logs showed why: TB800 scroll reports arrive only
+when the ring changes, often 20–100 ms apart, and the follower consumed each position step before
+the next report. The resulting motion was display-synchronized internally but visibly arrived in
+event-rate bursts. Do not enable this path for normal testing until it feeds accepted distance
+gradually from a reservoir across display frames.
+
+Velocity measurement has its own 1ms minimum interval, independent from the legacy acceleration curve's 15ms
+extrapolation boundary. This preserves actual event timing without assuming that the TB800's 750Hz USB polling rate is
+also its scroll-event rate. `MFSCROLL_FEEL` logs sampled input/output velocity, cadence, release delay, target error, and
+display refresh rate at 10Hz for hardware tuning.
+
+The accepted Regular path limits overload in pixels/second rather than pixels/report, so its maximum does not change
+with hardware report frequency. Initial distance and retained carry have separate bounds; this prevents a high maximum
+speed from becoming a large first jump or a delayed motion queue. Near overload it uses stronger release friction. A
+single immediate opposite report during a fast coast acts as a stop/rebound filter, while a sustained reversal
+continues from the next report. The filter has a short time limit so the first scroll after changing windows is kept
+even if an old animation is still coasting. `MFSCROLL_LEGACY` records input mapping and carry behavior; `MFSCROLL_OUTPUT` aggregates the integer
+pixel events applications actually receive, including effective event rate and maximum gap.
+
+Regular animated scrolling divides its continuous output into gesture and momentum phases. Ending the gesture phase
+before the coast lets macOS perform a short native rubber-band snap-back at content boundaries instead of waiting for
+MMF's complete, variable-duration animation. Because the TB800 has no finger-presence signal, sustained fast output
+is promoted to momentum after a short direct window; its valid hardware distance is preserved while macOS applies
+stronger momentum edge resistance. The promotion is latched so late ring reports do not repeatedly reopen a gesture.
+Direct gestures use the complete `MayBegin -> Began` opening sequence, and a frontmost-app change resets any session
+owned by the previous app so a newly activated browser does not ignore its first scroll.
+
+Regular-path Smoothness is adaptive at the bottom of the speed range. **Smoothness** sets normal/fast blending,
+**Slow Smoothness** sets the zero-speed endpoint, and **Adaptive Until** sets where the smoothstep transition has
+returned to normal as a percentage of Maximum Speed. The smoothness readouts expose the actual duration multiplier
+(`0.4×...1.6×`) used by the engine. Once a gesture reaches the transition speed, adaptive slow smoothing stays off
+until the next gesture; this prevents a sparse final hardware report from becoming a delayed post-scroll burst.
+`MFSCROLL_LEGACY.smoothness` logs the effective value and `adaptiveBlend` logs how much slow blending is applied.
+If a fast gesture has already stopped and the ring emits one late, very-low-velocity report, only that first report is
+shortened and reduced instead of discarded. `MFSCROLL_TAIL` records this narrow settling path. A second slow report
+proves continued movement and restores full distance plus speed-adaptive smoothing. To avoid a velocity notch during
+fast-to-slow deceleration, the first report's protection is itself blended against existing animation speed: strong at
+a complete stop and fully inactive by 400 px/s. Re-acceleration arms the one-report protection again.
 
 ### Fork feature map
 
 | Feature | UI/config | Runtime implementation |
 |---|---|---|
-| Five scroll-tuning sliders | `ScrollTabController.swift`, `Scroll.tuning.*` | `ScrollConfig.swift`, `Scroll.m`, `ScrollAnalyzer.m` |
+| Seven scroll-tuning sliders (Sensitivity, Acceleration, Maximum Speed, Smoothness, Slow Smoothness, Adaptive Until, Glide) | `ScrollTabController.swift`, `Scroll.tuning.*` | `ScrollConfig.swift`, `Scroll.m`, `ScrollAnalyzer.m` |
 | Invert zoom / ball scroll | `Scroll.invertZoom`, `Scroll.invertBallScroll` | `Scroll.m`, `ModifiedDragOutputTwoFingerSwipe.m` |
 | Scroll & Zoom / Zoom modes | Button action dictionaries | `HelperState.swift`, `Actions.m`, `Buttons.swift` |
 | Shift + Primary Click | Remap effects table; optional `flags` key | `ModificationUtility.m`, `Actions.m` |
@@ -267,8 +310,13 @@ fallback sources synchronized:
 ## 5. Debugging
 
 ```bash
-./dev.sh run                  # foreground Helper, logs straight to stdout
+./dev.sh run                  # rebuild and relaunch the complete app
+./dev.sh run-target           # test experimental reservoir scrolling
+./dev.sh run-stable           # return to Regular + legacy scrolling
+./dev.sh run-helper           # advanced: foreground Helper with direct logs
 ./dev.sh logs                 # stream a launchd-started Helper's logs (App + Helper)
+./dev.sh logs-record          # save MFSCROLL telemetry in the background
+./dev.sh logs-record-stop     # stop recording and print the saved file path
 MMF_LOG_ALL=1 ./dev.sh logs   # ...plus system frameworks (TCC / launchd / XPC issues)
 ./dev.sh logs-dump 30m        # past logs — sparse, see below
 ```

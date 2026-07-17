@@ -264,7 +264,10 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
     if (_consecutiveScrollTickCounter == 0 || !_velocityFilterIsInitialized) {
         velocityInterval = scrollConfig.isolatedTickVelocityInterval;
     } else {
-        velocityInterval = MAX(secondsSinceLastTick, scrollConfig.consecutiveScrollTickInterval_AccelerationEnd);
+        /// Do not reuse `consecutiveScrollTickInterval_AccelerationEnd` here. That 15ms constant defines where the
+        /// legacy Bezier acceleration curve starts extrapolating; it is not a hardware sampling limit. Reusing it
+        /// capped measured velocity at 66.7 reports/s even if a high-polling-rate device delivered faster events.
+        velocityInterval = MAX(secondsSinceLastTick, scrollConfig.velocityMeasurementIntervalMin);
     }
 
     double rawVelocity = ((double)MAX(1, units)) / velocityInterval;

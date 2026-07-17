@@ -21,7 +21,7 @@ class ScrollTabController: NSViewController {
     var invertZoom = ConfigValue<Bool>(configPath: "Scroll.invertZoom")
     var invertBallScroll = ConfigValue<Bool>(configPath: "Scroll.invertBallScroll")
 
-    /// Fork: tuning sliders. keyPath -> (slider, readout label)
+    /// Fork: tuning sliders. slider -> config key and readout label
     private var tuningSliders: [NSSlider: (keyPath: String, readout: NSTextField)] = [:]
     var scrollSpeed = ConfigValue<String>(configPath: "Scroll.speed")
     var precise = ConfigValue<Bool>(configPath: "Scroll.precise")
@@ -90,6 +90,32 @@ class ScrollTabController: NSViewController {
     
     /// Fork: tuning sliders
 
+    private func tuningReadout(keyPath: String, value: Double) -> String {
+        if keyPath == "Scroll.tuning.maxSpeed" {
+            let sensitivity = (config("Scroll.tuning.sensitivity") as? NSNumber)?.doubleValue ?? 0.10
+            let pxAtRefSpeed = 10.0 + sensitivity * 140.0
+            let pixelsPerSecond = pxAtRefSpeed * 50.0 * (30.0 * max(0.1, value))
+            return pixelsPerSecond >= 1000
+                ? String(format: "%.1fk px/s", pixelsPerSecond / 1000.0)
+                : String(format: "%.0f px/s", pixelsPerSecond)
+        }
+        if keyPath == "Scroll.tuning.smoothness" || keyPath == "Scroll.tuning.slowSmoothness" {
+            /// This is a duration multiplier, not a percentage of an abstract quality. Showing the value used by
+            /// the engine makes the trade-off explicit: larger means reports are blended over more time.
+            return String(format: "%.2f×", 0.4 + value * 1.2)
+        }
+        if keyPath == "Scroll.tuning.adaptiveSmoothnessEndSpeedRatio" {
+            return String(format: "%.1f%% max", value * 100.0)
+        }
+        return String(format: "%.0f%%", value * 100.0)
+    }
+
+    private func refreshTuningReadouts() {
+        for (slider, entry) in tuningSliders {
+            entry.readout.stringValue = tuningReadout(keyPath: entry.keyPath, value: slider.doubleValue)
+        }
+    }
+
     private func addTuningSliders() {
 
         /// Hide upstream's Smoothness and Speed pickers.
@@ -111,13 +137,18 @@ class ScrollTabController: NSViewController {
 
         /// `fallback` must match `default_config.plist > Scroll.tuning` and ScrollConfig's `slider()` fallbacks.
         /// It's only used for a config that predates these keys — nothing backfills them (see ScrollConfig).
+        /// Fast Scroll is intentionally not exposed. It is an upstream, swipe-history-based exponential multiplier
+        /// for notched wheels. A free-spinning ring triggers it based on arbitrary report grouping, so the fork keeps
+        /// its old config key readable for compatibility but defaults it to off.
         /// Note the string keys are kebab-case while the config keys are camelCase.
-        let specs: [(configKey: String, stringKey: String, fallback: Double)] = [
-            ("Scroll.tuning.sensitivity",  "scroll.tuning.sensitivity",  0.10),
-            ("Scroll.tuning.acceleration", "scroll.tuning.acceleration", 1.0),
-            ("Scroll.tuning.smoothness",   "scroll.tuning.smoothness",   0.5),
-            ("Scroll.tuning.glide",        "scroll.tuning.glide",        0.75),
-            ("Scroll.tuning.fastScroll",   "scroll.tuning.fast-scroll",  0.0),
+        let specs: [(configKey: String, stringKey: String, hintKey: String, fallback: Double, minimum: Double, maximum: Double)] = [
+            ("Scroll.tuning.sensitivity",  "scroll.tuning.sensitivity",       "scroll.tuning.sensitivity.hint",       0.10,  0.0,   1.0),
+            ("Scroll.tuning.acceleration", "scroll.tuning.acceleration",      "scroll.tuning.acceleration.hint",      1.0,   0.0,   1.0),
+            ("Scroll.tuning.maxSpeed",     "scroll.tuning.maximum-speed",     "scroll.tuning.maximum-speed.hint",     0.5,   0.1,   1.0),
+            ("Scroll.tuning.smoothness",   "scroll.tuning.smoothness",        "scroll.tuning.smoothness.hint",        0.5,   0.0,   1.0),
+            ("Scroll.tuning.slowSmoothness", "scroll.tuning.slow-smoothness", "scroll.tuning.slow-smoothness.hint",   0.90,  0.0,   1.0),
+            ("Scroll.tuning.adaptiveSmoothnessEndSpeedRatio", "scroll.tuning.adaptive-until", "scroll.tuning.adaptive-until.hint", 0.125, 0.025, 0.30),
+            ("Scroll.tuning.glide",        "scroll.tuning.glide",             "scroll.tuning.glide.hint",             0.75,  0.0,   1.0),
         ]
 
         let section = NSStackView()
@@ -132,25 +163,30 @@ class ScrollTabController: NSViewController {
         for spec in specs {
 
             let label = NSTextField(labelWithString: MFLocalizedString(spec.stringKey, comment: ""))
-            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-            label.alignment = .right
-            label.widthAnchor.constraint(equalToConstant: 90).isActive = true
+            /// Match the standard appearance font used by the surrounding controls in Main.storyboard.
+            label.font = .systemFont(ofSize: NSFont.systemFontSize)
+            label.alignment = .left
+            label.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            let hint = MFLocalizedString(spec.hintKey, comment: "")
+            label.toolTip = hint
 
             let value = (config(spec.configKey) as? NSNumber)?.doubleValue ?? spec.fallback
 
-            let readout = NSTextField(labelWithString: String(format: "%.2f", value))
-            readout.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+            let readout = NSTextField(labelWithString: tuningReadout(keyPath: spec.configKey, value: value))
+            readout.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             readout.textColor = .secondaryLabelColor
             readout.alignment = .left
-            readout.widthAnchor.constraint(equalToConstant: 30).isActive = true
+            readout.widthAnchor.constraint(equalToConstant: 84).isActive = true
 
-            let slider = NSSlider(value: value, minValue: 0, maxValue: 1,
+            let slider = NSSlider(value: value, minValue: spec.minimum, maxValue: spec.maximum,
                                   target: self, action: #selector(tuningSliderChanged(_:)))
             /// Fire on mouse-up only. Continuous would call commitConfig() — a config file write plus an IPC message
             /// to the Helper — on every pixel of the drag.
             slider.isContinuous = false
-            slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
+            slider.widthAnchor.constraint(equalToConstant: 138).isActive = true
             slider.setAccessibilityIdentifier("axTuning_" + spec.configKey)
+            slider.setAccessibilityLabel(label.stringValue)
+            slider.toolTip = hint
 
             tuningSliders[slider] = (keyPath: spec.configKey, readout: readout)
 
@@ -167,8 +203,8 @@ class ScrollTabController: NSViewController {
 
     @objc private func tuningSliderChanged(_ sender: NSSlider) {
         guard let entry = tuningSliders[sender] else { assert(false); return }
-        entry.readout.stringValue = String(format: "%.2f", sender.doubleValue)
         setConfig(entry.keyPath, NSNumber(value: sender.doubleValue))
+        refreshTuningReadouts() /// Sensitivity also changes the px/s value shown for Maximum Speed.
         commitConfig() /// -> writes the file and messages the Helper, which reloads ScrollConfig. Live, no restart.
     }
 

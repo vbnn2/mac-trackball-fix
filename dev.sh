@@ -2,17 +2,17 @@
 #
 # dev.sh — build/run/test helper for mac-trackball-fix
 #
-# The Helper is the process that actually does the input remapping. It CANNOT run
-# standalone: Locator.m asserts that it lives inside the main app bundle at
-#   Mac Mouse Fix.app/Contents/Library/LoginItems/Mac Mouse Fix Helper.app
-# So every flow here builds the *App* scheme (which embeds the Helper) and then runs
-# the embedded Helper binary directly. That skips launchd/SMAppService entirely, which
-# is what makes fast iteration possible.
+# The Helper is the process that actually does the input remapping. It lives inside
+# the main app bundle and is normally registered by the GUI through SMAppService.
+# The default run flow preserves that real app/helper lifecycle.
 #
 # Usage: ./dev.sh <command>
 #   build     Build the app (embeds the Helper)
-#   run       Build, then run the embedded Helper in the foreground with live logs
-#   app       Build, then launch the main app GUI
+#   run       Build, launch the GUI, and restart its launchd-managed Helper
+#   run-target  Enable the experimental reservoir engine, then build and launch
+#   run-stable  Restore Regular + legacy scrolling, then build and launch
+#   run-helper  Build and run only the embedded Helper in the foreground (advanced)
+#   app       Build and launch only the main app GUI
 #   test      Build + run the "Tests" scratch app (there is NO unit test suite)
 #   install   Build, then copy the app to /Applications (stable path for permissions)
 #   publish-check  Validate Developer ID and notarization prerequisites
@@ -20,6 +20,8 @@
 #   stop      Kill any running Helper / app instances
 #   logs      Stream the App's + Helper's own logs live (MMF_LOG_ALL=1 to include system logs)
 #   logs-dump [since]  Show past logs (default 15m). Sparse: os_log doesn't persist info/debug.
+#   logs-record  Record MFSCROLL logs in the background until logs-record-stop
+#   logs-record-stop  Stop background recording and print the saved file path
 #   clean     Wipe DerivedData for this project
 
 set -euo pipefail
@@ -28,11 +30,15 @@ PROJECT="Mouse Fix.xcodeproj"
 APP_SCHEME="App"            # scheme name; builds the "Mac Mouse Fix" target
 APP_NAME="Mac Mouse Fix"    # product name (.app on disk)
 HELPER_NAME="Mac Mouse Fix Helper"
+HELPER_LABEL="com.pixeption.mac-mouse-fix.helper"
 TEST_SCHEME="Tests"
 CONFIG="${CONFIG:-Debug}"
 DESTINATION="platform=macOS,arch=arm64"
 ARCH_SETTINGS=("ARCHS=arm64" "ONLY_ACTIVE_ARCH=YES")
 RELEASE_SCHEME="App - Release"
+USER_CONFIG="$HOME/Library/Application Support/com.pixeption.mac-mouse-fix/config.plist"
+SCROLL_LOG_FILE="${MMF_SCROLL_LOG_FILE:-/tmp/mac-trackball-fix-scroll.log}"
+SCROLL_LOG_LABEL="com.pixeption.mac-trackball-fix.scroll-log"
 
 cd "$(dirname "$0")"
 
@@ -60,11 +66,14 @@ HELPER_BIN() { echo "$(APP_PATH)/Contents/Library/LoginItems/$HELPER_NAME.app/Co
 do_build() {
   echo "==> Building '$APP_SCHEME' ($CONFIG)…"
   # The App scheme has the Helper as a dependency and embeds it, so this builds both.
+  set +e
   xcodebuild -project "$PROJECT" -scheme "$APP_SCHEME" -configuration "$CONFIG" \
     -destination "$DESTINATION" "${ARCH_SETTINGS[@]}" build \
-    | grep -E "error:|warning: (unused|unin)|BUILD (SUCCEEDED|FAILED)" || true
-  # xcodebuild's exit code is swallowed by the pipe above; re-check the product exists.
-  [ -x "$(HELPER_BIN)" ] || { echo "!! Build did not produce a Helper binary"; exit 1; }
+    | grep -E "error:|warning: (unused|unin)|BUILD (SUCCEEDED|FAILED)"
+  local build_status=${PIPESTATUS[0]}
+  set -e
+  [ "$build_status" -eq 0 ] || die "Build failed"
+  [ -x "$(HELPER_BIN)" ] || die "Build did not produce a Helper binary"
 }
 
 do_stop() {
@@ -73,6 +82,63 @@ do_stop() {
   pkill -f "$HELPER_NAME" 2>/dev/null || true
   pkill -f "/$APP_NAME.app/Contents/MacOS/" 2>/dev/null || true
   sleep 0.3
+}
+
+do_run_app() {
+  do_build
+  do_stop
+  echo "==> Launching the app and restarting its embedded Helper…"
+  echo "    The GUI owns the launchd service; this command does not need to stay open."
+  open -n "$(APP_PATH)" --args --dev-restart-helper
+  echo "==> Launched. Use './dev.sh logs' in another terminal for live logs."
+}
+
+set_scroll_config_value() {
+  local key="$1"
+  local type="$2"
+  local value="$3"
+
+  [ -f "$USER_CONFIG" ] || die "Config not found. Launch Mac Mouse Fix once, then retry: $USER_CONFIG"
+  plutil -replace "$key" "$type" "$value" "$USER_CONFIG" 2>/dev/null \
+    || plutil -insert "$key" "$type" "$value" "$USER_CONFIG"
+}
+
+configure_scroll_engine() {
+  local mode="$1"
+
+  if [ "$mode" = "target" ]; then
+    echo "==> Selecting experimental reservoir scrolling (High + Trackpad Simulation)…"
+    set_scroll_config_value Scroll.smooth -string high
+    set_scroll_config_value Scroll.trackpadSimulation -bool true
+    set_scroll_config_value Scroll.targetedScrollEngine -bool true
+  else
+    echo "==> Restoring stable scrolling (Regular + legacy engine)…"
+    set_scroll_config_value Scroll.smooth -string regular
+    set_scroll_config_value Scroll.trackpadSimulation -bool true
+    set_scroll_config_value Scroll.targetedScrollEngine -bool false
+  fi
+}
+
+require_direct_helper_slot() {
+  local service_target="gui/$(id -u)/$HELPER_LABEL"
+
+  # A registered Helper is KeepAlive. Killing its process in do_stop() only makes launchd immediately respawn it,
+  # after which the direct DerivedData Helper crashes because both instances claim the same CFMessagePort name.
+  if launchctl print "$service_target" >/dev/null 2>&1; then
+    echo "!! The normal launchd-managed Helper is still enabled." >&2
+    echo "   It must be disabled before the development Helper can run." >&2
+    echo >&2
+    echo "   Recommended:" >&2
+    echo "     1. Open Mac Mouse Fix." >&2
+    echo "     2. Turn off 'Enable Mac Mouse Fix'." >&2
+    echo "     3. Run './dev.sh run-helper' again, in the foreground." >&2
+    echo >&2
+    echo "   Temporary command-line alternative:" >&2
+    echo "     launchctl bootout \"$service_target\"" >&2
+    echo >&2
+    echo "   Re-enable the normal Helper in the GUI after development." >&2
+    exit 1
+  fi
 }
 
 PUBLISH_IDENTITY_RESOLVED=""
@@ -234,17 +300,34 @@ case "${1:-run}" in
     ;;
 
   run)
+    do_run_app
+    ;;
+
+  run-target)
+    configure_scroll_engine target
+    do_run_app
+    ;;
+
+  run-stable)
+    configure_scroll_engine stable
+    do_run_app
+    ;;
+
+  run-helper)
     # Must run in the FOREGROUND. UNIXSignals.m:133 asserts that SIGTERM's previous
     # disposition is SIG_DFL, and deliberately rejects SIG_IGN too. Bash sets SIGINT/SIGQUIT
     # to SIG_IGN for backgrounded jobs, and exec inherits that -> instant assertion failure:
     #   Assertion failed: (!signal_handler_did_exist), UNIXSignals.m, line 133
-    # So `./dev.sh run &` will crash. Run it in its own terminal instead.
+    # So `./dev.sh run-helper &` will crash. Run it in its own terminal instead.
+    require_direct_helper_slot
     do_build
+    # Re-check after the build in case the GUI registered the service while xcodebuild was running.
+    require_direct_helper_slot
     do_stop
     echo "==> Running Helper (Ctrl-C to stop)"
     echo "    $(HELPER_BIN)"
     echo "    NOTE: needs Accessibility permission — grant it to this binary when prompted."
-    echo "    NOTE: run this in the foreground; './dev.sh run &' trips an assert in UNIXSignals.m."
+    echo "    NOTE: run this in the foreground; './dev.sh run-helper &' trips an assert in UNIXSignals.m."
     echo
     exec "$(HELPER_BIN)"
     ;;
@@ -330,6 +413,40 @@ case "${1:-run}" in
     echo
     exec log show --last "$SINCE" --info --debug --style compact \
       --predicate 'senderImagePath CONTAINS "Mac Mouse Fix"'
+    ;;
+
+  logs-record)
+    scroll_log_target="gui/$(id -u)/$SCROLL_LOG_LABEL"
+    if launchctl print "$scroll_log_target" >/dev/null 2>&1; then
+      die "Scroll logging is already running: $SCROLL_LOG_FILE"
+    fi
+
+    : > "$SCROLL_LOG_FILE"
+    # launchctl owns the recorder so it survives after this script or a coding-agent
+    # command session exits. A plain background/nohup process can be reaped with its shell.
+    launchctl submit -l "$SCROLL_LOG_LABEL" \
+      -o "$SCROLL_LOG_FILE" \
+      -e "$SCROLL_LOG_FILE" \
+      -- /usr/bin/log stream --level debug --style compact \
+      --predicate 'senderImagePath CONTAINS "Mac Mouse Fix Helper" AND eventMessage CONTAINS "MFSCROLL_"'
+    sleep 0.5
+    launchctl print "$scroll_log_target" >/dev/null 2>&1 \
+      || die "Log recorder failed to start. See: $SCROLL_LOG_FILE"
+
+    echo "==> Recording MFSCROLL logs in the background"
+    echo "    File: $SCROLL_LOG_FILE"
+    echo "    Perform the scroll test, then run './dev.sh logs-record-stop' or tell the coding agent: done"
+    ;;
+
+  logs-record-stop)
+    scroll_log_target="gui/$(id -u)/$SCROLL_LOG_LABEL"
+    if ! launchctl print "$scroll_log_target" >/dev/null 2>&1; then
+      die "No background scroll log recorder was found"
+    fi
+    launchctl bootout "$scroll_log_target"
+    echo "==> Scroll log recording stopped"
+    echo "    File: $SCROLL_LOG_FILE"
+    echo "    Lines: $(wc -l < "$SCROLL_LOG_FILE" | tr -d ' ')"
     ;;
 
   stop)

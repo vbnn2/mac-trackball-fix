@@ -13,10 +13,16 @@ is an independent fork and does not use the upstream update channel.
 
 - Reworked the scroll engine around the magnitude of the device's line deltas, rather than treating
   every event as a single mouse-wheel detent.
-- Added a display-synchronized target follower for the trackpad-style high-smoothness mode, so new
-  reports preserve motion velocity instead of restarting a separate animation curve.
-- Added trackball-tuned **Sensitivity**, **Acceleration**, **Smoothness**, **Glide**, and
-  **Fast Scroll** controls.
+- Added an experimental display-synchronized target follower for scroll-engine research. Hardware testing found
+  uneven output with sparse ring reports, so it is disabled by default while input pacing is redesigned.
+- Kept velocity measurement based on actual scroll-event timestamps down to 1 ms. The device's USB polling rate is
+  not treated as its scroll-event rate.
+- Added report-rate-independent overload limiting, bounded motion carry, and fast-stop rebound filtering to the
+  default Regular scroll path. This keeps high-speed scrolling responsive without rebuilding a long drift queue.
+- Added trackball-tuned **Sensitivity**, **Acceleration**, **Maximum Speed**, **Smoothness**, **Slow Smoothness**,
+  **Adaptive Until**, and **Glide** controls. Smoothness readouts show their real animation-duration multiplier.
+  The upstream Fast Scroll burst multiplier remains readable for old configs but is hidden and disabled by default
+  because it reacts unpredictably to free-spinning ring report grouping.
 - Increased the slow-scroll continuity window for sparse free-spinning ring input.
 - Added independent **Invert Zoom Direction** and **Invert Ball Scrolling** settings.
 - Fixed dropped direction-change ticks, stale display-link selection, and scroll events that could
@@ -64,15 +70,18 @@ Build the app and its embedded helper:
 ./dev.sh build
 ```
 
-For fast input-driver development, run the embedded helper in the foreground:
+For normal development, build and launch the complete app:
 
 ```bash
 ./dev.sh run
 ```
 
-Grant the helper Accessibility access in **System Settings → Privacy & Security → Accessibility**
-when prompted. Keep `./dev.sh run` in the foreground; backgrounding it with `&` causes the helper's
-signal-handler assertion to fail.
+This opens the GUI and automatically re-registers the newly built embedded Helper with launchd. You do not need to
+disable Mac Mouse Fix first, and the command returns after launching. Grant the Helper Accessibility access in
+**System Settings → Privacy & Security → Accessibility** when prompted.
+
+`./dev.sh run-helper` is an advanced helper-only debugging mode. It requires turning off **Enable Mac Mouse Fix**
+first and must stay in the foreground.
 
 To launch the GUI or install a stable copy:
 
@@ -86,10 +95,15 @@ Useful commands:
 | Command | Purpose |
 |---|---|
 | `./dev.sh build` | Build the `App` scheme, including the embedded helper |
-| `./dev.sh run` | Build and run the embedded helper with foreground logs |
-| `./dev.sh app` | Build and launch the GUI |
+| `./dev.sh run` | Build, launch the GUI, and restart the launchd-managed embedded Helper |
+| `./dev.sh run-target` | Launch the failed/diagnostic reservoir experiment; not for normal use |
+| `./dev.sh run-stable` | Restore Regular smoothness and the legacy scroll engine |
+| `./dev.sh run-helper` | Run only the embedded Helper in the foreground for low-level debugging |
+| `./dev.sh app` | Build and launch only the GUI |
 | `./dev.sh install` | Copy the built app to `/Applications` and launch it |
 | `./dev.sh logs` | Stream live app/helper debug logs |
+| `./dev.sh logs-record` | Record scroll telemetry in the background to `/tmp/mac-trackball-fix-scroll.log` |
+| `./dev.sh logs-record-stop` | Stop the background scroll recorder |
 | `./dev.sh logs-dump 30m` | Show the limited logs persisted by macOS |
 | `./dev.sh test` | Build and run the manual `Tests` playground app |
 | `./dev.sh stop` | Stop running app/helper instances |

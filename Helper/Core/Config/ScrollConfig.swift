@@ -259,12 +259,12 @@ import Cocoa
     }
     /// Experimental display-synchronized target follower for the trackpad-style high-smoothness curve.
     ///
-    /// This is intentionally limited to the plain High + Trackpad Simulation path. Gesture effects and the
-    /// low/regular/precise/quick curves keep using TouchAnimator until the new controller has been validated for
-    /// those very different phase and duration requirements. Existing configs don't contain the new key, so the
-    /// fallback is part of the compatibility contract.
+    /// This is intentionally limited to the plain High + Trackpad Simulation path. Hardware testing showed that
+    /// the position-step controller can drain a sparse ring report before the next report arrives, producing
+    /// event-rate bursts even though output is display-synchronized. Keep it opt-in until input is paced through
+    /// a distance reservoir. Existing configs often don't contain the key, so the fallback must be the safe path.
     @objc var useTargetedScrollEngine: Bool {
-        let enabled = (c("targetedScrollEngine") as? NSNumber)?.boolValue ?? true
+        let enabled = (c("targetedScrollEngine") as? NSNumber)?.boolValue ?? false
         return enabled && animationCurve == kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim
     }
     
@@ -298,6 +298,9 @@ import Cocoa
     @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.10) }()
     @objc lazy var u_acceleration: Double = { slider("acceleration", 1.0) }()
     @objc lazy var u_smoothnessAmount: Double = { slider("smoothness", 0.5) }()
+    @objc lazy var u_slowSmoothnessAmount: Double = { slider("slowSmoothness", 0.90) }()
+    @objc lazy var u_adaptiveSmoothnessEndSpeedRatio: Double = { slider("adaptiveSmoothnessEndSpeedRatio", 0.125) }()
+    @objc lazy var u_maxSpeed: Double = { slider("maxSpeed", 0.5) }()
     @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.0) }()
     @objc lazy var u_glide: Double = { slider("glide", 0.75) }()
 
@@ -341,6 +344,83 @@ import Cocoa
 
     @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...150
     @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...1.2
+
+    /// Stable-engine overload control.
+    ///
+    /// A per-report pixel cap is inherently hardware-dependent: the same cap permits twice the output speed when
+    /// reports arrive twice as often. Express the ceiling as pixels/second instead.
+    ///
+    /// The UI stores 0.1...1.0 and maps that to 3x...30x the reference output speed. The accepted hardware-tested
+    /// baseline is 0.5 == 15x, about 18,000 px/s at the measured default sensitivity. Initial response and retained
+    /// distance are capped separately below, so a high sustained maximum does not recreate the old latency queue.
+    @objc lazy var stableMaximumOutputSpeed: Double = {
+        pxAtRefSpeed * refSpeed * (30.0 * max(0.1, u_maxSpeed))
+    }()
+
+    /// Sparse, very slow ring reports need more temporal blending than fast reports. `u_smoothnessAmount` remains
+    /// the normal/fast value; below `u_adaptiveSmoothnessEndSpeedRatio` of Maximum Speed, effective smoothness eases
+    /// from `u_slowSmoothnessAmount` back to that value. A smoothstep transition avoids a perceptible boundary, and
+    /// the slow value never reduces a higher normal value. Both thresholds are exposed in the Scrolling tab.
+
+    /// Keep the first report bounded even though the sustained speed ceiling is intentionally high. The first report
+    /// has no measured duration, so applying the full pixels/second ceiling to an assumed interval would create a
+    /// large initial lurch.
+    @objc lazy var stableMaximumInitialDistance: Double = {
+        pxAtRefSpeed * 15.0
+    }()
+
+    /// Retained distance is a latency budget, not a speed budget. Keep this near the previous pass's ~630px even
+    /// when stableMaximumOutputSpeed changes. New input still takes effect immediately; only distance that would
+    /// otherwise remain in a growing queue is discarded.
+    @objc lazy var stableMaximumCarryDistance: Double = {
+        pxAtRefSpeed * refSpeed * 0.525
+    }()
+
+    /// Long glide is pleasant at reading speed, but the same low friction produces a large drift tail after a hard
+    /// spin. At the speed ceiling, raise friction to at least this value. The user's Glide setting still wins when
+    /// it requests even stronger friction.
+    @objc let stableFastDragCoefficient: Double = 32.0
+
+    /// The TB800 reports ring movement but has no touch sensor, so it cannot tell us exactly when the user's finger
+    /// left a free-spinning ring. After a short direct phase, classify sustained fast output as momentum. The scroll
+    /// distance is unchanged; this only makes macOS apply trackpad-like edge resistance instead of stretching a
+    /// boundary as though fingers were still dragging it. Slow precision movement stays in the direct phase.
+    @objc let stableDirectGestureMaxDuration: TimeInterval = 100.0 / 1000.0
+    @objc lazy var stableMomentumPromotionSpeed: Double = {
+        pxAtRefSpeed * refSpeed * 1.5
+    }()
+
+    /// An opposite report while a fast animation is still moving may be mechanical ring rebound or an intentional
+    /// reversal. The captured TB800 rebound lasted four reports / 213ms, while deliberate slow movement may contain
+    /// only one report, so neither "drop one" nor "accept the second" is safe. Cancel the coast immediately, preserve
+    /// a small preview, and bound the candidate direction briefly unless it becomes decisive.
+    @objc let stableReboundSuppressionSpeed: Double = 800.0
+
+    /// Rebound belongs to the same fast physical spin and follows its previous report quickly. A later opposite
+    /// report is a new user action—commonly the first scroll after switching windows—and must not be swallowed just
+    /// because the old display-synchronized animation is still coasting.
+    @objc let stableReboundSuppressionInterval: TimeInterval = 80.0 / 1000.0
+
+    /// Long enough to contain the measured multi-report mechanical rebound. A real reversal is not forced to wait
+    /// for this timeout: it is confirmed early when its raw hardware velocity crosses the threshold below.
+    @objc let stableReboundHysteresisDuration: TimeInterval = 250.0 / 1000.0
+    @objc let stableReboundConfirmationVelocity: Double = 500.0
+
+    /// Never turn a lone opposing report into zero. This small total budget opens a valid gesture immediately and
+    /// remains visible as feedback for an intentional slow reversal, while limiting an entire rebound run to 24px.
+    @objc let stableReboundPreviewDistance: Double = 24.0
+
+    /// A free-spinning ring can emit one last low-velocity report well after a fast gesture has visually stopped.
+    /// Do not discard it: a resumed scroll is indistinguishable at arrival time. Instead, make that one report small
+    /// and brief so mechanical settling cannot look like a second gesture while a real resume remains responsive.
+    @objc let stableFastTailInputGapMin: TimeInterval = 120.0 / 1000.0
+    @objc let stableFastTailRawVelocityMax: Double = 10.0
+    @objc let stableFastTailAnimatorSpeedMax: Double = 1000.0
+    /// Tail protection fades continuously as existing output motion rises. By this speed the report is part of an
+    /// active deceleration and receives full distance plus normal adaptive smoothing.
+    @objc let stableFastTailContinuitySpeed: Double = 400.0
+    @objc let stableFastTailDistanceScale: Double = 0.25
+    @objc let stableFastTailDurationScale: Double = 0.55
 
     // MARK: Invert ball scrolling (fork)
 
@@ -490,6 +570,10 @@ import Cocoa
     /// The first report has no measured interval. Treat it as an explicit isolated movement rather than pretending
     /// it arrived after the full 500ms continuity timeout.
     @objc let isolatedTickVelocityInterval: TimeInterval = 200.0/1000.0
+    /// Keep velocity measurement independent from the legacy acceleration curve's 15ms extrapolation boundary.
+    /// A 750Hz HID poll is 1.33ms; the CGEvent rate is usually much lower, but using a 1ms floor means the estimator
+    /// remains correct if macOS does deliver high-rate scroll reports. The final pixel cap still guards bad timestamps.
+    @objc let velocityMeasurementIntervalMin: TimeInterval = 1.0/1000.0
     /// Keep acceleration and deceleration similarly responsive. The earlier 20ms attack / 40ms release pair made
     /// output speed continue drifting after the ring had already slowed. Smoothness can still add a small amount of
     /// filtering, but it no longer doubles the release latency.
@@ -657,7 +741,9 @@ import Cocoa
             break
         }
 
-        /// SCALE the step duration; don't replace it.
+        /// SCALE the step duration; don't replace it. On the stable Regular path, Scroll.m applies a second relative
+        /// adjustment whose very-slow endpoint and transition speed are controlled by `u_slowSmoothnessAmount` and
+        /// `u_adaptiveSmoothnessEndSpeedRatio`.
         ///     `baseMsPerStepCurve` is speed-adaptive: Scroll.m:743 maps timeBetweenTicks onto 0...1 and samples it,
         ///     so the animation shortens (180 -> 110ms on LowInertia) as ticks arrive faster, letting the animator
         ///     keep up with fast scrolling. An earlier version of this pinned a single fixed duration and dropped

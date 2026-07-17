@@ -65,17 +65,85 @@ static ScrollAnalysisResult _lastScrollAnalysisResult;
 static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
 //static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
+/// A free-spinning ring can mechanically cross zero and report a short run in the opposite direction before
+/// settling back. Keep this state on `_scrollQueue`: it bounds that run without dropping a lone intentional report.
+static MFDirection _stableReboundCandidateDirection = kMFDirectionNone;
+static CFTimeInterval _stableReboundCandidateStartTime = 0;
+static double _stableReboundCandidateOutputDistance = 0;
+
+/// Aggregate the events that actually reach applications. The animator can be display-synchronized while integer
+/// pixel quantization still skips output frames, so input/curve telemetry alone cannot prove visible cadence.
+/// TouchAnimator invokes this callback on its display-link queue.
+static CFTimeInterval _legacyOutputWindowStart;
+static CFTimeInterval _legacyLastOutputTime;
+static NSUInteger _legacyOutputEventCount;
+static NSUInteger _legacyOutputIntervalCount;
+static CFTimeInterval _legacyOutputIntervalSum;
+static CFTimeInterval _legacyOutputMaxGap;
+static int64_t _legacyOutputPixelSum;
+
+static void legacyRecordOutput(int64_t px, MFDirection direction) {
+    if (px <= 0) return;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    CFTimeInterval gap = _legacyLastOutputTime > 0 ? now - _legacyLastOutputTime : 0;
+
+    if (_legacyOutputWindowStart == 0 || gap > 0.5) {
+        _legacyOutputWindowStart = now;
+        _legacyOutputEventCount = 0;
+        _legacyOutputIntervalCount = 0;
+        _legacyOutputIntervalSum = 0;
+        _legacyOutputMaxGap = 0;
+        _legacyOutputPixelSum = 0;
+        gap = 0;
+    }
+
+    if (gap > 0) {
+        _legacyOutputIntervalCount += 1;
+        _legacyOutputIntervalSum += gap;
+        _legacyOutputMaxGap = MAX(_legacyOutputMaxGap, gap);
+    }
+
+    _legacyLastOutputTime = now;
+    _legacyOutputEventCount += 1;
+    _legacyOutputPixelSum += px;
+
+    CFTimeInterval windowDuration = now - _legacyOutputWindowStart;
+    if (windowDuration >= 0.25) {
+        double eventHz = _legacyOutputIntervalSum > 0
+            ? (double)_legacyOutputIntervalCount / _legacyOutputIntervalSum
+            : 0;
+        double outputSpeed = (double)_legacyOutputPixelSum / windowDuration;
+        DDLogDebug("MFSCROLL_OUTPUT: eventHz=%.1f maxGapMs=%.2f outputV=%.1f events=%lu outputPx=%lld direction=%ld",
+                   eventHz,
+                   _legacyOutputMaxGap * 1000.0,
+                   outputSpeed,
+                   (unsigned long)_legacyOutputEventCount,
+                   _legacyOutputPixelSum,
+                   (long)direction);
+
+        _legacyOutputWindowStart = now;
+        _legacyOutputEventCount = 0;
+        _legacyOutputIntervalCount = 0;
+        _legacyOutputIntervalSum = 0;
+        _legacyOutputMaxGap = 0;
+        _legacyOutputPixelSum = 0;
+    }
+}
+
 #pragma mark - Display-synchronized scroll motion controller
 
 /// The legacy TouchAnimator restarts a finite curve for every physical report. That preserves distance, but it also
 /// turns report timing irregularities into repeated changes in output velocity. This controller instead maintains one
-/// continuously moving target. New reports move the target without resetting velocity, so steady input converges to
-/// steady output and fast input can be coalesced into one delta per display frame.
+/// continuously moving target. Reports first enter a distance reservoir. The display loop meters that distance into
+/// the target using the real report cadence, so sparse ring reports become display-rate motion instead of position
+/// steps which finish early and leave visible gaps.
 ///
 /// All mutable state below is confined to `_motionDisplayLink.dispatchQueue`.
 static Vector _motionPosition;
 static Vector _motionTarget;
 static Vector _motionVelocity;
+static Vector _motionPendingDistance;
 static Vector _motionLastSampledPosition;
 static CFTimeInterval _motionLastFrameTime;
 static CFTimeInterval _motionLastInputTime;
@@ -85,10 +153,19 @@ static BOOL _motionHasProducedDeltas;
 static MFDirection _motionDirection;
 static MFMomentumHint _motionLastMomentumHint;
 static ScrollConfig *_motionConfig;
+static MFScrollModificationResult _motionModifications;
+static double _motionRawInputVelocity;
+static double _motionFilteredInputVelocity;
+static CFTimeInterval _motionRecentInputInterval;
+static CFTimeInterval _motionEffectiveReleaseDelay;
+static CFTimeInterval _motionFeedHorizon;
+static double _motionFeedSpeed;
+static CFTimeInterval _motionLastTelemetryTime;
 
-static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config);
+static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications);
 static void motionControllerCancel(void);
-static void motionControllerAdd(Vector delta, MFDirection direction, ScrollConfig *config, CFTimeInterval inputTime, double inputQueueDelayMs);
+static void motionControllerReverse(void);
+static void motionControllerAdd(Vector delta, MFDirection direction, ScrollConfig *config, MFScrollModificationResult modifications, CFTimeInterval inputTime, double inputQueueDelayMs, double rawInputVelocity, double filteredInputVelocity);
 
 static double motionMagnitude(Vector vector) {
     return hypot(vector.x, vector.y);
@@ -98,6 +175,7 @@ static void motionControllerResetState_Unsafe(void) {
     _motionPosition = _P(0, 0);
     _motionTarget = _P(0, 0);
     _motionVelocity = _P(0, 0);
+    _motionPendingDistance = _P(0, 0);
     _motionLastSampledPosition = _P(0, 0);
     _motionLastFrameTime = 0;
     _motionLastInputTime = 0;
@@ -107,12 +185,23 @@ static void motionControllerResetState_Unsafe(void) {
     _motionDirection = kMFDirectionNone;
     _motionLastMomentumHint = kMFMomentumHintNone;
     _motionConfig = nil;
+    _motionModifications = (MFScrollModificationResult) {
+        .inputMod = kMFScrollInputModificationNone,
+        .effectMod = kMFScrollEffectModificationNone,
+    };
+    _motionRawInputVelocity = 0;
+    _motionFilteredInputVelocity = 0;
+    _motionRecentInputInterval = 0;
+    _motionEffectiveReleaseDelay = 0;
+    _motionFeedHorizon = 0;
+    _motionFeedSpeed = 0;
+    _motionLastTelemetryTime = 0;
     [_motionSubPixelator reset];
 }
 
 static void motionControllerStop_Unsafe(MFAnimationCallbackPhase phase) {
     if (_motionHasProducedDeltas && _motionConfig != nil) {
-        sendScroll(0, _motionDirection, YES, phase, _motionLastMomentumHint, _motionConfig);
+        sendScroll(0, _motionDirection, YES, phase, _motionLastMomentumHint, _motionConfig, _motionModifications);
     }
     [_motionDisplayLink stop_Unsafe];
     motionControllerResetState_Unsafe();
@@ -123,6 +212,25 @@ static void motionControllerCancel(void) {
         if ([_motionDisplayLink isRunning_Unsafe]) {
             motionControllerStop_Unsafe(kMFAnimationCallbackPhaseCanceled);
         } else {
+            motionControllerResetState_Unsafe();
+        }
+    });
+}
+
+/// End the old-direction session without stopping and immediately restarting CVDisplayLink. DisplayLink's actual
+/// start/stop operations are asynchronous to its requested-state flag; rapidly doing both during reversal can leave
+/// the flag at "running" after the underlying link has stopped. Resetting in place avoids that lifecycle race.
+static void motionControllerReverse(void) {
+    dispatch_async(_motionDisplayLink.dispatchQueue, ^{
+        if ([_motionDisplayLink isRunning_Unsafe] && _motionConfig != nil) {
+            DDLogDebug("MFSCROLL_REVERSAL: canceling old motion in place pendingPx=%.1f errorPx=%.1f outputV=%.1f",
+                       motionMagnitude(_motionPendingDistance),
+                       motionMagnitude(subtractedVectors(_motionTarget, _motionPosition)),
+                       motionMagnitude(_motionVelocity));
+            if (_motionHasProducedDeltas) {
+                sendScroll(0, _motionDirection, YES, kMFAnimationCallbackPhaseCanceled,
+                           _motionLastMomentumHint, _motionConfig, _motionModifications);
+            }
             motionControllerResetState_Unsafe();
         }
     });
@@ -152,9 +260,28 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
     dt = CLIP(dt, 1.0 / 240.0, 1.0 / 20.0);
     _motionLastFrameTime = frameTime;
 
+    /// Move accepted distance from the reservoir into the spring target at display cadence. `_motionFeedSpeed` is
+    /// recomputed whenever a real report arrives so that all currently pending distance is scheduled across the
+    /// cadence-derived horizon. The final min() is what preserves exact distance without overshooting the reservoir.
+    double pendingDistance = motionMagnitude(_motionPendingDistance);
+    if (pendingDistance > 0.000001) {
+        double feedDistance = MIN(pendingDistance, _motionFeedSpeed * dt);
+        if (feedDistance <= 0) {
+            /// Defensive fallback for a malformed/zero cadence estimate. This still drains only accepted distance.
+            feedDistance = MIN(pendingDistance, pendingDistance * dt / MAX(_motionFeedHorizon, dt));
+        }
+        Vector feedDelta = scaledVector(unitVector(_motionPendingDistance), feedDistance);
+        _motionTarget = addedVectors(_motionTarget, feedDelta);
+        _motionPendingDistance = subtractedVectors(_motionPendingDistance, feedDelta);
+        if (motionMagnitude(_motionPendingDistance) < 0.000001) {
+            _motionPendingDistance = _P(0, 0);
+            _motionFeedSpeed = 0;
+        }
+    }
+
     /// While reports are arriving, a fast critical response keeps the page attached to the ring. Once reports stop,
     /// a gentler response drains only the remaining target error: it glides without inventing distance or overshoot.
-    BOOL inputIsActive = CACurrentMediaTime() - _motionLastInputTime <= _motionConfig.targetedScrollReleaseDelay;
+    BOOL inputIsActive = CACurrentMediaTime() - _motionLastInputTime <= _motionEffectiveReleaseDelay;
     double omega = inputIsActive
         ? _motionConfig.targetedScrollActiveResponse
         : _motionConfig.targetedScrollReleaseResponse;
@@ -177,6 +304,7 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
     motionControllerAdvanceDimension(&_motionPosition.y, &_motionVelocity.y, _motionTarget.y, omega, dt);
 
     BOOL isSettled = !inputIsActive
+        && motionMagnitude(_motionPendingDistance) < 0.001
         && motionMagnitude(subtractedVectors(_motionTarget, _motionPosition)) < 0.20
         && motionMagnitude(_motionVelocity) < 4.0;
     if (isSettled) {
@@ -204,9 +332,34 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
                        _motionFirstInputQueueDelayMs);
         }
 
-        sendScroll(llround(motionMagnitude(integerDelta)), _motionDirection, YES, phase, momentumHint, _motionConfig);
+        sendScroll(llround(motionMagnitude(integerDelta)), _motionDirection, YES, phase, momentumHint, _motionConfig, _motionModifications);
         _motionHasProducedDeltas = YES;
         _motionLastMomentumHint = momentumHint;
+    }
+
+    /// A scalar, sampled trace for correlating what the ring did with what the controller produced. Keep this at
+    /// 10Hz so attaching `./dev.sh logs` does not turn logging itself into a source of scroll latency.
+    CFTimeInterval telemetryTime = CACurrentMediaTime();
+    if (telemetryTime - _motionLastTelemetryTime >= 100.0/1000.0 || isSettled) {
+        Vector targetError = subtractedVectors(_motionTarget, _motionPosition);
+        double pendingPx = motionMagnitude(_motionPendingDistance);
+        DDLogDebug("MFSCROLL_FEEL: rawV=%.1f filteredV=%.1f acceptedPx=%.1f pendingPx=%.1f feedV=%.1f feedMs=%.2f targetPx=%.1f outputPx=%.1f errorPx=%.2f outputV=%.1f active=%d omega=%.1f cadenceMs=%.2f releaseMs=%.2f frameHz=%.1f",
+                   _motionRawInputVelocity,
+                   _motionFilteredInputVelocity,
+                   motionMagnitude(_motionTarget) + pendingPx,
+                   pendingPx,
+                   _motionFeedSpeed,
+                   _motionFeedHorizon * 1000.0,
+                   motionMagnitude(_motionTarget),
+                   motionMagnitude(_motionPosition),
+                   motionMagnitude(targetError),
+                   motionMagnitude(_motionVelocity),
+                   (int)inputIsActive,
+                   omega,
+                   _motionRecentInputInterval * 1000.0,
+                   _motionEffectiveReleaseDelay * 1000.0,
+                   1.0 / dt);
+        _motionLastTelemetryTime = telemetryTime;
     }
 
     if (isSettled) {
@@ -214,19 +367,59 @@ static void motionControllerDisplayLinkCallback(DisplayLinkCallbackTimeInfo time
     }
 }
 
-static void motionControllerAdd(Vector delta, MFDirection direction, ScrollConfig *config, CFTimeInterval inputTime, double inputQueueDelayMs) {
+static void motionControllerAdd(Vector delta, MFDirection direction, ScrollConfig *config, MFScrollModificationResult modifications, CFTimeInterval inputTime, double inputQueueDelayMs, double rawInputVelocity, double filteredInputVelocity) {
     dispatch_async(_motionDisplayLink.dispatchQueue, ^{
         BOOL wasRunning = [_motionDisplayLink isRunning_Unsafe];
-        if (!wasRunning) {
-            motionControllerResetState_Unsafe();
+        BOOL startsNewSession = !wasRunning || _motionConfig == nil;
+        if (startsNewSession) {
+            if (!wasRunning) {
+                motionControllerResetState_Unsafe();
+            }
             _motionFirstInputTime = inputTime;
             _motionFirstInputQueueDelayMs = inputQueueDelayMs;
+        } else {
+            CFTimeInterval inputInterval = inputTime - _motionLastInputTime;
+            if (inputInterval > 0 && inputInterval <= config.consecutiveScrollTickIntervalMax) {
+                if (_motionRecentInputInterval <= 0) {
+                    _motionRecentInputInterval = inputInterval;
+                } else if (inputInterval < _motionRecentInputInterval) {
+                    /// Follow acceleration immediately. A slow cadence filter here would leave a large backlog just
+                    /// as the user spins faster. The spring still smooths the corresponding output-rate transition.
+                    _motionRecentInputInterval = inputInterval;
+                } else {
+                    /// Slow down with a time-based cadence filter. One late/jittery report should not immediately
+                    /// stretch all pending motion, but a genuinely slower ring should be tracked within about 60ms.
+                    double cadenceAlpha = 1.0 - exp(-inputInterval / (60.0/1000.0));
+                    _motionRecentInputInterval += cadenceAlpha * (inputInterval - _motionRecentInputInterval);
+                }
+            }
         }
 
-        _motionTarget = addedVectors(_motionTarget, delta);
+        _motionPendingDistance = addedVectors(_motionPendingDistance, delta);
         _motionDirection = direction;
         _motionConfig = config;
+        _motionModifications = modifications;
+        _motionRawInputVelocity = rawInputVelocity;
+        _motionFilteredInputVelocity = filteredInputVelocity;
         _motionLastInputTime = inputTime;
+        /// Protect medium-rate input from repeatedly falling into momentum between normal reports. Fast input keeps
+        /// the short slider-derived release; sparse input may extend it, but never beyond 140ms.
+        CFTimeInterval cadenceReleaseDelay = MIN(140.0/1000.0, _motionRecentInputInterval * 1.5);
+        _motionEffectiveReleaseDelay = MAX(config.targetedScrollReleaseDelay, cadenceReleaseDelay);
+
+        /// Schedule the whole reservoir over slightly more than one expected report interval. The 1.25 cushion
+        /// prevents ordinary timing jitter from emptying the reservoir before the next change report arrives.
+        /// At least two display frames are used so even a single large report cannot become a one-frame jump.
+        CFTimeInterval displayPeriod = [_motionDisplayLink bestTimeBetweenFramesEstimate];
+        if (!isfinite(displayPeriod) || displayPeriod <= 0) {
+            displayPeriod = 1.0 / 60.0;
+        }
+        CFTimeInterval minimumFeedHorizon = MAX(12.0/1000.0, displayPeriod * 2.0);
+        CFTimeInterval cadenceFeedHorizon = _motionRecentInputInterval > 0
+            ? _motionRecentInputInterval * 1.25
+            : MAX(config.targetedScrollReleaseDelay, 50.0/1000.0);
+        _motionFeedHorizon = CLIP(cadenceFeedHorizon, minimumFeedHorizon, 140.0/1000.0);
+        _motionFeedSpeed = motionMagnitude(_motionPendingDistance) / _motionFeedHorizon;
 
         if (!wasRunning) {
             [_motionDisplayLink start_UnsafeWithCallback:^(DisplayLinkCallbackTimeInfo timeInfo) {
@@ -254,7 +447,14 @@ static void motionControllerAdd(Vector delta, MFDirection direction, ScrollConfi
     
     /// Create/enable scrollwheel input callback
     if (_eventTap == NULL) {
-        CGEventMask mask = CGEventMaskBit(kCGEventScrollWheel);
+        /// Mouse-down events are observed only to terminate an existing scroll gesture. Activating or moving a
+        /// window starts with a click/drag; if the old gesture survives that interaction, some scroll views keep it
+        /// associated with the previous target and ignore same-direction deltas until a reversal opens a new one.
+        /// The button events themselves are always returned unmodified by eventTapCallback().
+        CGEventMask mask = CGEventMaskBit(kCGEventScrollWheel)
+            | CGEventMaskBit(kCGEventLeftMouseDown)
+            | CGEventMaskBit(kCGEventRightMouseDown)
+            | CGEventMaskBit(kCGEventOtherMouseDown);
         _eventTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, eventTapCallback, NULL);
         DDLogDebug("Scroll.m: _eventTap: %@", _eventTap);
         CFRunLoopSourceRef runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, _eventTap, 0);
@@ -293,6 +493,9 @@ void resetState_Unsafe(void) {
     motionControllerCancel();
     [GestureScrollSimulator stopMomentumScroll]; /// Not sure if appropriate
     [ScrollAnalyzer resetState];
+    _stableReboundCandidateDirection = kMFDirectionNone;
+    _stableReboundCandidateStartTime = 0;
+    _stableReboundCandidateOutputDistance = 0;
 }
 
 //+ (void)suspend {
@@ -383,14 +586,32 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
         DDLogDebug("Scroll.m: eventTap was disabled by %@", type == kCGEventTapDisabledByTimeout ? @"timeout. Re-enabling." : @"user input.");
         
-        if (type == kCGEventTapDisabledByTimeout) {
-            CGEventTapEnable(_eventTap, true);
-        }
+        /// This tap is the active scroll driver whenever SwitchMaster has enabled it. Leaving it disabled for
+        /// kCGEventTapDisabledByUserInput keeps the Helper alive but makes scrolling permanently inert until a
+        /// restart. Programmatic `stopReceiving` does not arrive through this callback, so re-enabling here does
+        /// not fight the user's enable switch.
+        CGEventTapEnable(_eventTap, true);
         
         return event;
     }
 
-    /// Return non-scrollwheel events unaltered
+    /// A click or drag changes which view owns the next scroll gesture, even when the frontmost bundle identifier
+    /// stays the same. End the old session on the scroll queue, preserving event order with future wheel input, and
+    /// pass the button event through untouched. This also mirrors trackpad behavior: pressing the pointer cancels
+    /// any scroll momentum which was still active.
+    if (type == kCGEventLeftMouseDown
+        || type == kCGEventRightMouseDown
+        || type == kCGEventOtherMouseDown) {
+        int64_t buttonNumber = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1;
+        dispatch_async(_scrollQueue, ^{
+            DDLogDebug("MFSCROLL_TARGET: mouse-down button=%lld action=reset-session",
+                       buttonNumber);
+            resetState_Unsafe();
+        });
+        return event;
+    }
+
+    /// Inspect physical scrollwheel events
     int64_t isPixelBased     = CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous);
     int64_t scrollPhase      = CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase);
     int64_t scrollDeltaAxis1 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1);
@@ -462,7 +683,12 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     
     /// Declare stuff for later
     static DriverUnsuspender unsuspendDrivers = ^{}; /// This is old stuff that should be removed I think [Jun 2 2025]
+    static CFTimeInterval previousPhysicalScrollInputTime = 0;
     double inputQueueDelayMs = MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0);
+    double physicalInputGap = previousPhysicalScrollInputTime > 0
+        ? tickTS - previousPhysicalScrollInputTime
+        : DBL_MAX;
+    previousPhysicalScrollInputTime = tickTS;
     
     /// Get axis
     
@@ -489,6 +715,21 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     if (_scrollConfig == nil) {
         _scrollConfig = ScrollConfig.shared;
     }
+
+    /// A scroll animation belongs to the application that received its opening phase. If focus moves to another
+    /// app, continuing that old gesture/momentum session in the new app can make its scroll view ignore deltas until
+    /// a later direction change cancels the session. Start clean on the first physical report after activation.
+    static NSString *previousScrollTargetBundleID = nil;
+    NSString *currentScrollTargetBundleID = HelperState.shared.frontmostAppBundleID ?: @"";
+    BOOL scrollTargetAppChanged = previousScrollTargetBundleID != nil
+        && ![currentScrollTargetBundleID isEqualToString:previousScrollTargetBundleID];
+    if (scrollTargetAppChanged) {
+        DDLogDebug("MFSCROLL_TARGET: app-change %@ -> %@ action=reset-session",
+                   previousScrollTargetBundleID,
+                   currentScrollTargetBundleID);
+        resetState_Unsafe();
+    }
+    previousScrollTargetBundleID = [currentScrollTargetBundleID copy];
     
     /// Run preliminary scrollAnalysis
     ///     To check if this is the first consecutive scrollTick
@@ -600,15 +841,10 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     /// Run full scrollAnalysis
     ScrollAnalysisResult scrollAnalysisResult = [ScrollAnalyzer updateWithTickOccuringAt:tickTS direction:scrollDirection units:llabs(lineDelta) config:_scrollConfig];
 
-    /// Note [Jul 16 2026]: there used to be a "drop the lone trailing detent" heuristic here. It's been removed.
-    ///     Short version: a settling detent and the first tick of a *resumed* scroll are identical at
-    ///     the moment they arrive, and differ only in what comes after, which an event tap can't see. Measured over
-    ///     1464 real events, it dropped 112 ticks of which **87 were the start of a scroll, not a trailing detent**
-    ///     — the user felt that as "it sticks for a bit, then starts scrolling". The gap distributions overlap
-    ///     completely (wrongly-dropped starts at 179-354ms vs real detents at ~260ms), so no timing window
-    ///     separates them.
-    ///     It's also obsolete: it was built when one unit was a 73-86px lurch. At the tuned default sensitivity a
-    ///     detent is ~14px, which is what actually solved the problem.
+    /// Note [Jul 16 2026]: never drop a lone trailing detent outright. A settling detent and the first tick of a
+    ///     resumed scroll are identical at arrival time. An earlier timing-only heuristic dropped 112 ticks, 87 of
+    ///     which were real scroll starts, producing a sticky delay. The stable path below instead remembers whether
+    ///     this gesture actually became fast and attenuates—rather than discards—one late low-velocity report.
 
     
     /// Store scrollAnalysisResult
@@ -658,6 +894,19 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     ///     -> Edit: Their whole shtick is to make the outputSpeed(inputSpeed) curve smooth. This is relatively hard and I don't think this would be noticable for scrolling. Instead we simply define a sens(inputSpeed) curve using a Bezier curve.
     
     int64_t pxToScrollForThisTick;
+    double pxForThisTickBeforeRateLimit = 0;
+    double stableRateLimitPx = 0;
+    double stableOutputSpeedRatio = 0;
+    BOOL stableRateLimited = NO;
+    BOOL stableOverloadControlEnabled = NO;
+    /// A fast gesture's first sparse tail report must remain brief, but intentional continued slow movement must
+    /// regain adaptive smoothing. Track whether one tail report has already been handled; a second slow report is
+    /// evidence of continuation and returns to the normal speed-derived curve.
+    double stableAdaptiveSlowSmoothingBlendForTick = 1.0;
+    static BOOL stableGestureReachedFastSpeed = NO;
+    static BOOL stableFastTailReportHandled = NO;
+    BOOL stableFastTailReport = NO;
+    double stableFastTailContinuity = 1.0;
     
     if (_scrollConfig.useAppleAcceleration) {
         
@@ -667,6 +916,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         
         /// Get tickInterval
         double timeBetweenTicks = scrollAnalysisResult.timeBetweenTicks;
+        BOOL hasMeasuredTickInterval = timeBetweenTicks != DBL_MAX;
         
         /// Validate tickInterval
         assert(timeBetweenTicks == DBL_MAX
@@ -726,11 +976,87 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         }
 
         /// Cap the FINAL output, after every acceleration layer.
-        ///     Capping before fastScroll let the exponential multiplier bypass the safety limit entirely.
-        double maxPxPerTick = _scrollConfig.pxAtRefSpeed * 12.0;
-        if (pxForThisTickDouble > maxPxPerTick) {
-            DDLogDebug("Scroll.m: capping px %.0f -> %.0f (v=%.0f units/s)", pxForThisTickDouble, maxPxPerTick, scrollSpeed);
-            pxForThisTickDouble = maxPxPerTick;
+        ///
+        /// The old limit was pixels/report. Its effective speed therefore changed with hardware cadence and let the
+        /// TB800 enqueue 17k–24k px/s during a hard spin. Limit distance by the real time represented by this report
+        /// instead. The first report has no interval, so retain the old bounded-start behavior for that one report.
+        pxForThisTickBeforeRateLimit = pxForThisTickDouble;
+        stableOverloadControlEnabled = !_scrollConfig.useTargetedScrollEngine
+            && _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
+
+        double modeledOutputSpeed = _scrollConfig.pxAtRefSpeed
+            * _scrollConfig.refSpeed
+            * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma);
+        stableOutputSpeedRatio = modeledOutputSpeed / _scrollConfig.stableMaximumOutputSpeed;
+
+        if (firstConsecutive) {
+            stableGestureReachedFastSpeed = NO;
+            stableFastTailReportHandled = NO;
+        }
+        if (modeledOutputSpeed >= _scrollConfig.stableMomentumPromotionSpeed) {
+            stableGestureReachedFastSpeed = YES;
+            /// Re-arm after every genuinely fast section, including fast -> slow -> fast within one gesture.
+            stableFastTailReportHandled = NO;
+        }
+
+        /// Hardware traces show the visible secondary burst as a real ~50px report arriving 150–320ms after a
+        /// fast gesture, often after retained distance has already reached zero. Dropping it is unsafe because a
+        /// deliberate resume looks the same. Reduce only the first response. A second report proves continued
+        /// movement and therefore regains the speed-adaptive smoothness curve and full distance.
+        double currentLegacyAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
+        stableFastTailReport = stableOverloadControlEnabled
+            && !firstConsecutive
+            && !scrollAnalysisResult.scrollDirectionDidChange
+            && stableGestureReachedFastSpeed
+            && !stableFastTailReportHandled
+            && scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw <= _scrollConfig.stableFastTailRawVelocityMax
+            && physicalInputGap >= _scrollConfig.stableFastTailInputGapMin
+            && currentLegacyAnimationSpeed <= _scrollConfig.stableFastTailAnimatorSpeedMax;
+        if (stableFastTailReport) {
+            stableFastTailReportHandled = YES;
+            double continuityUnit = CLIP(currentLegacyAnimationSpeed
+                / _scrollConfig.stableFastTailContinuitySpeed, 0.0, 1.0);
+            stableFastTailContinuity = continuityUnit * continuityUnit * (3.0 - 2.0 * continuityUnit);
+            stableAdaptiveSlowSmoothingBlendForTick = stableFastTailContinuity;
+            double fullTailDistance = pxForThisTickDouble;
+            double distanceScale = _scrollConfig.stableFastTailDistanceScale
+                + stableFastTailContinuity * (1.0 - _scrollConfig.stableFastTailDistanceScale);
+            pxForThisTickDouble *= distanceScale;
+            DDLogDebug("MFSCROLL_TAIL: action=blend rawV=%.1f gapMs=%.1f currentV=%.1f continuity=%.2f distanceScale=%.2f fullPx=%.1f outputPx=%.1f",
+                       scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
+                       physicalInputGap * 1000.0,
+                       currentLegacyAnimationSpeed,
+                       stableFastTailContinuity,
+                       distanceScale,
+                       fullTailDistance,
+                       pxForThisTickDouble);
+        }
+
+        if (stableOverloadControlEnabled) {
+            double rateInterval = hasMeasuredTickInterval
+                ? MAX(scrollAnalysisResult.DEBUG_timeBetweenTicksRaw, _scrollConfig.velocityMeasurementIntervalMin)
+                : 0;
+            stableRateLimitPx = hasMeasuredTickInterval
+                ? _scrollConfig.stableMaximumOutputSpeed * rateInterval
+                : _scrollConfig.stableMaximumInitialDistance;
+
+            if (pxForThisTickDouble > stableRateLimitPx) {
+                DDLogDebug("Scroll.m: rate limiting px %.1f -> %.1f over %.2fms (modeled %.0f px/s, limit %.0f px/s)",
+                           pxForThisTickDouble,
+                           stableRateLimitPx,
+                           rateInterval * 1000.0,
+                           modeledOutputSpeed,
+                           _scrollConfig.stableMaximumOutputSpeed);
+                pxForThisTickDouble = stableRateLimitPx;
+                stableRateLimited = YES;
+            }
+        } else {
+            /// Preserve the diagnostic target engine's previous behavior so this stable-engine change remains
+            /// independently testable.
+            stableRateLimitPx = _scrollConfig.pxAtRefSpeed * 12.0;
+            if (pxForThisTickDouble > stableRateLimitPx) {
+                pxForThisTickDouble = stableRateLimitPx;
+            }
         }
 
         pxToScrollForThisTick = llround(pxForThisTickDouble);
@@ -759,16 +1085,77 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 /// Drop the old-direction target immediately. Reversal is a control action, so preserving a stale
                 /// coast here is less precise than preserving its remaining distance.
                 DDLogDebug("Scroll.m: Direction change – cancel targeted scroll and keep current tick.");
-                motionControllerCancel();
+                motionControllerReverse();
             } else {
                 double currentAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
-                if (currentAnimationSpeed > 0) {
-                    /// Cancel the old-direction coast, but keep processing this tick. The animator serializes
-                    /// cancel() and startWithParams() on the same queue, so the new-direction animation starts
-                    /// after the old one has stopped. Returning here used to discard the exact tick that should
-                    /// make scrolling responsive again at a content boundary.
-                    DDLogDebug("Scroll.m: Direction change – cancel scroll and keep current tick.");
-                    [_animator cancel];
+                /// Always terminate the old gesture before opening the opposite one, even if the last sampled
+                /// animation speed happens to be zero. Leaving phase state alive at that boundary can make a view
+                /// ignore the new same-direction stream until another reversal.
+                DDLogDebug("Scroll.m: Direction change – cancel scroll and keep current tick.");
+                [_animator cancel];
+
+                /// The TB800 trace disproved the old one-report rebound assumption: the mechanical rebound lasted
+                /// four reports / 213ms, while a deliberate slow movement may contain only one report. Start a short
+                /// hysteresis window instead. The shared clamp below preserves a small immediate response and bounds
+                /// the whole candidate run; a decisive reversal escapes as soon as its raw velocity is high enough.
+                BOOL isImmediateFastRebound = _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia
+                    && currentAnimationSpeed >= _scrollConfig.stableReboundSuppressionSpeed
+                    && physicalInputGap <= _scrollConfig.stableReboundSuppressionInterval;
+                if (isImmediateFastRebound) {
+                    _stableReboundCandidateDirection = scrollDirection;
+                    _stableReboundCandidateStartTime = tickTS;
+                    _stableReboundCandidateOutputDistance = 0;
+                    DDLogDebug("MFSCROLL_REVERSAL: action=begin-hysteresis currentV=%.1f gapMs=%.1f inputPx=%lld direction=%ld",
+                               currentAnimationSpeed,
+                               physicalInputGap * 1000.0,
+                               pxToScrollForThisTick,
+                               (long)scrollDirection);
+                } else if (_scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia
+                           && currentAnimationSpeed >= _scrollConfig.stableReboundSuppressionSpeed) {
+                    DDLogDebug("MFSCROLL_REVERSAL: action=keep-new-input currentV=%.1f gapMs=%.1f keptPx=%lld direction=%ld",
+                               currentAnimationSpeed,
+                               physicalInputGap * 1000.0,
+                               pxToScrollForThisTick,
+                               (long)scrollDirection);
+                }
+            }
+        }
+
+        if (_stableReboundCandidateDirection != kMFDirectionNone) {
+            if (scrollDirection != _stableReboundCandidateDirection) {
+                DDLogDebug("MFSCROLL_REVERSAL: action=returned-to-original elapsedMs=%.1f candidateOutputPx=%.1f direction=%ld",
+                           (tickTS - _stableReboundCandidateStartTime) * 1000.0,
+                           _stableReboundCandidateOutputDistance,
+                           (long)scrollDirection);
+                _stableReboundCandidateDirection = kMFDirectionNone;
+                _stableReboundCandidateStartTime = 0;
+                _stableReboundCandidateOutputDistance = 0;
+            } else {
+                CFTimeInterval reboundElapsed = tickTS - _stableReboundCandidateStartTime;
+                double rawVelocity = scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw;
+                BOOL candidateIsUnconfirmed = reboundElapsed <= _scrollConfig.stableReboundHysteresisDuration
+                    && rawVelocity < _scrollConfig.stableReboundConfirmationVelocity;
+                if (candidateIsUnconfirmed) {
+                    double remainingPreviewDistance = MAX(0,
+                        _scrollConfig.stableReboundPreviewDistance - _stableReboundCandidateOutputDistance);
+                    int64_t unclampedDistance = pxToScrollForThisTick;
+                    pxToScrollForThisTick = MIN(pxToScrollForThisTick, llround(remainingPreviewDistance));
+                    _stableReboundCandidateOutputDistance += pxToScrollForThisTick;
+                    DDLogDebug("MFSCROLL_REVERSAL: action=bound-candidate elapsedMs=%.1f rawV=%.1f inputPx=%lld outputPx=%lld budgetLeftPx=%.1f direction=%ld",
+                               reboundElapsed * 1000.0,
+                               rawVelocity,
+                               unclampedDistance,
+                               pxToScrollForThisTick,
+                               MAX(0, _scrollConfig.stableReboundPreviewDistance - _stableReboundCandidateOutputDistance),
+                               (long)scrollDirection);
+                } else {
+                    DDLogDebug("MFSCROLL_REVERSAL: action=confirmed elapsedMs=%.1f rawV=%.1f direction=%ld",
+                               reboundElapsed * 1000.0,
+                               rawVelocity,
+                               (long)scrollDirection);
+                    _stableReboundCandidateDirection = kMFDirectionNone;
+                    _stableReboundCandidateStartTime = 0;
+                    _stableReboundCandidateOutputDistance = 0;
                 }
             }
         }
@@ -789,7 +1176,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     } else if (!_scrollConfig.smoothEnabled) {
         
         /// Send scroll event directly - without the animator. Will scroll all of pxToScrollForThisTick at once.
-        sendScroll(pxToScrollForThisTick, scrollDirection, NO, kMFAnimationCallbackPhaseNone, kMFMomentumHintNone, _scrollConfig);
+        sendScroll(pxToScrollForThisTick, scrollDirection, NO, kMFAnimationCallbackPhaseNone, kMFMomentumHintNone, _scrollConfig, _modifications);
         
     } else if (_scrollConfig.useTargetedScrollEngine) {
 
@@ -801,8 +1188,11 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         motionControllerAdd(vectorFromDeltaAndDirection(pxToScrollForThisTick, scrollDirection),
                             scrollDirection,
                             _scrollConfig,
+                            _modifications,
                             tickTS,
-                            inputQueueDelayMs);
+                            inputQueueDelayMs,
+                            scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
+                            scrollAnalysisResult.velocityInUnitsPerSecond);
 
     } else {
         
@@ -817,6 +1207,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         
 //        ScrollConfig *configCopyForBlock = [_scrollConfig copy];
         ScrollConfig *configCopyForBlock = _scrollConfig;
+        MFScrollModificationResult modificationsForBlock = _modifications;
         
         /// Start animation
         
@@ -873,6 +1264,21 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             /// Debug
             DDLogDebug("Scroll.m: animation init - current speed: (%f, %f)", currentSpeed.x, currentSpeed.y);
             
+            /// Bound carry-over by time, not by an arbitrary pixel count. At normal speed the generous 200ms
+            /// horizon is effectively inactive. As input reaches the rate ceiling it contracts to 85ms, preventing
+            /// overload from becoming a long queue that continues drifting after the ring stops.
+            double stableFastness = stableOverloadControlEnabled
+                ? CLIP((stableOutputSpeedRatio - 0.5) / 0.5, 0.0, 1.0)
+                : 0.0;
+            double slowToFastCarryRatio = 0.200 / 0.070;
+            double stableCarryLimitPx = _scrollConfig.stableMaximumCarryDistance
+                * (slowToFastCarryRatio + stableFastness * (1.0 - slowToFastCarryRatio));
+            double stableDroppedCarryPx = 0;
+            if (stableOverloadControlEnabled && pxLeftToScroll > stableCarryLimitPx) {
+                stableDroppedCarryPx = pxLeftToScroll - stableCarryLimitPx;
+                pxLeftToScroll = stableCarryLimitPx;
+            }
+
             /// Calculate distance to scroll
             double delta = pxToScrollForThisTick + pxLeftToScroll;
             
@@ -882,6 +1288,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             /// Get baseDuration
             
             double baseDuration;
+            double effectiveSmoothnessAmount = _scrollConfig.u_smoothnessAmount;
             
             if (pCurve.baseMsPerStep != -1) {
                 
@@ -970,6 +1377,32 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 /// Debug
                 DDLogDebug("Scroll.m: animation init - baseMsPerStepCurve - calculating animation baseDuration - baseTimeEnd: %.1f, baseBaseTimeStart: %.1f, tick: %.1f, tickEnd: %.1f, tickStart: %1.f, consecutiveScrollTickIntervalMax: %.1f, result: %.1f", baseTimeEnd, baseTimeStart, tick*1000, tickEnd*1000, tickStart*1000, _scrollConfig.consecutiveScrollTickIntervalMax*1000, baseDuration*1000);
             }
+
+            /// Very slow TB800 movement produces sparse change reports, so the fixed slider value can expose each
+            /// report as a separate short burst. Blend extra time in only at the bottom of the speed range. The
+            /// animation parameters above already contain the slider's fixed duration factor, so apply only the
+            /// ratio between the adaptive factor and that fixed factor here.
+            if (stableOverloadControlEnabled) {
+                double selectedSmoothness = _scrollConfig.u_smoothnessAmount;
+                double slowSmoothness = MAX(selectedSmoothness, _scrollConfig.u_slowSmoothnessAmount);
+                double transitionUnit = CLIP(stableOutputSpeedRatio
+                    / _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio, 0.0, 1.0);
+                double smoothTransition = transitionUnit * transitionUnit * (3.0 - 2.0 * transitionUnit);
+                double speedAdaptiveSmoothness = slowSmoothness
+                    + smoothTransition * (selectedSmoothness - slowSmoothness);
+                effectiveSmoothnessAmount = selectedSmoothness
+                    + stableAdaptiveSlowSmoothingBlendForTick
+                    * (speedAdaptiveSmoothness - selectedSmoothness);
+
+                double selectedDurationFactor = 0.4 + selectedSmoothness * 1.2;
+                double effectiveDurationFactor = 0.4 + effectiveSmoothnessAmount * 1.2;
+                baseDuration *= effectiveDurationFactor / selectedDurationFactor;
+            }
+            if (stableFastTailReport) {
+                double durationScale = _scrollConfig.stableFastTailDurationScale
+                    + stableFastTailContinuity * (1.0 - _scrollConfig.stableFastTailDurationScale);
+                baseDuration *= durationScale;
+            }
             
             /// Get curve and duration
             
@@ -1012,11 +1445,19 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 }
                 
                 /// Create hybrid curve
+                /// Increase release friction only near the overload ceiling. This leaves reading-speed Glide
+                /// untouched while preventing a hard spin from inheriting the same long exponential tail.
+                double effectiveDragCoefficient = pCurve.dragCoefficient;
+                if (stableOverloadControlEnabled && pCurve.dragCoefficient < _scrollConfig.stableFastDragCoefficient) {
+                    effectiveDragCoefficient += stableFastness
+                        * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
+                }
+
                 HybridCurve *hc = [[BezierHybridCurve alloc]
                      initWithBaseCurve:baseCurve
                      minDuration:baseDuration
                      distance:delta
-                     dragCoefficient:pCurve.dragCoefficient
+                     dragCoefficient:effectiveDragCoefficient
                      dragExponent:pCurve.dragExponent
                      stopSpeed:pCurve.stopSpeed
                      distanceEpsilon:0.2];
@@ -1039,6 +1480,33 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             p[@"duration"] = @(duration);
             p[@"vector"] = nsValueFromVector(vectorFromDeltaAndDirection(delta, scrollDirection));
             p[@"curve"] = c;
+
+            /// Stable-engine tuning trace. One line per physical report is low-volume on the TB800 and exposes
+            /// whether perceived drift comes from retained distance, the base curve, or the drag tail.
+            double effectiveDragCoefficientForLog = pCurve.dragCoefficient;
+            if (stableOverloadControlEnabled && pCurve.dragCoefficient < _scrollConfig.stableFastDragCoefficient) {
+                effectiveDragCoefficientForLog += stableFastness
+                    * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
+            }
+            DDLogDebug("MFSCROLL_LEGACY: rawV=%.1f filteredV=%.1f rawPx=%.1f tickPx=%lld rateCapPx=%.1f limited=%d retainedPx=%.1f carryCapPx=%.1f droppedPx=%.1f totalPx=%.1f currentV=%.1f smoothness=%.2f adaptiveBlend=%.2f baseMs=%.1f durationMs=%.1f glideCoeff=%.2f cadenceMs=%.2f direction=%ld",
+                       scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
+                       scrollAnalysisResult.velocityInUnitsPerSecond,
+                       pxForThisTickBeforeRateLimit,
+                       pxToScrollForThisTick,
+                       stableRateLimitPx,
+                       stableRateLimited,
+                       pxLeftToScroll,
+                       stableCarryLimitPx,
+                       stableDroppedCarryPx,
+                       delta,
+                       magnitudeOfVector(currentSpeed),
+                       effectiveSmoothnessAmount,
+                       stableAdaptiveSlowSmoothingBlendForTick,
+                       baseDuration * 1000.0,
+                       duration * 1000.0,
+                       effectiveDragCoefficientForLog,
+                       scrollAnalysisResult.timeBetweenTicks == DBL_MAX ? 0.0 : scrollAnalysisResult.timeBetweenTicks * 1000.0,
+                       (long)scrollDirection);
             
             /// Debug
             DDLogDebug("Scroll.m: animation init - Returning value: %@", p);
@@ -1092,7 +1560,8 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                            MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0),
                            inputQueueDelayMs);
             }
-            sendScroll(distanceDelta, scrollDirection, YES, animationPhase, momentumHint, config);
+            legacyRecordOutput((int64_t)distanceDelta, scrollDirection);
+            sendScroll(distanceDelta, scrollDirection, YES, animationPhase, momentumHint, config, modificationsForBlock);
             
         }];
     }
@@ -1102,7 +1571,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
 
 #pragma mark - Send Scroll events
 
-static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config) {
+static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications) {
     
     /// Get x and y deltas
     
@@ -1137,15 +1606,15 @@ static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, M
         }
     }
     
-    if (_modifications.effectMod == kMFScrollEffectModificationZoom) {
+    if (modifications.effectMod == kMFScrollEffectModificationZoom) {
         outputType = kMFScrollOutputTypeZoom;
-    } else if (_modifications.effectMod == kMFScrollEffectModificationRotate) {
+    } else if (modifications.effectMod == kMFScrollEffectModificationRotate) {
         outputType = kMFScrollOutputTypeRotation;
-    } else if (_modifications.effectMod == kMFScrollEffectModificationFourFingerPinch) {
+    } else if (modifications.effectMod == kMFScrollEffectModificationFourFingerPinch) {
         outputType = kMFScrollOutputTypeFourFingerPinch;
-    } else if (_modifications.effectMod == kMFScrollEffectModificationCommandTab) {
+    } else if (modifications.effectMod == kMFScrollEffectModificationCommandTab) {
         outputType = kMFScrollOutputTypeCommandTab;
-    } else if (_modifications.effectMod == kMFScrollEffectModificationThreeFingerSwipeHorizontal) {
+    } else if (modifications.effectMod == kMFScrollEffectModificationThreeFingerSwipeHorizontal) {
         outputType = kMFScrollOutputTypeThreeFingerSwipeHorizontal;
     } /// kMFScrollEffectModificationHorizontalScroll is handled above when determining scroll direction
     
@@ -1166,6 +1635,19 @@ typedef enum {
     kMFScrollOutputTypeRotation,
     kMFScrollOutputTypeCommandTab,
 } MFScrollOutputType;
+
+/// Post a zero-delta momentum boundary for an animated continuous scroll.
+/// Normal ring movement remains an ordinary continuous pixel-wheel stream. Only a promoted hard spin is marked as
+/// momentum, so scroll views can finish rubber-band overscroll promptly without treating every wheel stream as a
+/// synthetic trackpad-finger gesture.
+static void postContinuousScrollPhase(IOHIDEventPhaseBits scrollPhase, CGMomentumScrollPhase momentumPhase) {
+    CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitPixel, 2, 0, 0);
+    CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scrollPhase);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, momentumPhase);
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
 
 /// Output
 
@@ -1205,12 +1687,12 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
             if (eventPhase != kIOHIDEventPhaseEnded) {
                 
                 /// Post event
-                [GestureScrollSimulator postGestureScrollEventWithDeltaX:dx deltaY:dy phase:eventPhase autoMomentumScroll:YES invertedFromDevice:_scrollConfig.invertedFromDevice];
+                [GestureScrollSimulator postGestureScrollEventWithDeltaX:dx deltaY:dy phase:eventPhase autoMomentumScroll:YES invertedFromDevice:config.invertedFromDevice];
                 
             } else {
                 
                 /// Post end event
-                [GestureScrollSimulator postGestureScrollEventWithDeltaX:0.0 deltaY:0.0 phase:kIOHIDEventPhaseEnded autoMomentumScroll:YES invertedFromDevice:_scrollConfig.invertedFromDevice];
+                [GestureScrollSimulator postGestureScrollEventWithDeltaX:0.0 deltaY:0.0 phase:kIOHIDEventPhaseEnded autoMomentumScroll:YES invertedFromDevice:config.invertedFromDevice];
                 
                 /// Debug
                 DDLogDebug("Scroll.m: THAT CALL where displayLinkkk is stopped from Scroll.m");
@@ -1237,7 +1719,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
                 if (lastMomentumHint == kMFMomentumHintMomentum) {
                     
                     /// Send momentum end event
-                    [GestureScrollSimulator postMomentumScrollDirectlyWithDeltaX:0 deltaY:0 momentumPhase:kCGMomentumScrollPhaseEnd invertedFromDevice:_scrollConfig.invertedFromDevice];
+                    [GestureScrollSimulator postMomentumScrollDirectlyWithDeltaX:0 deltaY:0 momentumPhase:kCGMomentumScrollPhaseEnd invertedFromDevice:config.invertedFromDevice];
                     
                     /// Set eventPhase to start
                     eventPhase = kIOHIDEventPhaseBegan;
@@ -1247,7 +1729,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
                 }
                 
                 /// Send normal gesture scroll
-                [GestureScrollSimulator postGestureScrollEventWithDeltaX:dx deltaY:dy phase:eventPhase autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
+                [GestureScrollSimulator postGestureScrollEventWithDeltaX:dx deltaY:dy phase:eventPhase autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
                 
                 /// Simulate tap to prevent momentum scrolling
                 ///     - Send kIOHIDEventPhaseMayBegin and kIOHIDEventPhaseCancelled events to prevent momentum scrolling from starting in apps like Xcode
@@ -1257,8 +1739,8 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
                 if (animatorPhase == kMFAnimationCallbackPhaseCanceled) {
                     assert(eventPhase == kIOHIDEventPhaseEnded);
                     
-                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseMayBegin autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
-                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseCancelled autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
+                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseMayBegin autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
+                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseCancelled autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
                 }
                 
                 /// Debug
@@ -1272,7 +1754,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
                     /// Momentum begins
                     
                     /// Send gesture end event
-                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseEnded autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
+                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseEnded autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
                     
                     /// Get momentum phase
                     momentumPhase = kCGMomentumScrollPhaseBegin;
@@ -1297,14 +1779,14 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
                 }
                 
                 /// Send momentum event
-                [GestureScrollSimulator postMomentumScrollDirectlyWithDeltaX:dx deltaY:dy momentumPhase:momentumPhase invertedFromDevice:_scrollConfig.invertedFromDevice];
+                [GestureScrollSimulator postMomentumScrollDirectlyWithDeltaX:dx deltaY:dy momentumPhase:momentumPhase invertedFromDevice:config.invertedFromDevice];
                 
                 /// Simulate tap to prevent momentum scrolling
                 ///     [Jul 2025] Simulating the tap shouldn't usually be necessary for kMFAnimationCallbackPhaseEnd, since in that case the scrolling should naturally have slowed down to the point where there is no further automatic momentum scrolling. But Always doing it should make things more robust.
                 ///     [Jul 2025] Doing this for kMFAnimationCallbackPhaseCanceled is necessary to get reliable scroll canceling in DownPay iPad app..
                 if (animatorPhase == kMFAnimationCallbackPhaseEnd || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
-                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseMayBegin autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
-                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseCancelled autoMomentumScroll:NO invertedFromDevice:_scrollConfig.invertedFromDevice];
+                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseMayBegin autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
+                    [GestureScrollSimulator postGestureScrollEventWithDeltaX:0 deltaY:0 phase:kIOHIDEventPhaseCancelled autoMomentumScroll:NO invertedFromDevice:config.invertedFromDevice];
                 }
                 
                 /// Debug
@@ -1322,16 +1804,85 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
     } else if (outputType == kMFScrollOutputTypeContinuousScroll) {
         
         /// --- ContinuousScroll ---
+
+        /// Keep the base part of the curve as ordinary continuous wheel movement and mark only the drag part as
+        /// momentum. Continuous wheel events are intentionally not trackpad gestures: opening a ScrollPhase session
+        /// here can leave Chromium waiting after a click, even while it receives non-zero deltas at display cadence.
+        /// The browser then appears to wake up only when the stream changes to MomentumPhase several hundred
+        /// milliseconds later. The original stable continuous-scroll path also left ScrollPhase undefined.
+        ///
+        /// A free-spinning ring keeps producing physical reports after the user's finger leaves it. Since the TB800
+        /// has no touch sensor, new reports repeatedly restart the animator's base curve and would otherwise keep a
+        /// hard spin in the direct phase until the ring nearly stops. After a short direct window, promote sustained
+        /// high-speed output to momentum and latch it for the rest of the animation session. No distance is removed;
+        /// only macOS's edge-resistance mode changes. Slow movement remains direct for precise control.
+        static MFMomentumHint lastContinuousMomentumHint = kMFMomentumHintNone;
+        static BOOL continuousMomentumLatched = NO;
+        static CFTimeInterval continuousGestureStartTime = 0;
+        static CFTimeInterval continuousLastOutputTime = 0;
+
+        CFTimeInterval continuousOutputTime = CACurrentMediaTime();
+        if (lastContinuousMomentumHint == kMFMomentumHintNone
+            || animatorPhase == kMFAnimationCallbackPhaseStart) {
+            continuousGestureStartTime = continuousOutputTime;
+            continuousLastOutputTime = continuousOutputTime;
+            continuousMomentumLatched = NO;
+        }
+
+        double continuousOutputInterval = continuousOutputTime - continuousLastOutputTime;
+        double continuousOutputSpeed = continuousOutputInterval > 0.0
+            ? hypot((double)dx, (double)dy) / continuousOutputInterval
+            : 0.0;
+        continuousLastOutputTime = continuousOutputTime;
+
+        BOOL shouldPromoteFastRing = momentumHint != kMFMomentumHintNone
+            && continuousOutputTime - continuousGestureStartTime >= config.stableDirectGestureMaxDuration
+            && continuousOutputSpeed >= config.stableMomentumPromotionSpeed;
+        if (momentumHint == kMFMomentumHintMomentum || shouldPromoteFastRing) {
+            if (!continuousMomentumLatched && shouldPromoteFastRing) {
+                DDLogDebug("MFSCROLL_PHASE: promote-fast-ring outputV=%.1f threshold=%.1f directMs=%.1f",
+                           continuousOutputSpeed,
+                           config.stableMomentumPromotionSpeed,
+                           (continuousOutputTime - continuousGestureStartTime) * 1000.0);
+            }
+            continuousMomentumLatched = YES;
+        }
+
+        MFMomentumHint effectiveMomentumHint = continuousMomentumLatched
+            ? kMFMomentumHintMomentum
+            : momentumHint;
+        CGMomentumScrollPhase continuousMomentumPhase = kCGMomentumScrollPhaseNone;
+        eventPhase = kIOHIDEventPhaseUndefined;
+
+        if (effectiveMomentumHint == kMFMomentumHintMomentum) {
+            if (lastContinuousMomentumHint == kMFMomentumHintGesture) {
+                continuousMomentumPhase = kCGMomentumScrollPhaseBegin;
+                DDLogDebug("MFSCROLL_PHASE: wheel=direct momentum=begin");
+            } else if (animatorPhase == kMFAnimationCallbackPhaseEnd
+                       || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
+                continuousMomentumPhase = kCGMomentumScrollPhaseEnd;
+            } else if (lastContinuousMomentumHint == kMFMomentumHintMomentum) {
+                continuousMomentumPhase = kCGMomentumScrollPhaseContinue;
+            } else {
+                continuousMomentumPhase = kCGMomentumScrollPhaseBegin;
+            }
+        } else if (effectiveMomentumHint == kMFMomentumHintGesture) {
+            if (lastContinuousMomentumHint == kMFMomentumHintMomentum) {
+                postContinuousScrollPhase(kIOHIDEventPhaseUndefined, kCGMomentumScrollPhaseEnd);
+                DDLogDebug("MFSCROLL_PHASE: momentum=end wheel=direct");
+            }
+        }
         
         /// Create base event
         
         /// Use the public scroll-event constructor instead of mutating a null event into type 22.
         /// Do not override its location: HID-posted events can move the cursor to the supplied point.
-        /// Always post the animator phase, including zero-delta Ended events. Dropping the end event
-        /// leaves some scroll views latched until unrelated pointer or click input resets their state.
+        /// Do not attach ScrollPhase to this wheel-style output. GestureScrollSimulator is the separate output path
+        /// for events which intentionally emulate a trackpad gesture and provides the matching gesture event stream.
         CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitPixel, 2, 0, 0);
         CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
         CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, eventPhase);
+        CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, continuousMomentumPhase);
         
         /// Setup subpixelator
         
@@ -1382,8 +1933,19 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         /// Our own HID tap immediately passes continuous events through, so this does not recurse into
         /// the scroll engine. Session-tap injection can bypass routing/gesture state that some apps use,
         /// which matches the captured failure: events were posted, but the target view stayed stuck.
-        CGEventPost(kCGHIDEventTap, event);
+        if (dx != 0 || dy != 0 || continuousMomentumPhase != kCGMomentumScrollPhaseNone) {
+            CGEventPost(kCGHIDEventTap, event);
+        }
         CFRelease(event);
+
+        lastContinuousMomentumHint = effectiveMomentumHint;
+        if (animatorPhase == kMFAnimationCallbackPhaseEnd
+            || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
+            lastContinuousMomentumHint = kMFMomentumHintNone;
+            continuousMomentumLatched = NO;
+            continuousGestureStartTime = 0;
+            continuousLastOutputTime = 0;
+        }
         
     } else if (outputType == kMFScrollOutputTypeLineScroll) {
         
@@ -1512,7 +2074,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
             assert(false);
         }
         
-        [TouchSimulator postDockSwipeEventWithDelta:eventDelta type:type phase:eventPhase invertedFromDevice:_scrollConfig.invertedFromDevice];
+        [TouchSimulator postDockSwipeEventWithDelta:eventDelta type:type phase:eventPhase invertedFromDevice:config.invertedFromDevice];
         
     } else if (outputType == kMFScrollOutputTypeCommandTab) {
         

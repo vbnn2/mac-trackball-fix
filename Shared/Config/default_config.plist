@@ -29,6 +29,12 @@
 			<real>1.0</real>
 			<key>smoothness</key>
 			<real>0.5</real>
+			<key>slowSmoothness</key>
+			<real>0.90</real>
+			<key>adaptiveSmoothnessEndSpeedRatio</key>
+			<real>0.125</real>
+			<key>maxSpeed</key>
+			<real>0.5</real>
 			<key>fastScroll</key>
 			<real>0.0</real>
 			<key>glide</key>
@@ -37,7 +43,7 @@
 		<key>trackpadSimulation</key>
 		<true/>
 		<key>targetedScrollEngine</key>
-		<true/>
+		<false/>
 		<key>precise</key>
 		<false/>
 		<key>smooth</key>

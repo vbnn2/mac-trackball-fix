@@ -12202,6 +12202,39 @@
         }
       }
     },
+    "scroll.tuning.acceleration.hint" : {
+      "comment" : "Tooltip for the scroll acceleration slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How strongly output speed grows as you move the scroll ring faster."
+          }
+        }
+      }
+    },
+    "scroll.tuning.adaptive-until" : {
+      "comment" : "Speed where adaptive slow smoothing has fully returned to normal smoothing.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive Until"
+          }
+        }
+      }
+    },
+    "scroll.tuning.adaptive-until.hint" : {
+      "comment" : "Tooltip for the adaptive slow-smoothing speed threshold slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Extra slow smoothing fades out by this percentage of Maximum Speed. Once a gesture becomes fast, it stays off until the next gesture."
+          }
+        }
+      }
+    },
     "scroll.tuning.fast-scroll" : {
       "comment" : "",
       "localizations" : {
@@ -12224,6 +12257,39 @@
         }
       }
     },
+    "scroll.tuning.glide.hint" : {
+      "comment" : "Tooltip for the scroll glide slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How long scrolling continues after you stop moving the ring."
+          }
+        }
+      }
+    },
+    "scroll.tuning.maximum-speed" : {
+      "comment" : "Maximum sustained scroll output speed.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Speed"
+          }
+        }
+      }
+    },
+    "scroll.tuning.maximum-speed.hint" : {
+      "comment" : "Tooltip for the maximum sustained scroll speed slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps sustained scroll output without changing slow-scroll sensitivity."
+          }
+        }
+      }
+    },
     "scroll.tuning.sensitivity" : {
       "comment" : "",
       "localizations" : {
@@ -12235,6 +12301,17 @@
         }
       }
     },
+    "scroll.tuning.sensitivity.hint" : {
+      "comment" : "Tooltip for the scroll sensitivity slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scroll distance around normal ring speed."
+          }
+        }
+      }
+    },
     "scroll.tuning.smoothness" : {
       "comment" : "",
       "localizations" : {
@@ -12242,6 +12319,39 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Smoothness"
+          }
+        }
+      }
+    },
+    "scroll.tuning.smoothness.hint" : {
+      "comment" : "Tooltip for the scroll smoothness slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Normal and fast report blending. The displayed multiplier controls animation time: larger is smoother but less immediate."
+          }
+        }
+      }
+    },
+    "scroll.tuning.slow-smoothness" : {
+      "comment" : "Maximum smoothing used for very slow scroll-ring movement.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Slow Smoothness"
+          }
+        }
+      }
+    },
+    "scroll.tuning.slow-smoothness.hint" : {
+      "comment" : "Tooltip for the very-slow movement smoothness slider.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Report blending at the very lowest movement speed. The displayed multiplier controls animation time."
           }
         }
       }

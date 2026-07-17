@@ -358,6 +358,16 @@ static NSDictionary *sideButtonActions;
 //        [up checkForUpdatesInBackground];
 //    }
 
+#pragma mark Development launch
+
+    /// `./dev.sh run` launches the complete app with this argument. Re-registering through the
+    /// main app is important: SMAppService then owns the embedded Helper's normal lifecycle, the
+    /// enable switch remains usable, and the Helper does not need to be run from a terminal.
+    if ([NSProcessInfo.processInfo.arguments containsObject:@"--dev-restart-helper"]) {
+        DDLogInfo("Development launch: registering and restarting the embedded Helper");
+        [HelperServices restartHelperWithDelay:0.0];
+    }
+
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     DDLogInfo("Mac Mouse Fix should terminate");
