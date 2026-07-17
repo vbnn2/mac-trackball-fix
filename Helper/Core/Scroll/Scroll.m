@@ -899,9 +899,12 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     double stableOutputSpeedRatio = 0;
     BOOL stableRateLimited = NO;
     BOOL stableOverloadControlEnabled = NO;
-    /// A fast gesture's first sparse tail report must remain brief, but intentional continued slow movement must
-    /// regain adaptive smoothing. Track whether one tail report has already been handled; a second slow report is
-    /// evidence of continuation and returns to the normal speed-derived curve.
+    /// A new gesture's first report has no cadence measurement. Do not classify that unknown report as "very slow"
+    /// and apply the maximum adaptive duration: doing so delays every scroll start by hundreds of milliseconds.
+    /// Once a second report supplies a real interval, the speed-derived slow smoothing takes over normally.
+    /// A fast gesture's first sparse tail report must also remain brief, but intentional continued slow movement
+    /// must regain adaptive smoothing. Track whether one tail report has already been handled; a second slow report
+    /// is evidence of continuation and returns to the normal speed-derived curve.
     double stableAdaptiveSlowSmoothingBlendForTick = 1.0;
     static BOOL stableGestureReachedFastSpeed = NO;
     static BOOL stableFastTailReportHandled = NO;
@@ -983,6 +986,11 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         pxForThisTickBeforeRateLimit = pxForThisTickDouble;
         stableOverloadControlEnabled = !_scrollConfig.useTargetedScrollEngine
             && _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
+
+        if (stableOverloadControlEnabled && !hasMeasuredTickInterval) {
+            stableAdaptiveSlowSmoothingBlendForTick = 0.0;
+            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=unknown action=use-normal-smoothness");
+        }
 
         double modeledOutputSpeed = _scrollConfig.pxAtRefSpeed
             * _scrollConfig.refSpeed
