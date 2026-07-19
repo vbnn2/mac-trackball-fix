@@ -13,14 +13,14 @@ is an independent fork and does not use the upstream update channel.
 
 - Reworked the scroll engine around the magnitude of the device's line deltas, rather than treating
   every event as a single mouse-wheel detent.
-- Added an experimental display-synchronized target follower for scroll-engine research. Hardware testing found
-  uneven output with sparse ring reports, so it is disabled by default while input pacing is redesigned.
 - Kept velocity measurement based on actual scroll-event timestamps down to 1 ms. The device's USB polling rate is
   not treated as its scroll-event rate.
 - Added report-rate-independent overload limiting, bounded motion carry, and fast-stop rebound filtering to the
   default Regular scroll path. This keeps high-speed scrolling responsive without rebuilding a long drift queue.
 - Added trackball-tuned **Sensitivity**, **Acceleration**, **Maximum Speed**, **Smoothness**, **Slow Smoothness**,
   **Adaptive Until**, and **Glide** controls. Smoothness readouts show their real animation-duration multiplier.
+  A dedicated wide tuning window shows a description for every control. Values update while dragging, accept precise
+  numeric input, and support persistent per-control ranges beyond the default `0...1` scale, with range reset actions.
   The upstream Fast Scroll burst multiplier remains readable for old configs but is hidden and disabled by default
   because it reacts unpredictably to free-spinning ring report grouping.
 - Increased the slow-scroll continuity window for sparse free-spinning ring input.
@@ -96,8 +96,6 @@ Useful commands:
 |---|---|
 | `./dev.sh build` | Build the `App` scheme, including the embedded helper |
 | `./dev.sh run` | Build, launch the GUI, and restart the launchd-managed embedded Helper |
-| `./dev.sh run-target` | Launch the failed/diagnostic reservoir experiment; not for normal use |
-| `./dev.sh run-stable` | Restore Regular smoothness and the legacy scroll engine |
 | `./dev.sh run-helper` | Run only the embedded Helper in the foreground for low-level debugging |
 | `./dev.sh app` | Build and launch only the GUI |
 | `./dev.sh install` | Copy the built app to `/Applications` and launch it |

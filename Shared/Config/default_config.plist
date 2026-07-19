@@ -42,12 +42,8 @@
 		</dict>
 		<key>trackpadSimulation</key>
 		<true/>
-		<key>targetedScrollEngine</key>
-		<false/>
-		<key>precise</key>
-		<false/>
 		<key>smooth</key>
-		<string>high</string>
+		<string>regular</string>
 		<key>speed</key>
 		<string>medium</string>
 	</dict>

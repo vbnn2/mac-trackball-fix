@@ -1125,7 +1125,7 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                             </textField>
                                             <popUpButton horizontalHuggingPriority="1000" verticalHuggingPriority="750" horizontalCompressionResistancePriority="1000" verticalCompressionResistancePriority="1000" translatesAutoresizingMaskIntoConstraints="NO" id="saP-aP-bnv">
                                                 <rect key="frame" x="87" y="0.0" width="94" height="24"/>
-                                                <popUpButtonCell key="cell" type="push" title="High" bezelStyle="rounded" alignment="left" lineBreakMode="truncatingTail" state="on" borderStyle="borderAndBezel" imageScaling="proportionallyDown" inset="2" selectedItem="97W-3h-SSc" id="LBG-Mq-hAQ">
+                                                <popUpButtonCell key="cell" type="push" title="Regular" bezelStyle="rounded" alignment="left" lineBreakMode="truncatingTail" state="on" borderStyle="borderAndBezel" imageScaling="proportionallyDown" inset="2" selectedItem="17P-PJ-tV1" id="LBG-Mq-hAQ">
                                                     <behavior key="behavior" lightByBackground="YES" lightByGray="YES"/>
                                                     <font key="font" metaFont="message"/>
                                                     <menu key="menu" id="Mvm-5t-dK8">
@@ -1140,12 +1140,12 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                                                     <fragment content="Scrolling &gt; Smoothness &gt; Low Option"/>
                                                                 </attributedString>
                                                             </menuItem>
-                                                            <menuItem title="Regular" identifier="regular" id="17P-PJ-tV1">
+                                                            <menuItem title="Regular" state="on" identifier="regular" id="17P-PJ-tV1">
                                                                 <attributedString key="userComments">
                                                                     <fragment content="Scrolling &gt; Smoothness &gt; Regular Option"/>
                                                                 </attributedString>
                                                             </menuItem>
-                                                            <menuItem title="High" state="on" identifier="high" id="97W-3h-SSc">
+                                                            <menuItem title="High" identifier="high" id="97W-3h-SSc">
                                                                 <attributedString key="userComments">
                                                                     <fragment content="Scrolling &gt; Smoothness &gt; High Option"/>
                                                                 </attributedString>
@@ -1234,20 +1234,6 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                             </attributedString>
                                         </buttonCell>
                                     </button>
-                                    <customView verticalHuggingPriority="999" translatesAutoresizingMaskIntoConstraints="NO" id="PDb-87-6bc" userLabel="Divider">
-                                        <rect key="frame" x="0.0" y="289" width="350" height="18"/>
-                                        <subviews>
-                                            <box horizontalHuggingPriority="1000" verticalHuggingPriority="750" boxType="separator" translatesAutoresizingMaskIntoConstraints="NO" id="dvw-oy-SUP">
-                                                <rect key="frame" x="0.0" y="6" width="350" height="6"/>
-                                            </box>
-                                        </subviews>
-                                        <constraints>
-                                            <constraint firstAttribute="trailing" secondItem="dvw-oy-SUP" secondAttribute="trailing" id="ClC-Gx-Lc5"/>
-                                            <constraint firstAttribute="bottom" secondItem="dvw-oy-SUP" secondAttribute="bottom" constant="8" id="KqQ-fE-IpL"/>
-                                            <constraint firstItem="dvw-oy-SUP" firstAttribute="leading" secondItem="PDb-87-6bc" secondAttribute="leading" id="S5u-RA-TzQ"/>
-                                            <constraint firstItem="dvw-oy-SUP" firstAttribute="top" secondItem="PDb-87-6bc" secondAttribute="top" constant="8" id="WIT-yM-IZV"/>
-                                        </constraints>
-                                    </customView>
                                     <stackView distribution="fill" orientation="horizontal" alignment="centerY" horizontalStackHuggingPriority="1000" verticalStackHuggingPriority="750" horizontalHuggingPriority="1000" detachesHiddenViews="YES" translatesAutoresizingMaskIntoConstraints="NO" id="Ajf-ff-OPq">
                                         <rect key="frame" x="0.0" y="257" width="147" height="24"/>
                                         <subviews>
@@ -1301,56 +1287,6 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                             <integer value="1000"/>
                                         </visibilityPriorities>
                                         <customSpacing>
-                                            <real value="3.4028234663852886e+38"/>
-                                            <real value="3.4028234663852886e+38"/>
-                                        </customSpacing>
-                                    </stackView>
-                                    <stackView distribution="fill" orientation="vertical" alignment="leading" horizontalStackHuggingPriority="249.99998474121094" verticalStackHuggingPriority="249.99998474121094" detachesHiddenViews="YES" translatesAutoresizingMaskIntoConstraints="NO" id="WGO-Zc-NYH" userLabel="Precise Section">
-                                        <rect key="frame" x="0.0" y="203" width="350" height="46"/>
-                                        <subviews>
-                                            <customView verticalHuggingPriority="1000" translatesAutoresizingMaskIntoConstraints="NO" id="8JP-6I-CYk" userLabel="Spacer">
-                                                <rect key="frame" x="0.0" y="46" width="99" height="0.0"/>
-                                                <constraints>
-                                                    <constraint firstAttribute="height" id="gGV-lw-xrR"/>
-                                                </constraints>
-                                            </customView>
-                                            <button verticalHuggingPriority="750" translatesAutoresizingMaskIntoConstraints="NO" id="5rO-m9-I0Q">
-                                                <rect key="frame" x="0.0" y="22" width="78" height="16"/>
-                                                <buttonCell key="cell" type="check" title="Precision" bezelStyle="regularSquare" imagePosition="left" state="on" inset="2" id="4hf-tQ-y76">
-                                                    <behavior key="behavior" changeContents="YES" doesNotDimImage="YES" lightByContents="YES"/>
-                                                    <font key="font" metaFont="system"/>
-                                                    <attributedString key="userComments">
-                                                        <fragment content="Scrolling &gt; Precise Scrolling Toggle"/>
-                                                    </attributedString>
-                                                </buttonCell>
-                                            </button>
-                                            <customView horizontalHuggingPriority="999" verticalHuggingPriority="999" translatesAutoresizingMaskIntoConstraints="NO" id="WnW-0I-ajJ" userLabel="Indent">
-                                                <rect key="frame" x="0.0" y="0.0" width="293" height="14"/>
-                                                <subviews>
-                                                    <textField focusRingType="none" horizontalHuggingPriority="251" verticalHuggingPriority="750" horizontalCompressionResistancePriority="1000" verticalCompressionResistancePriority="1000" translatesAutoresizingMaskIntoConstraints="NO" id="Yn5-ch-Oxi" customClass="MarkdownTextField" customModule="Mac_Mouse_Fix" customModuleProvider="target">
-                                                        <rect key="frame" x="18" y="0.0" width="277" height="14"/>
-                                                        <textFieldCell key="cell" controlSize="small" alignment="left" title="&lt;Scroll precisely by moving the scroll wheel slowly&gt;" id="1nK-vb-jNz">
-                                                            <font key="font" metaFont="smallSystem"/>
-                                                            <color key="textColor" name="secondaryLabelColor" catalog="System" colorSpace="catalog"/>
-                                                            <color key="backgroundColor" name="textBackgroundColor" catalog="System" colorSpace="catalog"/>
-                                                        </textFieldCell>
-                                                    </textField>
-                                                </subviews>
-                                                <constraints>
-                                                    <constraint firstItem="Yn5-ch-Oxi" firstAttribute="leading" secondItem="WnW-0I-ajJ" secondAttribute="leading" constant="20" symbolic="YES" id="3lB-Tc-gjb"/>
-                                                    <constraint firstItem="Yn5-ch-Oxi" firstAttribute="top" secondItem="WnW-0I-ajJ" secondAttribute="top" id="73D-fr-uSW"/>
-                                                    <constraint firstAttribute="bottom" secondItem="Yn5-ch-Oxi" secondAttribute="bottom" id="HQg-uu-Dfw"/>
-                                                    <constraint firstAttribute="trailing" secondItem="Yn5-ch-Oxi" secondAttribute="trailing" id="IIo-57-lz0"/>
-                                                </constraints>
-                                            </customView>
-                                        </subviews>
-                                        <visibilityPriorities>
-                                            <integer value="1000"/>
-                                            <integer value="1000"/>
-                                            <integer value="1000"/>
-                                        </visibilityPriorities>
-                                        <customSpacing>
-                                            <real value="3.4028234663852886e+38"/>
                                             <real value="3.4028234663852886e+38"/>
                                             <real value="3.4028234663852886e+38"/>
                                         </customSpacing>
@@ -1639,12 +1575,7 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                         </constraints>
                                     </customView>
                                 </subviews>
-                                <constraints>
-                                    <constraint firstItem="ljz-rp-t9J" firstAttribute="width" relation="greaterThanOrEqual" secondItem="Yn5-ch-Oxi" secondAttribute="width" id="sEf-4q-f8E"/>
-                                </constraints>
                                 <visibilityPriorities>
-                                    <integer value="1000"/>
-                                    <integer value="1000"/>
                                     <integer value="1000"/>
                                     <integer value="1000"/>
                                     <integer value="1000"/>
@@ -1654,8 +1585,6 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                                     <integer value="1000"/>
                                 </visibilityPriorities>
                                 <customSpacing>
-                                    <real value="3.4028234663852886e+38"/>
-                                    <real value="3.4028234663852886e+38"/>
                                     <real value="3.4028234663852886e+38"/>
                                     <real value="3.4028234663852886e+38"/>
                                     <real value="3.4028234663852886e+38"/>
@@ -1680,10 +1609,7 @@ your mouse. (**Logitech M720 Triathlon**)&gt;</string>
                     <connections>
                         <outlet property="horizontalModField" destination="PpE-2r-BrM" id="sxE-uX-0zf"/>
                         <outlet property="masterStack" destination="N4F-RB-d7a" id="l0H-83-1J7"/>
-                        <outlet property="preciseHint" destination="Yn5-ch-Oxi" id="qNm-Cv-Jsf"/>
                         <outlet property="preciseModField" destination="gqo-T2-Nmz" id="Rts-Lf-EyR"/>
-                        <outlet property="preciseSection" destination="WGO-Zc-NYH" id="3ee-ik-5UL"/>
-                        <outlet property="preciseToggle" destination="5rO-m9-I0Q" id="qoO-s1-pXz"/>
                         <outlet property="restoreDefaultModsButton" destination="4ZD-1f-bbe" id="4G3-Tp-sEf"/>
                         <outlet property="reverseDirectionToggle" destination="dtR-AX-YsY" id="P3O-kx-KCg"/>
                         <outlet property="smoothPicker" destination="saP-aP-bnv" id="Zlr-EF-GAN"/>

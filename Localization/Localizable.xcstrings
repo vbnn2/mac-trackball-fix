@@ -9904,89 +9904,6 @@
         }
       }
     },
-    "precise-scrolling-hint" : {
-      "comment" : "The mention of keyboard modifiers is meant to draw attention to the keyboard modifers section of the UI which appears right below. (Search for: 'Scrolling > Keyboard Modifiers')",
-      "localizations" : {
-        "cs" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Přesné posouvání i bez použití modifikační klávesy, *pomalým* pohybem rolovacího kolečka"
-          }
-        },
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Scrolle auch ohne Sondertasten präzise, indem du das\nScrollrad *langsam* bewegst"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Scroll precisely, even without a keyboard modifier, by moving the scroll wheel *slowly*"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Desplázate con precisión, incluso sin un modificador de teclado, moviendo la rueda de desplazamiento&nbsp;*lentamente*"
-          }
-        },
-        "fr" : {
-          "stringUnit" : {
-            "state" : "needs_review",
-            "value" : "Défiler précisement, même sans un raccourci clavier,\nen bougeant la molette de défilement *doucement*"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "needs_review",
-            "value" : "스크롤을 *천천히* 움직이는 경우, 보조 키를 사용하지 않더라도\n정밀하게 스크롤합니다."
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Role com precisão, mesmo sem um modificador de teclado,\nmovendo a roda de rolagem *lentamente*"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Прокручивайте точно, даже без модификатора клавиатуры, *медленно* перемещая колесико прокрутки"
-          }
-        },
-        "tr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Kaydırma tekerleğini *yavaşça* hareket ettirerek, klavye değiştiricisi tuşu olmadan bile hassas bir şekilde&nbsp;kaydırın"
-          }
-        },
-        "vi" : {
-          "stringUnit" : {
-            "state" : "needs_review",
-            "value" : "Cuộn chính xác, dù không kèm theo một phím bổ sung,\nbằng cách di chuyện con lăn *thật chậm*"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "*慢慢*滚动滚轮来精准滚动，甚至无需键盘修饰键"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "needs_review",
-            "value" : "*慢慢*滾動滾輪來精確捲動，甚至無需鍵盤變更鍵"
-          }
-        },
-        "zh-HK" : {
-          "stringUnit" : {
-            "state" : "needs_review",
-            "value" : "*慢慢*滾動滾輪來精確捲動，甚至無需鍵盤變更鍵"
-          }
-        }
-      }
-    },
     "restore-buttons-alert.back" : {
       "comment" : "",
       "localizations" : {
@@ -12191,6 +12108,116 @@
         }
       }
     },
+    "scroll.tuning.exact-value.hint" : {
+      "comment" : "Tooltip for editable numeric scroll-tuning fields.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter an exact value within the slider range."
+          }
+        }
+      }
+    },
+    "scroll.tuning.launcher-hint" : {
+      "comment" : "Description beside the button that opens the dedicated scrolling-tuning window.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open a wider workspace for precise scrolling adjustments and explanations."
+          }
+        }
+      }
+    },
+    "scroll.tuning.maximum" : {
+      "comment" : "Label for a tuning slider's maximum value.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum"
+          }
+        }
+      }
+    },
+    "scroll.tuning.minimum" : {
+      "comment" : "Label for a tuning slider's minimum value.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Minimum"
+          }
+        }
+      }
+    },
+    "scroll.tuning.open" : {
+      "comment" : "Button that opens the dedicated scrolling-tuning window.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Scrolling Feel…"
+          }
+        }
+      }
+    },
+    "scroll.tuning.reset-ranges" : {
+      "comment" : "Button that restores every tuning slider's default minimum and maximum.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset Ranges"
+          }
+        }
+      }
+    },
+    "scroll.tuning.reset-ranges.hint" : {
+      "comment" : "Tooltip for restoring all tuning slider ranges.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restore the default minimum and maximum for every slider."
+          }
+        }
+      }
+    },
+    "scroll.tuning.restore-range" : {
+      "comment" : "Button that restores one tuning slider's default minimum and maximum.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restore Default Range"
+          }
+        }
+      }
+    },
+    "scroll.tuning.section-hint" : {
+      "comment" : "Short instruction above the scroll tuning controls.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Drag for quick changes, enter an exact value, or adjust a slider's range."
+          }
+        }
+      }
+    },
+    "scroll.tuning.section-title" : {
+      "comment" : "Heading above the trackball scroll tuning controls.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scrolling Feel"
+          }
+        }
+      }
+    },
     "scroll.tuning.acceleration" : {
       "comment" : "",
       "localizations" : {
@@ -12230,7 +12257,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Extra slow smoothing fades out by this percentage of Maximum Speed. Once a gesture becomes fast, it stays off until the next gesture."
+            "value" : "Extra slow smoothing fades out by this percentage of Maximum Speed and follows changes during acceleration and deceleration."
           }
         }
       }
@@ -12352,6 +12379,39 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Report blending at the very lowest movement speed. The displayed multiplier controls animation time."
+          }
+        }
+      }
+    },
+    "scroll.tuning.supported-range" : {
+      "comment" : "Description of the engine-supported numeric range for a tuning setting. The placeholders are the minimum and maximum.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Supported range: %@–%@"
+          }
+        }
+      }
+    },
+    "scroll.tuning.value" : {
+      "comment" : "Label for a tuning slider's exact numeric value.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Value"
+          }
+        }
+      }
+    },
+    "scroll.tuning.window-title" : {
+      "comment" : "Title of the dedicated scrolling-tuning window.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scrolling Feel"
           }
         }
       }

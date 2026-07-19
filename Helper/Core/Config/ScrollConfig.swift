@@ -88,7 +88,6 @@ import Cocoa
             
             /// Declare overridables
             var u_speed = new.u_speed
-            var precise = new.u_precise
             var useQuickMod = modifiers.inputMod == kMFScrollInputModificationQuick
             var usePreciseMod = modifiers.inputMod == kMFScrollInputModificationPrecise
             var scaleToDisplay = true
@@ -129,7 +128,6 @@ import Cocoa
                 animationCurveOverride = kMFScrollAnimationCurveNameTouchDriverLinear;
                 
                 /// Adjust speed params
-                precise = false
                 if u_speed == kMFScrollSpeedSystem {
                     u_speed = kMFScrollSpeedMedium
                 }
@@ -148,7 +146,6 @@ import Cocoa
                 animationCurveOverride = kMFScrollAnimationCurveNameTouchDriverLinear;
                 
                 /// Adjust speed params
-                precise = false
                 if u_speed == kMFScrollSpeedSystem {
                     u_speed = kMFScrollSpeedMedium
                 }
@@ -182,7 +179,6 @@ import Cocoa
                 }
                 
                 /// Adjust speed params
-                precise = false
                 scaleToDisplay = false /// Is scaled to windowSize instead
                 
                 /// Make fastScroll easier to trigger
@@ -206,7 +202,6 @@ import Cocoa
                 }
                 
                 /// Adjust speed params
-                precise = false
                 scaleToDisplay = false
                 
                 /// Turn off fast scroll
@@ -222,7 +217,7 @@ import Cocoa
             if u_speed == kMFScrollSpeedSystem && !usePreciseMod && !useQuickMod {
                 new.accelerationCurve = nil
             } else {
-                new.accelerationCurve = getAccelerationCurve(forSpeed: u_speed, precise: precise, smoothness: new.u_smoothness, animationCurve: new.animationCurve, inputAxis: inputAxis, display: display, scaleToDisplay: scaleToDisplay, modifiers: modifiers, useQuickModSpeed: useQuickMod, usePreciseModSpeed: usePreciseMod, consecutiveScrollTickIntervalMax: new.consecutiveScrollTickIntervalMax, consecutiveScrollTickInterval_AccelerationEnd: new.consecutiveScrollTickInterval_AccelerationEnd)
+                new.accelerationCurve = getAccelerationCurve(forSpeed: u_speed, smoothness: new.u_smoothness, animationCurve: new.animationCurve, inputAxis: inputAxis, display: display, scaleToDisplay: scaleToDisplay, modifiers: modifiers, useQuickModSpeed: useQuickMod, usePreciseModSpeed: usePreciseMod, consecutiveScrollTickIntervalMax: new.consecutiveScrollTickIntervalMax, consecutiveScrollTickInterval_AccelerationEnd: new.consecutiveScrollTickInterval_AccelerationEnd)
             }
             
             /// Cache & return
@@ -257,17 +252,6 @@ import Cocoa
     @objc var useAppleAcceleration: Bool {
         return accelerationCurve == nil
     }
-    /// Experimental display-synchronized target follower for the trackpad-style high-smoothness curve.
-    ///
-    /// This is intentionally limited to the plain High + Trackpad Simulation path. Hardware testing showed that
-    /// the position-step controller can drain a sparse ring report before the next report arrives, producing
-    /// event-rate bursts even though output is display-synchronized. Keep it opt-in until input is paced through
-    /// a distance reservoir. Existing configs often don't contain the key, so the fallback must be the safe path.
-    @objc var useTargetedScrollEngine: Bool {
-        let enabled = (c("targetedScrollEngine") as? NSNumber)?.boolValue ?? false
-        return enabled && animationCurve == kMFScrollAnimationCurveNameHighInertiaPlusTrackpadSim
-    }
-    
     // MARK: Invert Direction
     
     @objc lazy var u_invertDirection: MFScrollInversion = {
@@ -279,12 +263,17 @@ import Cocoa
 
     // MARK: Tuning sliders (fork)
 
-    /// Raw 0...1 slider values. Absent -> the documented default, for the same reason as `u_invertZoom` below:
+    /// Raw tuning values. The UI's default ranges remain approachable, but expert users can expand each slider to
+    /// the broader supported range. Absent -> the documented default, for the same reason as `u_invertZoom` below:
     /// `_loadAndRepair` is a configVersion migration, not a key-merger, and the Helper doesn't repair at all.
 
-    private func slider(_ key: String, _ fallback: Double) -> Double {
+    private func tuningValue(_ key: String,
+                             fallback: Double,
+                             supportedMinimum: Double,
+                             supportedMaximum: Double) -> Double {
         let v = (c("tuning.\(key)") as? NSNumber)?.doubleValue ?? fallback
-        return SharedUtilitySwift.clip(v, betweenLow: 0.0, high: 1.0)
+        guard v.isFinite else { return fallback }
+        return SharedUtilitySwift.clip(v, betweenLow: supportedMinimum, high: supportedMaximum)
     }
 
     /// Fallbacks must match `default_config.plist > Scroll.tuning`. They aren't dead code: `_loadAndRepair` is a
@@ -295,32 +284,38 @@ import Cocoa
     /// sensitivity so slow scrolling moves in small steps rather than lurching, with strong but bounded acceleration
     /// to get distance back on a fast spin. Burst-history-based fastScroll stays off by default because it makes
     /// identical physical input behave differently depending on how reports happen to be grouped.
-    @objc lazy var u_sensitivity: Double = { slider("sensitivity", 0.10) }()
-    @objc lazy var u_acceleration: Double = { slider("acceleration", 1.0) }()
-    @objc lazy var u_smoothnessAmount: Double = { slider("smoothness", 0.5) }()
-    @objc lazy var u_slowSmoothnessAmount: Double = { slider("slowSmoothness", 0.90) }()
-    @objc lazy var u_adaptiveSmoothnessEndSpeedRatio: Double = { slider("adaptiveSmoothnessEndSpeedRatio", 0.125) }()
-    @objc lazy var u_maxSpeed: Double = { slider("maxSpeed", 0.5) }()
-    @objc lazy var u_fastScrollAmount: Double = { slider("fastScroll", 0.0) }()
-    @objc lazy var u_glide: Double = { slider("glide", 0.75) }()
+    @objc lazy var u_sensitivity: Double = {
+        tuningValue("sensitivity", fallback: 0.10, supportedMinimum: 0.0, supportedMaximum: 10.0)
+    }()
+    @objc lazy var u_acceleration: Double = {
+        tuningValue("acceleration", fallback: 1.0, supportedMinimum: 0.0, supportedMaximum: 5.0)
+    }()
+    @objc lazy var u_smoothnessAmount: Double = {
+        tuningValue("smoothness", fallback: 0.5, supportedMinimum: 0.0, supportedMaximum: 10.0)
+    }()
+    @objc lazy var u_slowSmoothnessAmount: Double = {
+        tuningValue("slowSmoothness", fallback: 0.90, supportedMinimum: 0.0, supportedMaximum: 10.0)
+    }()
+    @objc lazy var u_adaptiveSmoothnessEndSpeedRatio: Double = {
+        tuningValue("adaptiveSmoothnessEndSpeedRatio", fallback: 0.125,
+                    supportedMinimum: 0.001, supportedMaximum: 10.0)
+    }()
+    @objc lazy var u_maxSpeed: Double = {
+        tuningValue("maxSpeed", fallback: 0.5, supportedMinimum: 0.1, supportedMaximum: 10.0)
+    }()
+    @objc lazy var u_fastScrollAmount: Double = {
+        tuningValue("fastScroll", fallback: 0.0, supportedMinimum: 0.0, supportedMaximum: 1.0)
+    }()
+    @objc lazy var u_glide: Double = {
+        tuningValue("glide", fallback: 0.75, supportedMinimum: 0.0, supportedMaximum: 1.1)
+    }()
 
     /// How long the scroll keeps gliding after your finger leaves the ring.
     ///     The legacy animator hands off from the base curve to a drag curve, which models
     ///     `v'(t) = -a*v(t)^b` (DragCurve.swift). `dragExponent` (b) is 1.0 for the scrolling curves, so that's plain
     ///     exponential decay: `v(t) = v0 * e^(-a*t)`, with a time constant of exactly `1/dragCoefficient` seconds.
-    ///     The targeted engine uses the same slider below to control its release delay and settling response.
     ///     0.5 == 22.5 ~= upstream. Higher = less friction = longer glide (a=5 -> a 200ms time constant).
-    @objc lazy var dragCoefficientForGlide: Double = { 40.0 - (u_glide * 35.0) }() /// 40 (abrupt) ... 5 (floaty)
-
-    /// Targeted-engine response parameters.
-    ///
-    /// A critically damped target follower tracking a constant-speed target trails it by approximately `2 / omega`.
-    /// The original experimental value (`omega = 65`) therefore added about 31ms of steady-state lag on top of the
-    /// velocity estimator and display-frame latency. These ranges keep the output visibly smooth while making the
-    /// default feel much more attached to the ring.
-    @objc lazy var targetedScrollActiveResponse: Double = { 110.0 - (u_smoothnessAmount * 40.0) }() /// 110...70 rad/s
-    @objc lazy var targetedScrollReleaseDelay: TimeInterval = { (35.0 + (u_glide * 35.0)) / 1000.0 }() /// 35...70ms
-    @objc lazy var targetedScrollReleaseResponse: Double = { 44.0 - (u_glide * 24.0) }() /// 44...20 rad/s
+    @objc lazy var dragCoefficientForGlide: Double = { 40.0 - (u_glide * 35.0) }() /// 40 (abrupt) ... 1.5 (floaty)
 
     /// Derived engine parameters
     ///     The model (see Scroll.m):  pxPerUnit(v) = pxAtRefSpeed * (v/refSpeed)^(gamma - 1),  px = pxPerUnit * units
@@ -342,15 +337,16 @@ import Cocoa
     /// natural pivot — it's the middle of the actual usable range rather than an arbitrary constant.
     @objc let refSpeed: Double = 50.0
 
-    @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...150
-    @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...1.2
+    @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...1410
+    @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...4.4
 
     /// Stable-engine overload control.
     ///
     /// A per-report pixel cap is inherently hardware-dependent: the same cap permits twice the output speed when
     /// reports arrive twice as often. Express the ceiling as pixels/second instead.
     ///
-    /// The UI stores 0.1...1.0 and maps that to 3x...30x the reference output speed. The accepted hardware-tested
+    /// The default UI range is 0.1...1.0 and maps that to 3x...30x the reference output speed. Expert custom ranges
+    /// can extend this as far as 10.0. The accepted hardware-tested
     /// baseline is 0.5 == 15x, about 18,000 px/s at the measured default sensitivity. Initial response and retained
     /// distance are capped separately below, so a high sustained maximum does not recreate the old latency queue.
     @objc lazy var stableMaximumOutputSpeed: Double = {
@@ -800,8 +796,6 @@ import Cocoa
         default: fatalError()
         }
     }()
-    @objc lazy var u_precise: Bool = { c("precise") as! Bool }()
-    
     /// Stored property
     ///     This is used by Scroll.m to determine how to accelerate
     
@@ -1180,7 +1174,7 @@ fileprivate func animationCurveParamsMap(name: MFScrollAnimationCurveName) -> MF
 }
 
 /// Define function that maps userSettings -> accelerationCurve
-fileprivate func getAccelerationCurve(forSpeed speedArg: MFScrollSpeed, precise: Bool, smoothness: MFScrollSmoothness, animationCurve: MFScrollAnimationCurveName, inputAxis: MFAxis, display: CGDirectDisplayID, scaleToDisplay: Bool, modifiers: MFScrollModificationResult, useQuickModSpeed: Bool, usePreciseModSpeed: Bool, consecutiveScrollTickIntervalMax: Double, consecutiveScrollTickInterval_AccelerationEnd: Double) -> Curve {
+fileprivate func getAccelerationCurve(forSpeed speedArg: MFScrollSpeed, smoothness: MFScrollSmoothness, animationCurve: MFScrollAnimationCurveName, inputAxis: MFAxis, display: CGDirectDisplayID, scaleToDisplay: Bool, modifiers: MFScrollModificationResult, useQuickModSpeed: Bool, usePreciseModSpeed: Bool, consecutiveScrollTickIntervalMax: Double, consecutiveScrollTickInterval_AccelerationEnd: Double) -> Curve {
     
     /// Notes:
     /// - The inputs to the curve can sometimes be ridiculously high despite smoothing, because our time measurements of when ticks occur are very imprecise
@@ -1259,63 +1253,35 @@ fileprivate func getAccelerationCurve(forSpeed speedArg: MFScrollSpeed, precise:
         
         minSens =   CombinedLinearCurve(yValues: [45.0, 60.0, 90.0]).evaluate(atX: minSend_n)
         maxSens =   CombinedLinearCurve(yValues: [90.0, 120.0, 180.0]).evaluate(atX: maxSens_n)
-        if !precise {
-            curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
-        } else {
-            curvature = CombinedLinearCurve(yValues: [0.75, 0.75, 0.25]).evaluate(atX: curvature_n)
-        }
+        curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
 
         
     } else if smoothness == kMFScrollSmoothnessOff { /// It might be better to use the animationCurve instead of smoothness in these if-statements
         
         minSens =   CombinedLinearCurve(yValues: [20.0, 30.0, 40.0]).evaluate(atX: minSend_n)
         maxSens =   CombinedLinearCurve(yValues: [40.0, 60.0, 80.0]).evaluate(atX: maxSens_n)
-        if !precise {
-            /// For the other smoothnesses we apply more curvature if precise == true, but here it felt best to have them the same. Don't know why.
-            curvature = CombinedLinearCurve(yValues: [4.25, 3.0, 2.25]).evaluate(atX: curvature_n)
-        } else {
-            curvature = CombinedLinearCurve(yValues: [4.25, 3.0, 2.25]).evaluate(atX: curvature_n)
-        }
+        curvature = CombinedLinearCurve(yValues: [4.25, 3.0, 2.25]).evaluate(atX: curvature_n)
 
     } else if smoothness == kMFScrollSmoothnessLow { /// kMFScrollAnimationCurveNameVeryLowInertia
 
         minSens =   CombinedLinearCurve(yValues: [30.0, 60.0, 120.0]).evaluate(atX: minSend_n)
         maxSens =   CombinedLinearCurve(yValues: [90.0, 120.0, 180.0]).evaluate(atX: maxSens_n)
-        if !precise {
-            curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
-        } else {
-            curvature = CombinedLinearCurve(yValues: [0.75, 0.75, 0.25]).evaluate(atX: curvature_n)
-        }
+        curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
 
     } else if smoothness == kMFScrollSmoothnessRegular {
 
         minSens =   CombinedLinearCurve(yValues: [/*20.0, 40.0,*/ 30.0, 60.0, 120.0]).evaluate(atX: minSend_n)
         maxSens =   CombinedLinearCurve(yValues: [/*60.0, 90.0,*/ 90.0, 120.0, 180.0]).evaluate(atX: maxSens_n)
-        if !precise {
-            curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
-        } else {
-            curvature = CombinedLinearCurve(yValues: [0.75, 0.75, 0.25]).evaluate(atX: curvature_n)
-        }
+        curvature = CombinedLinearCurve(yValues: [0.25, 0.0, 0.0]).evaluate(atX: curvature_n)
         
     } else if smoothness == kMFScrollSmoothnessHigh {
         
         minSens =   CombinedLinearCurve(yValues: [/*30.0,*/ 60.0, 90.0, 150.0]).evaluate(atX: minSend_n)
         maxSens =   CombinedLinearCurve(yValues: [/*90.0,*/ 120.0, 180.0, 240.0]).evaluate(atX: maxSens_n)
-        if !precise {
-            curvature = 0.0
-        } else {
-            curvature = CombinedLinearCurve(yValues: [1.5, 1.25, 0.75]).evaluate(atX: curvature_n)
-        }
+        curvature = 0.0
         
     } else {
         fatalError()
-    }
-    
-    
-    /// Precise
-    
-    if precise {
-        minSens = 10
     }
     
     /// Screen height

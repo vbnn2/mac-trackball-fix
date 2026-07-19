@@ -9,8 +9,6 @@
 # Usage: ./dev.sh <command>
 #   build     Build the app (embeds the Helper)
 #   run       Build, launch the GUI, and restart its launchd-managed Helper
-#   run-target  Enable the experimental reservoir engine, then build and launch
-#   run-stable  Restore Regular + legacy scrolling, then build and launch
 #   run-helper  Build and run only the embedded Helper in the foreground (advanced)
 #   app       Build and launch only the main app GUI
 #   test      Build + run the "Tests" scratch app (there is NO unit test suite)
@@ -36,7 +34,6 @@ CONFIG="${CONFIG:-Debug}"
 DESTINATION="platform=macOS,arch=arm64"
 ARCH_SETTINGS=("ARCHS=arm64" "ONLY_ACTIVE_ARCH=YES")
 RELEASE_SCHEME="App - Release"
-USER_CONFIG="$HOME/Library/Application Support/com.pixeption.mac-mouse-fix/config.plist"
 SCROLL_LOG_FILE="${MMF_SCROLL_LOG_FILE:-/tmp/mac-trackball-fix-scroll.log}"
 SCROLL_LOG_LABEL="com.pixeption.mac-trackball-fix.scroll-log"
 
@@ -91,32 +88,6 @@ do_run_app() {
   echo "    The GUI owns the launchd service; this command does not need to stay open."
   open -n "$(APP_PATH)" --args --dev-restart-helper
   echo "==> Launched. Use './dev.sh logs' in another terminal for live logs."
-}
-
-set_scroll_config_value() {
-  local key="$1"
-  local type="$2"
-  local value="$3"
-
-  [ -f "$USER_CONFIG" ] || die "Config not found. Launch Mac Mouse Fix once, then retry: $USER_CONFIG"
-  plutil -replace "$key" "$type" "$value" "$USER_CONFIG" 2>/dev/null \
-    || plutil -insert "$key" "$type" "$value" "$USER_CONFIG"
-}
-
-configure_scroll_engine() {
-  local mode="$1"
-
-  if [ "$mode" = "target" ]; then
-    echo "==> Selecting experimental reservoir scrolling (High + Trackpad Simulation)…"
-    set_scroll_config_value Scroll.smooth -string high
-    set_scroll_config_value Scroll.trackpadSimulation -bool true
-    set_scroll_config_value Scroll.targetedScrollEngine -bool true
-  else
-    echo "==> Restoring stable scrolling (Regular + legacy engine)…"
-    set_scroll_config_value Scroll.smooth -string regular
-    set_scroll_config_value Scroll.trackpadSimulation -bool true
-    set_scroll_config_value Scroll.targetedScrollEngine -bool false
-  fi
 }
 
 require_direct_helper_slot() {
@@ -300,16 +271,6 @@ case "${1:-run}" in
     ;;
 
   run)
-    do_run_app
-    ;;
-
-  run-target)
-    configure_scroll_engine target
-    do_run_app
-    ;;
-
-  run-stable)
-    configure_scroll_engine stable
     do_run_app
     ;;
 

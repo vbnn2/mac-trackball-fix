@@ -85,11 +85,16 @@ extension NSView {
         /// Approach 3: CGWindowListCreateImage
         ///  This works! No screenRecording permission popup.
         let screenRect = self.rectInQuartzScreenCoordinates()
-        guard let window = self.window
-        else { assert(false); return nil }
+        guard screenRect.width.isFinite,
+              screenRect.height.isFinite,
+              screenRect.width > 0,
+              screenRect.height > 0,
+              screenRect.width < 16_384,
+              screenRect.height < 16_384,
+              let window = self.window else { return nil }
         let windowID = CGWindowID(window.windowNumber)
         guard let screenshot = CGWindowListCreateImage(screenRect, .optionIncludingWindow, windowID, [])
-        else { assert(false); return nil }
+        else { return nil }
         
         /// Approach 2: CGWindowListCreateImageFromArray
         ///    Didn't test this because approach 3 works

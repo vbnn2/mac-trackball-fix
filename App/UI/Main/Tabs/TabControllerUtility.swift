@@ -30,7 +30,6 @@ func applyHardcodedTabWidth(_ tabName: String, _ tabController: NSViewController
     /// How to choose a hardcoded tab-width: [Sep 2025]
     ///     - Pick what looks good in English
     ///     - If there are awkward line-wrappings or truncations, make wider
-    ///         - Don't forget sections that are hidden by default (macOSHint)
     ///         - Text under 'Scrolling > Keyboard Modifiers:' can't wrap, so make sure it doesn't truncate. [Sep 2025]
     ///     - If there is awkward whitespace, make narrower (so far, we only did that for CJK languages, which makes sense since they have the highest informationDensity)
     ///
@@ -61,15 +60,15 @@ func applyHardcodedTabWidth(_ tabName: String, _ tabController: NSViewController
                 map = [
                     "en": 340,  /// 340 looks great and is very close to what what our non-semantic linebreaks produced. Being different from general tab makes animation a bit more interesting. [Sep 2025]
                     "zh": 330,  /// Everything's 1 line in Chinese, so we just let it be sized naturally [Sep 2025]
-                    "fr": 360,  /// 340 -> 360 is the narrowest, that doesn't wrap the precisionHint onto 3 lines. [Sep 2025]
+                    "fr": 360,
                     "de": 340,  /// 340 looks great [Sep 2025]
                     "ko": 330,  /// 340 -> 330 looks better. Not sure why. [Sep 2025]
                     "pt": 370,  /// 340 -> 370 is narrowest that doesn't truncate modfield title "Aumentar ou diminuir zoom" [Sep 2025]
                     "vi": 340,  /// 340 looks great. [Sep 2025]
                     "cs": 340,  /// 340 looks great [Nov 2025]
-                    "tr": 380,  /// 370 -> "Yakınlaştırma veya Uzaklaştırma" (H4T-Rp-t33.title) is no longer cut off [Dec 2025] || 380 -> "Kaydırma tekerleğini ..." (precise-scrolling-hint) is on 2 instead of 3 lines [Dec 2025]
-                    "ru": 350,  /// 350 -> Bit more breathing room than 340. String `Прокручивайте точно...` has orphaned word, but inserting &nbsp; or making the tab wider (min 400) looks worse. [Dec 2025]
-                    "es": 390,  /// 370 -> Stops "Modificadores de teclado:" labels from being cut off.  390 -> "Desplázate con precisión..." is on 2 lines instead of 3. [Dec 2025]
+                    "tr": 380,  /// 370 -> "Yakınlaştırma veya Uzaklaştırma" (H4T-Rp-t33.title) is no longer cut off [Dec 2025]
+                    "ru": 350,  /// 350 -> Bit more breathing room than 340. [Dec 2025]
+                    "es": 390,  /// 370 -> Stops "Modificadores de teclado:" labels from being cut off. [Dec 2025]
                 ]
             default:
                 fatalError("Calling this from unexpected tab: \(tabController)")

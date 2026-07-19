@@ -23,17 +23,12 @@ Then grant **Accessibility** permission when macOS prompts (System Settings → 
 Security → Accessibility). Without it the Helper starts but installs no event tap, so
 nothing happens and you get no error.
 
-`./dev.sh` commands: `build`, `run`, `run-target`, `run-stable`, `run-helper`, `app`, `test`, `install`, `publish-check`, `publish`,
+`./dev.sh` commands: `build`, `run`, `run-helper`, `app`, `test`, `install`, `publish-check`, `publish`,
 `logs`, `logs-record`, `logs-record-stop`, `logs-dump`, `stop`, `clean`.
 
 `./dev.sh run` uses the normal app lifecycle. It launches the GUI with a development argument that asks the app to
 unregister the previous Helper, register the newly built embedded Helper, and let launchd start it. The command does
 not need to stay open, and **Enable Mac Mouse Fix** remains available in the GUI.
-
-For diagnostic scroll-engine A/B testing, `./dev.sh run-target` explicitly selects High + Trackpad Simulation and
-enables the experimental reservoir engine. Real TB800 testing found that experiment bursty and capable of leaving
-scrolling inert on reversal, so it is not a candidate for normal use. `./dev.sh run-stable` restores Regular
-smoothness and disables it. Both commands rebuild and relaunch the complete app; no manual plist editing is needed.
 
 `./dev.sh run-helper` bypasses the GUI and runs the embedded Helper directly. Use it only for low-level debugging.
 The normal KeepAlive Helper must be disabled first, and this mode must run in the foreground. Backgrounding it causes
@@ -201,24 +196,14 @@ eventTapCallback()                     ← CGEventTap, kCGEventScrollWheel
         ├── ScrollUtility axisForVerticalDelta:horizontalDelta:  → picks ONE axis
         ├── ScrollAnalyzer → filtered line-unit velocity
         ├── trackball tuning → pixels for this tick
-        ├── Experimental target flag + High/Trackpad → display-synced target follower
-        ├── Regular stable path → rate limit + bounded carry + legacy TouchAnimator
-        ├── Other curves/effects → legacy TouchAnimator + drag/Bezier curve
+        ├── Regular path → rate limit + bounded carry + TouchAnimator
+        ├── Other curves/effects → TouchAnimator + drag/Bezier curve
         └── sendOutputEvents() → sendScroll() / TouchSimulator
 ```
 
-The target follower keeps one critically damped motion session alive across input reports. It is
-restricted to the plain `high` + `trackpadSimulation` path and is disabled by default through
-`Scroll.targetedScrollEngine = false`. Hardware logs showed why: TB800 scroll reports arrive only
-when the ring changes, often 20–100 ms apart, and the follower consumed each position step before
-the next report. The resulting motion was display-synchronized internally but visibly arrived in
-event-rate bursts. Do not enable this path for normal testing until it feeds accepted distance
-gradually from a reservoir across display frames.
-
 Velocity measurement has its own 1ms minimum interval, independent from the legacy acceleration curve's 15ms
 extrapolation boundary. This preserves actual event timing without assuming that the TB800's 750Hz USB polling rate is
-also its scroll-event rate. `MFSCROLL_FEEL` logs sampled input/output velocity, cadence, release delay, target error, and
-display refresh rate at 10Hz for hardware tuning.
+also its scroll-event rate.
 
 The accepted Regular path limits overload in pixels/second rather than pixels/report, so its maximum does not change
 with hardware report frequency. Initial distance and retained carry have separate bounds; this prevents a high maximum
@@ -239,8 +224,7 @@ owned by the previous app so a newly activated browser does not ignore its first
 Regular-path Smoothness is adaptive at the bottom of the speed range. **Smoothness** sets normal/fast blending,
 **Slow Smoothness** sets the zero-speed endpoint, and **Adaptive Until** sets where the smoothstep transition has
 returned to normal as a percentage of Maximum Speed. The smoothness readouts expose the actual duration multiplier
-(`0.4×...1.6×`) used by the engine. Once a gesture reaches the transition speed, adaptive slow smoothing stays off
-until the next gesture; this prevents a sparse final hardware report from becoming a delayed post-scroll burst.
+(`0.4×...1.6×`) used by the engine. Adaptation follows speed during both acceleration and deceleration.
 `MFSCROLL_LEGACY.smoothness` logs the effective value and `adaptiveBlend` logs how much slow blending is applied.
 If a fast gesture has already stopped and the ring emits one late, very-low-velocity report, only that first report is
 shortened and reduced instead of discarded. `MFSCROLL_TAIL` records this narrow settling path. A second slow report
@@ -252,7 +236,7 @@ a complete stop and fully inactive by 400 px/s. Re-acceleration arms the one-rep
 
 | Feature | UI/config | Runtime implementation |
 |---|---|---|
-| Seven scroll-tuning sliders (Sensitivity, Acceleration, Maximum Speed, Smoothness, Slow Smoothness, Adaptive Until, Glide) | `ScrollTabController.swift`, `Scroll.tuning.*` | `ScrollConfig.swift`, `Scroll.m`, `ScrollAnalyzer.m` |
+| Dedicated window with seven described scroll-tuning controls, exact input, and custom ranges (Sensitivity, Acceleration, Maximum Speed, Smoothness, Slow Smoothness, Adaptive Until, Glide) | `ScrollTabController.swift`, `Scroll.tuning.*`, `Scroll.tuningRanges.*` | `ScrollConfig.swift`, `Scroll.m`, `ScrollAnalyzer.m` |
 | Invert zoom / ball scroll | `Scroll.invertZoom`, `Scroll.invertBallScroll` | `Scroll.m`, `ModifiedDragOutputTwoFingerSwipe.m` |
 | Scroll & Zoom / Zoom modes | Button action dictionaries | `HelperState.swift`, `Actions.m`, `Buttons.swift` |
 | Shift + Primary Click | Remap effects table; optional `flags` key | `ModificationUtility.m`, `Actions.m` |
@@ -279,12 +263,16 @@ over the global remap table by trigger and modification precondition. `HelperSta
 reloads remaps. These are button overrides; scroll tuning remains global.
 
 New config keys must be nil-tolerant. Existing configs are not automatically backfilled merely
-because a key was added to `default_config.plist`. For the five tuning values, keep all three
+because a key was added to `default_config.plist`. For the seven tuning values, keep all three
 fallback sources synchronized:
 
 1. `Shared/Config/default_config.plist`
 2. `Helper/Core/Config/ScrollConfig.swift`
 3. `App/UI/Main/Tabs/ScrollTabController.swift`
+
+`Scroll.tuningRanges.*` is app-side presentation state. It controls the slider bounds only and is nil-tolerant for old
+configs. Each setting has a broader, engine-safe supported range in both `ScrollTabController` and `ScrollConfig`;
+keep those ranges synchronized when changing a tuning formula.
 
 ### Rules for coding agents
 
@@ -311,8 +299,6 @@ fallback sources synchronized:
 
 ```bash
 ./dev.sh run                  # rebuild and relaunch the complete app
-./dev.sh run-target           # test experimental reservoir scrolling
-./dev.sh run-stable           # return to Regular + legacy scrolling
 ./dev.sh run-helper           # advanced: foreground Helper with direct logs
 ./dev.sh logs                 # stream a launchd-started Helper's logs (App + Helper)
 ./dev.sh logs-record          # save MFSCROLL telemetry in the background

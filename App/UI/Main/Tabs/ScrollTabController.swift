@@ -8,10 +8,13 @@
 import Cocoa
 import ReactiveSwift
 import ReactiveCocoa
-import AppKit
+
+private final class FlippedTuningDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
 
 @available(macOS 11.0, *)
-class ScrollTabController: NSViewController {
+class ScrollTabController: NSViewController, NSTextFieldDelegate {
     
     /// Config
     
@@ -21,10 +24,55 @@ class ScrollTabController: NSViewController {
     var invertZoom = ConfigValue<Bool>(configPath: "Scroll.invertZoom")
     var invertBallScroll = ConfigValue<Bool>(configPath: "Scroll.invertBallScroll")
 
-    /// Fork: tuning sliders. slider -> config key and readout label
-    private var tuningSliders: [NSSlider: (keyPath: String, readout: NSTextField)] = [:]
+    /// Fork: trackball tuning controls
+
+    private struct TuningSpec {
+        let configKey: String
+        let stringKey: String
+        let hintKey: String
+        let fallback: Double
+        let defaultMinimum: Double
+        let defaultMaximum: Double
+        let supportedMinimum: Double
+        let supportedMaximum: Double
+
+        var rangeConfigBase: String {
+            "Scroll.tuningRanges." + String(configKey.split(separator: ".").last!)
+        }
+    }
+
+    private final class TuningControl {
+        let spec: TuningSpec
+        let slider: NSSlider
+        let valueField: NSTextField
+        let minimumField: NSTextField
+        let maximumField: NSTextField
+        let detailLabel: NSTextField
+
+        init(spec: TuningSpec,
+             slider: NSSlider,
+             valueField: NSTextField,
+             minimumField: NSTextField,
+             maximumField: NSTextField,
+             detailLabel: NSTextField) {
+            self.spec = spec
+            self.slider = slider
+            self.valueField = valueField
+            self.minimumField = minimumField
+            self.maximumField = maximumField
+            self.detailLabel = detailLabel
+        }
+    }
+
+    private var tuningControlsByKey: [String: TuningControl] = [:]
+    private var tuningKeyBySlider: [NSSlider: String] = [:]
+    private var tuningKeyByValueField: [NSTextField: String] = [:]
+    private var tuningKeyByRangeField: [NSTextField: String] = [:]
+    private var tuningKeyByRestoreButton: [NSButton: String] = [:]
+    private var pendingTuningCommit: DispatchWorkItem?
+    private weak var resetTuningRangesButton: NSButton?
+    private var tuningWindowController: NSWindowController?
     var scrollSpeed = ConfigValue<String>(configPath: "Scroll.speed")
-    var precise = ConfigValue<Bool>(configPath: "Scroll.precise")
     var horizontalMod = ConfigValue<UInt>(configPath: "Scroll.modifiers.horizontal")
     var zoomMod = ConfigValue<UInt>(configPath: "Scroll.modifiers.zoom")
     var swiftMod = ConfigValue<UInt>(configPath: "Scroll.modifiers.swift")
@@ -50,10 +98,6 @@ class ScrollTabController: NSViewController {
     @IBOutlet weak var reverseDirectionToggle: NSButton!
     
     @IBOutlet weak var speedPicker: NSPopUpButton!
-    
-    @IBOutlet weak var preciseSection: NSStackView!
-    @IBOutlet weak var preciseToggle: NSButton!
-    @IBOutlet weak var preciseHint: MarkdownTextField!
     
     @IBOutlet weak var horizontalModField: ModCaptureTextField!
     @IBOutlet weak var zoomModField: ModCaptureTextField!
@@ -88,7 +132,31 @@ class ScrollTabController: NSViewController {
         }
     }
     
-    /// Fork: tuning sliders
+    /// Fork: trackball tuning controls
+
+    private lazy var tuningNumberFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 6
+        formatter.allowsFloats = true
+        formatter.usesGroupingSeparator = false
+        return formatter
+    }()
+
+    private var tuningSpecs: [TuningSpec] {
+        /// Fallbacks and supported ranges must match `default_config.plist > Scroll.tuning` and ScrollConfig.
+        /// Range defaults only affect editing in this UI. The Helper continues to receive the exact stored value.
+        [
+            TuningSpec(configKey: "Scroll.tuning.sensitivity", stringKey: "scroll.tuning.sensitivity", hintKey: "scroll.tuning.sensitivity.hint", fallback: 0.10, defaultMinimum: 0.0, defaultMaximum: 1.0, supportedMinimum: 0.0, supportedMaximum: 10.0),
+            TuningSpec(configKey: "Scroll.tuning.acceleration", stringKey: "scroll.tuning.acceleration", hintKey: "scroll.tuning.acceleration.hint", fallback: 1.0, defaultMinimum: 0.0, defaultMaximum: 1.0, supportedMinimum: 0.0, supportedMaximum: 5.0),
+            TuningSpec(configKey: "Scroll.tuning.maxSpeed", stringKey: "scroll.tuning.maximum-speed", hintKey: "scroll.tuning.maximum-speed.hint", fallback: 0.5, defaultMinimum: 0.1, defaultMaximum: 1.0, supportedMinimum: 0.1, supportedMaximum: 10.0),
+            TuningSpec(configKey: "Scroll.tuning.smoothness", stringKey: "scroll.tuning.smoothness", hintKey: "scroll.tuning.smoothness.hint", fallback: 0.5, defaultMinimum: 0.0, defaultMaximum: 1.0, supportedMinimum: 0.0, supportedMaximum: 10.0),
+            TuningSpec(configKey: "Scroll.tuning.slowSmoothness", stringKey: "scroll.tuning.slow-smoothness", hintKey: "scroll.tuning.slow-smoothness.hint", fallback: 0.90, defaultMinimum: 0.0, defaultMaximum: 1.0, supportedMinimum: 0.0, supportedMaximum: 10.0),
+            TuningSpec(configKey: "Scroll.tuning.adaptiveSmoothnessEndSpeedRatio", stringKey: "scroll.tuning.adaptive-until", hintKey: "scroll.tuning.adaptive-until.hint", fallback: 0.125, defaultMinimum: 0.025, defaultMaximum: 0.30, supportedMinimum: 0.001, supportedMaximum: 10.0),
+            TuningSpec(configKey: "Scroll.tuning.glide", stringKey: "scroll.tuning.glide", hintKey: "scroll.tuning.glide.hint", fallback: 0.75, defaultMinimum: 0.0, defaultMaximum: 1.0, supportedMinimum: 0.0, supportedMaximum: 1.1),
+        ]
+    }
 
     private func tuningReadout(keyPath: String, value: Double) -> String {
         if keyPath == "Scroll.tuning.maxSpeed" {
@@ -111,12 +179,78 @@ class ScrollTabController: NSViewController {
     }
 
     private func refreshTuningReadouts() {
-        for (slider, entry) in tuningSliders {
-            entry.readout.stringValue = tuningReadout(keyPath: entry.keyPath, value: slider.doubleValue)
+        for control in tuningControlsByKey.values {
+            control.detailLabel.stringValue = tuningReadout(keyPath: control.spec.configKey,
+                                                             value: control.slider.doubleValue)
         }
     }
 
-    private func addTuningSliders() {
+    private func parsedNumber(from field: NSTextField) -> Double? {
+        tuningNumberFormatter.number(from: field.stringValue)?.doubleValue
+    }
+
+    private func setNumericField(_ field: NSTextField, to value: Double) {
+        field.stringValue = tuningNumberFormatter.string(from: NSNumber(value: value)) ?? String(value)
+    }
+
+    private func clipped(_ value: Double, low: Double, high: Double) -> Double {
+        min(high, max(low, value))
+    }
+
+    private func scheduleTuningCommit() {
+        pendingTuningCommit?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingTuningCommit = nil
+            commitConfig()
+        }
+        pendingTuningCommit = work
+        /// Keep dragging responsive without writing the plist and messaging the Helper for every mouse event.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.075, execute: work)
+    }
+
+    private func flushTuningCommit() {
+        pendingTuningCommit?.cancel()
+        pendingTuningCommit = nil
+        commitConfig()
+    }
+
+    private func currentRange(for spec: TuningSpec, containing value: Double) -> (Double, Double) {
+        let storedMinimum = (config(spec.rangeConfigBase + ".minimum") as? NSNumber)?.doubleValue
+            ?? spec.defaultMinimum
+        let storedMaximum = (config(spec.rangeConfigBase + ".maximum") as? NSNumber)?.doubleValue
+            ?? spec.defaultMaximum
+        var minimum = clipped(storedMinimum, low: spec.supportedMinimum, high: spec.supportedMaximum)
+        var maximum = clipped(storedMaximum, low: spec.supportedMinimum, high: spec.supportedMaximum)
+        if minimum >= maximum {
+            minimum = spec.defaultMinimum
+            maximum = spec.defaultMaximum
+        }
+        /// Old or imported values remain editable even when they sit outside a custom visual range.
+        minimum = min(minimum, value)
+        maximum = max(maximum, value)
+        return (minimum, maximum)
+    }
+
+    private func makeNumericField(value: Double, width: CGFloat, accessibilityLabel: String) -> NSTextField {
+        let field = NSTextField()
+        field.isEditable = true
+        field.isSelectable = true
+        field.alignment = .right
+        field.lineBreakMode = .byClipping
+        field.maximumNumberOfLines = 1
+        field.cell?.usesSingleLineMode = true
+        field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        field.formatter = tuningNumberFormatter
+        field.delegate = self
+        field.controlSize = .small
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+        field.setAccessibilityLabel(accessibilityLabel)
+        setNumericField(field, to: value)
+        return field
+    }
+
+    private func addTuningLauncher() {
 
         /// Hide upstream's Smoothness and Speed pickers.
         ///     Hidden, not deleted: their outlets stay wired and their reactive bindings keep running, so the
@@ -135,77 +269,365 @@ class ScrollTabController: NSViewController {
             }
         }
 
-        /// `fallback` must match `default_config.plist > Scroll.tuning` and ScrollConfig's `slider()` fallbacks.
-        /// It's only used for a config that predates these keys — nothing backfills them (see ScrollConfig).
-        /// Fast Scroll is intentionally not exposed. It is an upstream, swipe-history-based exponential multiplier
-        /// for notched wheels. A free-spinning ring triggers it based on arbitrary report grouping, so the fork keeps
-        /// its old config key readable for compatibility but defaults it to off.
-        /// Note the string keys are kebab-case while the config keys are camelCase.
-        let specs: [(configKey: String, stringKey: String, hintKey: String, fallback: Double, minimum: Double, maximum: Double)] = [
-            ("Scroll.tuning.sensitivity",  "scroll.tuning.sensitivity",       "scroll.tuning.sensitivity.hint",       0.10,  0.0,   1.0),
-            ("Scroll.tuning.acceleration", "scroll.tuning.acceleration",      "scroll.tuning.acceleration.hint",      1.0,   0.0,   1.0),
-            ("Scroll.tuning.maxSpeed",     "scroll.tuning.maximum-speed",     "scroll.tuning.maximum-speed.hint",     0.5,   0.1,   1.0),
-            ("Scroll.tuning.smoothness",   "scroll.tuning.smoothness",        "scroll.tuning.smoothness.hint",        0.5,   0.0,   1.0),
-            ("Scroll.tuning.slowSmoothness", "scroll.tuning.slow-smoothness", "scroll.tuning.slow-smoothness.hint",   0.90,  0.0,   1.0),
-            ("Scroll.tuning.adaptiveSmoothnessEndSpeedRatio", "scroll.tuning.adaptive-until", "scroll.tuning.adaptive-until.hint", 0.125, 0.025, 0.30),
-            ("Scroll.tuning.glide",        "scroll.tuning.glide",             "scroll.tuning.glide.hint",             0.75,  0.0,   1.0),
-        ]
+        let title = NSTextField(labelWithString: MFLocalizedString("scroll.tuning.section-title", comment: ""))
+        title.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
 
-        let section = NSStackView()
+        let hint = NSTextField(wrappingLabelWithString: MFLocalizedString("scroll.tuning.launcher-hint", comment: ""))
+        hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        hint.textColor = .secondaryLabelColor
+        hint.maximumNumberOfLines = 2
+        hint.setContentHuggingPriority(.required, for: .vertical)
+        hint.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        let openButton = NSButton(title: MFLocalizedString("scroll.tuning.open", comment: ""),
+                                  target: self,
+                                  action: #selector(showTuningWindow(_:)))
+        openButton.bezelStyle = .rounded
+        openButton.setAccessibilityIdentifier("axOpenScrollingFeel")
+        openButton.setContentHuggingPriority(.required, for: .vertical)
+        openButton.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        let section = NSStackView(views: [title, hint, openButton])
         section.orientation = .vertical
         section.alignment = .leading
-        section.spacing = 6
-        /// Hug vertically, or masterStack (distribution=fill) stretches this and the 99999 tab-measuring probe in
-        /// TabViewController.resizeWindowToFit() reports a nonsense height. Same trap as the General tab.
+        section.spacing = 7
         section.setHuggingPriority(.required, for: .vertical)
         section.setContentHuggingPriority(.required, for: .vertical)
-
-        for spec in specs {
-
-            let label = NSTextField(labelWithString: MFLocalizedString(spec.stringKey, comment: ""))
-            /// Match the standard appearance font used by the surrounding controls in Main.storyboard.
-            label.font = .systemFont(ofSize: NSFont.systemFontSize)
-            label.alignment = .left
-            label.widthAnchor.constraint(equalToConstant: 110).isActive = true
-            let hint = MFLocalizedString(spec.hintKey, comment: "")
-            label.toolTip = hint
-
-            let value = (config(spec.configKey) as? NSNumber)?.doubleValue ?? spec.fallback
-
-            let readout = NSTextField(labelWithString: tuningReadout(keyPath: spec.configKey, value: value))
-            readout.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            readout.textColor = .secondaryLabelColor
-            readout.alignment = .left
-            readout.widthAnchor.constraint(equalToConstant: 84).isActive = true
-
-            let slider = NSSlider(value: value, minValue: spec.minimum, maxValue: spec.maximum,
-                                  target: self, action: #selector(tuningSliderChanged(_:)))
-            /// Fire on mouse-up only. Continuous would call commitConfig() — a config file write plus an IPC message
-            /// to the Helper — on every pixel of the drag.
-            slider.isContinuous = false
-            slider.widthAnchor.constraint(equalToConstant: 138).isActive = true
-            slider.setAccessibilityIdentifier("axTuning_" + spec.configKey)
-            slider.setAccessibilityLabel(label.stringValue)
-            slider.toolTip = hint
-
-            tuningSliders[slider] = (keyPath: spec.configKey, readout: readout)
-
-            let row = NSStackView(views: [label, slider, readout])
-            row.orientation = .horizontal
-            row.spacing = 6
-            row.setHuggingPriority(.required, for: .vertical)
-            row.setContentHuggingPriority(.required, for: .vertical)
-            section.addArrangedSubview(row)
-        }
+        section.setContentCompressionResistancePriority(.required, for: .vertical)
 
         masterStack.insertArrangedSubview(section, at: 0)
     }
 
+    @objc private func showTuningWindow(_ sender: Any?) {
+        /// Opening another key window can interrupt the main tab controller's cross-fade. Finish the visible state
+        /// synchronously so the inactive main window cannot be left with transparent tab content.
+        view.alphaValue = 1.0
+        view.subviews.first?.alphaValue = 1.0
+        if let mainWindow = MainAppState.shared.window {
+            mainWindow.alphaValue = 1.0
+            mainWindow.isOpaque = true
+            mainWindow.backgroundColor = .windowBackgroundColor
+        }
+        if tuningWindowController == nil {
+            tuningWindowController = makeTuningWindowController()
+        }
+        tuningWindowController?.showWindow(self)
+        tuningWindowController?.window?.makeKeyAndOrderFront(self)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func makeTuningWindowController() -> NSWindowController {
+        tuningControlsByKey.removeAll()
+        tuningKeyBySlider.removeAll()
+        tuningKeyByValueField.removeAll()
+        tuningKeyByRangeField.removeAll()
+        tuningKeyByRestoreButton.removeAll()
+
+        let contentController = NSViewController()
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        contentController.view = root
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        root.addSubview(scrollView)
+
+        let document = FlippedTuningDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = document
+
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        document.addSubview(stack)
+
+        let windowTitle = NSTextField(labelWithString: MFLocalizedString("scroll.tuning.window-title", comment: ""))
+        windowTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+
+        let windowHint = NSTextField(wrappingLabelWithString: MFLocalizedString("scroll.tuning.section-hint", comment: ""))
+        windowHint.textColor = .secondaryLabelColor
+        windowHint.maximumNumberOfLines = 2
+
+        let resetRanges = NSButton(title: MFLocalizedString("scroll.tuning.reset-ranges", comment: ""),
+                                   target: self,
+                                   action: #selector(resetAllTuningRanges(_:)))
+        resetRanges.bezelStyle = .rounded
+        resetRanges.toolTip = MFLocalizedString("scroll.tuning.reset-ranges.hint", comment: "")
+        resetTuningRangesButton = resetRanges
+
+        let heading = NSStackView(views: [windowTitle, NSView(), resetRanges])
+        heading.orientation = .horizontal
+        heading.alignment = .centerY
+        heading.spacing = 12
+        stack.addArrangedSubview(heading)
+        stack.addArrangedSubview(windowHint)
+        heading.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        windowHint.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        for spec in tuningSpecs {
+            let row = makeTuningRow(for: spec)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 22),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -22),
+        ])
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 720),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered,
+                              defer: false)
+        window.title = MFLocalizedString("scroll.tuning.window-title", comment: "")
+        window.contentViewController = contentController
+        window.minSize = NSSize(width: 720, height: 520)
+        window.setFrameAutosaveName("ScrollingFeelWindow")
+        window.center()
+        window.contentView?.layoutSubtreeIfNeeded()
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        refreshResetRangesButton()
+        return NSWindowController(window: window)
+    }
+
+    private func makeTuningRow(for spec: TuningSpec) -> NSView {
+        let name = MFLocalizedString(spec.stringKey, comment: "")
+        let description = MFLocalizedString(spec.hintKey, comment: "")
+        let storedValue = (config(spec.configKey) as? NSNumber)?.doubleValue ?? spec.fallback
+        let value = clipped(storedValue, low: spec.supportedMinimum, high: spec.supportedMaximum)
+        let range = currentRange(for: spec, containing: value)
+
+        let title = NSTextField(labelWithString: name)
+        title.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+
+        let detail = NSTextField(labelWithString: tuningReadout(keyPath: spec.configKey, value: value))
+        detail.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        detail.textColor = .secondaryLabelColor
+
+        let titleRow = NSStackView(views: [title, NSView(), detail])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+
+        let supportedMinimum = tuningNumberFormatter.string(from: NSNumber(value: spec.supportedMinimum))
+            ?? String(spec.supportedMinimum)
+        let supportedMaximum = tuningNumberFormatter.string(from: NSNumber(value: spec.supportedMaximum))
+            ?? String(spec.supportedMaximum)
+        let supportedRange = String(format: MFLocalizedString("scroll.tuning.supported-range", comment: ""),
+                                    supportedMinimum,
+                                    supportedMaximum)
+        let descriptionLabel = NSTextField(wrappingLabelWithString: description + "\n" + supportedRange)
+        descriptionLabel.textColor = .secondaryLabelColor
+        descriptionLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        descriptionLabel.maximumNumberOfLines = 3
+        descriptionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let slider = NSSlider(value: value, minValue: range.0, maxValue: range.1,
+                              target: self, action: #selector(tuningSliderChanged(_:)))
+        slider.isContinuous = true
+        slider.setAccessibilityIdentifier("axTuning_" + spec.configKey)
+        slider.setAccessibilityLabel(name)
+        slider.toolTip = description
+        slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 560).isActive = true
+
+        let minimumField = makeNumericField(value: range.0, width: 92,
+                                            accessibilityLabel: MFLocalizedString("scroll.tuning.minimum", comment: "") + " " + name)
+        let maximumField = makeNumericField(value: range.1, width: 92,
+                                            accessibilityLabel: MFLocalizedString("scroll.tuning.maximum", comment: "") + " " + name)
+        for field in [minimumField, maximumField] {
+            field.target = self
+            field.action = #selector(tuningRangeFieldChanged(_:))
+        }
+
+        let valueField = makeNumericField(value: value, width: 92, accessibilityLabel: name)
+        valueField.target = self
+        valueField.action = #selector(tuningValueFieldChanged(_:))
+        valueField.toolTip = MFLocalizedString("scroll.tuning.exact-value.hint", comment: "")
+
+        let restore = NSButton(title: MFLocalizedString("scroll.tuning.restore-range", comment: ""),
+                               target: self,
+                               action: #selector(restoreTuningRange(_:)))
+        restore.bezelStyle = .inline
+        restore.controlSize = .small
+
+        let minimumLabel = NSTextField(labelWithString: MFLocalizedString("scroll.tuning.minimum", comment: ""))
+        let maximumLabel = NSTextField(labelWithString: MFLocalizedString("scroll.tuning.maximum", comment: ""))
+        let valueLabel = NSTextField(labelWithString: MFLocalizedString("scroll.tuning.value", comment: ""))
+        for label in [minimumLabel, maximumLabel, valueLabel] {
+            label.textColor = .secondaryLabelColor
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        }
+
+        let fields = NSStackView(views: [minimumLabel, minimumField, maximumLabel, maximumField,
+                                         valueLabel, valueField, NSView(), restore])
+        fields.orientation = .horizontal
+        fields.alignment = .centerY
+        fields.spacing = 7
+
+        let row = NSStackView(views: [titleRow, descriptionLabel, slider, fields])
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 5
+        row.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 8
+        row.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.45).cgColor
+        for arrangedView in [titleRow, descriptionLabel, slider, fields] {
+            arrangedView.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -28).isActive = true
+        }
+
+        let control = TuningControl(spec: spec,
+                                    slider: slider,
+                                    valueField: valueField,
+                                    minimumField: minimumField,
+                                    maximumField: maximumField,
+                                    detailLabel: detail)
+        tuningControlsByKey[spec.configKey] = control
+        tuningKeyBySlider[slider] = spec.configKey
+        tuningKeyByValueField[valueField] = spec.configKey
+        tuningKeyByRangeField[minimumField] = spec.configKey
+        tuningKeyByRangeField[maximumField] = spec.configKey
+        tuningKeyByRestoreButton[restore] = spec.configKey
+        return row
+    }
+
     @objc private func tuningSliderChanged(_ sender: NSSlider) {
-        guard let entry = tuningSliders[sender] else { assert(false); return }
-        setConfig(entry.keyPath, NSNumber(value: sender.doubleValue))
+        guard let key = tuningKeyBySlider[sender], let control = tuningControlsByKey[key] else {
+            assertionFailure()
+            return
+        }
+        setConfig(key, NSNumber(value: sender.doubleValue))
+        setNumericField(control.valueField, to: sender.doubleValue)
         refreshTuningReadouts() /// Sensitivity also changes the px/s value shown for Maximum Speed.
-        commitConfig() /// -> writes the file and messages the Helper, which reloads ScrollConfig. Live, no restart.
+        scheduleTuningCommit()
+    }
+
+    @objc private func tuningValueFieldChanged(_ sender: NSTextField) {
+        commitTuningValueField(sender)
+    }
+
+    private func commitTuningValueField(_ field: NSTextField) {
+        guard let key = tuningKeyByValueField[field], let control = tuningControlsByKey[key] else { return }
+        guard let parsed = parsedNumber(from: field) else {
+            NSSound.beep()
+            setNumericField(field, to: control.slider.doubleValue)
+            return
+        }
+        let value = clipped(parsed, low: control.slider.minValue, high: control.slider.maxValue)
+        control.slider.doubleValue = value
+        setNumericField(field, to: value)
+        setConfig(key, NSNumber(value: value))
+        refreshTuningReadouts()
+        flushTuningCommit()
+    }
+
+    @objc private func tuningRangeFieldChanged(_ sender: NSTextField) {
+        guard let key = tuningKeyByRangeField[sender], let control = tuningControlsByKey[key] else { return }
+        commitTuningRangeFields(for: control)
+    }
+
+    private func commitTuningRangeFields(for control: TuningControl) {
+        guard let parsedMinimum = parsedNumber(from: control.minimumField),
+              let parsedMaximum = parsedNumber(from: control.maximumField) else {
+            NSSound.beep()
+            setNumericField(control.minimumField, to: control.slider.minValue)
+            setNumericField(control.maximumField, to: control.slider.maxValue)
+            return
+        }
+
+        let minimum = clipped(parsedMinimum,
+                              low: control.spec.supportedMinimum,
+                              high: control.spec.supportedMaximum)
+        let maximum = clipped(parsedMaximum,
+                              low: control.spec.supportedMinimum,
+                              high: control.spec.supportedMaximum)
+        guard minimum < maximum else {
+            NSSound.beep()
+            setNumericField(control.minimumField, to: control.slider.minValue)
+            setNumericField(control.maximumField, to: control.slider.maxValue)
+            return
+        }
+
+        control.slider.minValue = minimum
+        control.slider.maxValue = maximum
+        let value = clipped(control.slider.doubleValue, low: minimum, high: maximum)
+        control.slider.doubleValue = value
+        setNumericField(control.valueField, to: value)
+        setNumericField(control.minimumField, to: minimum)
+        setNumericField(control.maximumField, to: maximum)
+        setConfig(control.spec.configKey, NSNumber(value: value))
+        setConfig(control.spec.rangeConfigBase + ".minimum", NSNumber(value: minimum))
+        setConfig(control.spec.rangeConfigBase + ".maximum", NSNumber(value: maximum))
+        refreshTuningReadouts()
+        refreshResetRangesButton()
+        flushTuningCommit()
+    }
+
+    @objc private func restoreTuningRange(_ sender: NSButton) {
+        guard let key = tuningKeyByRestoreButton[sender], let control = tuningControlsByKey[key] else { return }
+        applyDefaultRange(to: control)
+        commitConfig()
+    }
+
+    @objc private func resetAllTuningRanges(_ sender: NSButton) {
+        pendingTuningCommit?.cancel()
+        pendingTuningCommit = nil
+        for control in tuningControlsByKey.values {
+            applyDefaultRange(to: control)
+        }
+        commitConfig()
+    }
+
+    private func applyDefaultRange(to control: TuningControl) {
+        control.slider.minValue = control.spec.defaultMinimum
+        control.slider.maxValue = control.spec.defaultMaximum
+        let value = clipped(control.slider.doubleValue,
+                            low: control.spec.defaultMinimum,
+                            high: control.spec.defaultMaximum)
+        control.slider.doubleValue = value
+        setNumericField(control.valueField, to: value)
+        setNumericField(control.minimumField, to: control.spec.defaultMinimum)
+        setNumericField(control.maximumField, to: control.spec.defaultMaximum)
+        setConfig(control.spec.configKey, NSNumber(value: value))
+        setConfig(control.spec.rangeConfigBase + ".minimum", NSNumber(value: control.spec.defaultMinimum))
+        setConfig(control.spec.rangeConfigBase + ".maximum", NSNumber(value: control.spec.defaultMaximum))
+        refreshTuningReadouts()
+        refreshResetRangesButton()
+    }
+
+    private func refreshResetRangesButton() {
+        resetTuningRangesButton?.isEnabled = tuningControlsByKey.values.contains {
+            abs($0.slider.minValue - $0.spec.defaultMinimum) > 0.000_001
+                || abs($0.slider.maxValue - $0.spec.defaultMaximum) > 0.000_001
+        }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField else { return }
+        if tuningKeyByValueField[field] != nil {
+            commitTuningValueField(field)
+        } else if let key = tuningKeyByRangeField[field], let control = tuningControlsByKey[key] {
+            commitTuningRangeFields(for: control)
+        }
+    }
+
+    override func viewWillDisappear() {
+        if pendingTuningCommit != nil {
+            flushTuningCommit()
+        }
+        super.viewWillDisappear()
     }
 
     /// Init
@@ -214,7 +636,6 @@ class ScrollTabController: NSViewController {
         super.viewDidLoad()
         
         /// There was some reason we don't use viewDidLoad here, and instead we use awakeFromNib. I think it had to do with preventing animations from playing when the app starts right into this tab or sth. But maybe it's just unnecessary.
-        /// Edit: The replacing between the macOSHint and the preciseSection broke when we used awakeFromNib. Not totally sure why. Let's hope viewDidLoad works after all.
         
         /// Smooth
         
@@ -236,8 +657,8 @@ class ScrollTabController: NSViewController {
         reverseDirection.bindingTarget <~ reverseDirectionToggle.reactive.boolValues
         reverseDirectionToggle.reactive.boolValue <~ reverseDirection.producer
 
-        /// Fork: tuning sliders (replaces the Smoothness / Speed pickers)
-        addTuningSliders()
+        /// Fork: tuning window launcher (replaces the Smoothness / Speed pickers)
+        addTuningLauncher()
 
         /// Fork: Invert zoom
         ///     Added in code rather than IB, like the other fork additions. `reverseDirectionToggle` is itself a
@@ -298,108 +719,8 @@ class ScrollTabController: NSViewController {
         })
         speedPicker.reactive.selectedIdentifier <~ scrollSpeed.producer.map({ NSUserInterfaceItemIdentifier($0) })
         
-        /// Precise
-        /// Notes:
-        /// - Why do we generate the preciseHint text in code instead of setting it in IB?
-        /// - TODO: Determine line-width programmatically. (We're telling translators to set the line break to their own taste, to make the layout look good, but now that we expect localizers to use .xcloc files instead of running the app that might be difficult.)
-        ///     -> Do the same thing for all UI strings with non-semantic linebreaks. (non-semantic means they linebreak exists to make the layout look good not to separate text logically.)
-        precise.bindingTarget <~ preciseToggle.reactive.boolValues
-        preciseToggle.reactive.boolValue <~ precise.producer
-        let preciseHintRaw = MFLocalizedString("precise-scrolling-hint", comment: "The mention of keyboard modifiers is meant to draw attention to the keyboard modifers section of the UI which appears right below. (Search for: 'Scrolling > Keyboard Modifiers')")
-        preciseHint.attributedStringValue = MarkdownParser.attributedString(withCoolMarkdown: preciseHintRaw, fillOutBase: false)!.fillingOutBaseAsHint()
-        
         /// Hardcode tab width
-        ///     Do this before installing the macOS hint so it can accurately calculate the size of stuff [Sep 2025]
-        applyHardcodedTabWidth("scrolling", self, widthControllingTextFields: [preciseHint]) /// The `macOSHint` below is not 'widthDetermining' so we don't need to pass it in here.
-    
-        /// Set up macOSHint
-        do {
-    
-            /// Generate macOS hint string
-            /// Notes:
-            ///   - Under Ventura, you can open the mouse prefpane with the URL `x-apple.systempreferences:com.apple.Mouse-Settings.extension`, but it only works when a mouse is attached and otherwise it will give weird errors, so we're not using it now. We might want to use it if  we test whether a mouse is attached beforehand, or if future Ventura Betas give less janky errors
-            ///     - A nice solution was if we had a reactive `activeDevice` class which we could attach to and update this stuff whenever it changes. See `MessagePortUtility_App.getActiveDeviceInfo()`
-            ///   - Pre-Ventura you can open the prefPane with `file:///System/Library/PreferencePanes/Mouse.prefPane` but clicking that link inside the macOSHint just reveals the `.prefPane` file in Finder under Big Sur instead of opening it.
-            
-            var mouseSettingsURL: NSString
-            if #available(macOS 13.0, *) {
-                
-                mouseSettingsURL = "x-apple.systempreferences:com.apple.Mouse-Settings.extension"
-                mouseSettingsURL = "" /// Disable for now (see above)
-            } else {
-                mouseSettingsURL = "file:///System/Library/PreferencePanes/Mouse.prefPane"
-                mouseSettingsURL = "" /// Disable for now (see above)
-            }
-            let macOSHintRaw = String(format: MFLocalizedString("macos-scrolling-hint", comment: "%1$@ will be the name of the System Settings app.\n\nConsider putting the destination in the System Settings on its own line just like English to make the text easier to scan."), UIStrings.systemSettingsName(), mouseSettingsURL)
-        
-            /// Install the macOSHint.
-            ///     We manually make the macOSHint width equal the preciseSection width, because if the width changes the window resizes from the left edge which looks crappy.
-            ///     This is a really hacky solution. Move this logic into CollapsableStackView (maybe rename to AnimatingStackView or sth).
-            ///         Make a method `register(switchableViews:forArrangedSubview:)` which calculates a size that fits all those views, and then you switch between them with `switchTo(view:)`..
-            
-            let macOSHint = CoolNSTextField(hintWithAttributedString: MarkdownParser.attributedString(withCoolMarkdown: macOSHintRaw, fillOutBase: false)!)
-            
-            do {
-                macOSHint.translatesAutoresizingMaskIntoConstraints = false
-                macOSHint.setContentHuggingPriority(.required, for: .horizontal)
-                macOSHint.setContentHuggingPriority(.required, for: .vertical)
-                macOSHint.cell?.wraps = true
-                
-                let macOSHintIndent = NSView()
-                do {
-                    macOSHintIndent.translatesAutoresizingMaskIntoConstraints = false
-                }
-                
-                do {
-                    macOSHintIndent.addSubview(macOSHint)
-                    
-                    macOSHint.leadingAnchor .constraint(equalTo: macOSHintIndent/*.layoutMarginsGuide*/.leadingAnchor).isActive = true
-                    macOSHint.trailingAnchor.constraint(equalTo: macOSHintIndent.trailingAnchor).isActive = true
-                    macOSHint.topAnchor     .constraint(equalTo: macOSHintIndent.topAnchor).isActive = true
-                    macOSHint.bottomAnchor  .constraint(equalTo: macOSHintIndent.bottomAnchor).isActive = true
-                }
-                
-                /// Create explicit width constraints, that match the natural width of the preciseSection
-                ///     Reasons:
-                ///     - macOSHintIndent needs the width constraint so the window stays the same width when it is swapped in (See notes above under `Install the macOSHint`) [Sep 2025]
-                ///     - preciseSection needs the width constraint to not become temporarily too wide during animation. This is probably a bug in our replaceAnimations. This only became necessary after `applyHardcodedTabWidth()` [Sep 2025]
-                ///     Brittle hacks around measuring size: [Sep 2025]
-                ///         - What we wanna do here is measure the 'natural' size of the `preciseSection` and then make the view we swap it out for (`macOSHintIndent`) the same width using a layout constraint.
-                ///         - The problem is that I cannot figure out how to accurately measure the 'natural' size of the preciseSection here.
-                ///             - I think it might be impossible in viewDidLoad()? See https://stackoverflow.com/a/28263756/10601702. [Sep 2025]
-                ///         - We happened to sorta randomly find 2 ways to accurately measure the `preciseSection` in certain circumstances:
-                ///             - 1. When none of the textFields in the preciseSection were wrapping, we could measure its size using `.fittingSize` (Cause that size doesn't depend on the rest of the layout, it's just an intrinsic property.)
-                ///             - 2. After making the textFields wrapping and using `applyHardcodedTabWidth()`, somehow `layoutSubtreeIfNeeded()` works. But it breaks if we don't set an explicit width constraint (We wanted to do that in `applyHardcodedTabWidth()` for Chinese but disabling that, since it breaks this).
-                do {
-                    let preciseSectionWidth: CGFloat
-                    do {
-                        self.view.needsLayout = true        /// Layout `self.view`, since that's where `applyHardcodedTabWidth()` applies its width constraint. [Sep 2025]
-                        self.view.layoutSubtreeIfNeeded()
-                        preciseSectionWidth = preciseSection.frame.width
-                    }
-                    preciseSection .widthAnchor.constraint(equalToConstant: preciseSectionWidth).addingIdentifier("preciseSectionWidth").isActive = true
-                    macOSHintIndent.widthAnchor.constraint(equalToConstant: preciseSectionWidth).addingIdentifier("macOSHintIndentWidth").isActive = true
-                }
-            
-                do {
-                    let preciseSectionRetained: NSStackView? = self.preciseSection /// [Sep 2025] Why do we need this?
-                    var macOSHintIsDisplaying = false
-                    var isInitialized = false
-                    
-                    scrollSpeed.producer.startWithValues { speed in
-                        if speed == "system" && !macOSHintIsDisplaying {
-                            self.preciseSection.animatedReplace(with: macOSHintIndent, doAnimate: isInitialized)
-                            macOSHintIsDisplaying = true
-                        } else if speed != "system" && macOSHintIsDisplaying {
-                            assert(isInitialized)
-                            macOSHintIndent.animatedReplace(with: preciseSectionRetained!, doAnimate: isInitialized)
-                            macOSHintIsDisplaying = false
-                        }
-                        isInitialized = true
-                    }
-                }
-            }
-        }
+        applyHardcodedTabWidth("scrolling", self, widthControllingTextFields: [])
         
         /// Scrollwheel capture notifications
         /// Notes:
