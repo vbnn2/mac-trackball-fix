@@ -127,12 +127,16 @@ static CFTimeInterval _consecutiveSwipeSequenceStartTime;
     if (directionChanged(_previousDirection, direction)) {
         scrollDirectionDidChange = YES;
     }
-    _previousDirection = direction;
     
     /// Reset state if scroll direction changed
     if (scrollDirectionDidChange) {
         [self resetState];
     }
+
+    /// `resetState` clears `_previousDirection`. Store the current direction afterwards so the next report is
+    /// compared with this report, not with `kMFDirectionNone`. The old ordering made every second quick reversal
+    /// invisible to the analyzer (observed in the Telegram trace: up -> down was detected, then down -> up was not).
+    _previousDirection = direction;
 
     /// Get raw seconds since last tick
     double secondsSinceLastTick = thisScrollTickTimeStamp - _previousScrollTickTimeStamp;

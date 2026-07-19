@@ -15,7 +15,7 @@ is an independent fork and does not use the upstream update channel.
   every event as a single mouse-wheel detent.
 - Kept velocity measurement based on actual scroll-event timestamps down to 1 ms. The device's USB polling rate is
   not treated as its scroll-event rate.
-- Added report-rate-independent overload limiting, bounded motion carry, and fast-stop rebound filtering to the
+- Added report-rate-independent overload limiting, bounded motion carry, and late-tail settling protection to the
   default Regular scroll path. This keeps high-speed scrolling responsive without rebuilding a long drift queue.
 - Added trackball-tuned **Sensitivity**, **Acceleration**, **Maximum Speed**, **Smoothness**, **Slow Smoothness**,
   **Adaptive Until**, and **Glide** controls. Smoothness readouts show their real animation-duration multiplier.

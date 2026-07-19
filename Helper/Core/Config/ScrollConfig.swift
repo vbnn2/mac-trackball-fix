@@ -377,34 +377,11 @@ import Cocoa
     /// it requests even stronger friction.
     @objc let stableFastDragCoefficient: Double = 32.0
 
-    /// The TB800 reports ring movement but has no touch sensor, so it cannot tell us exactly when the user's finger
-    /// left a free-spinning ring. After a short direct phase, classify sustained fast output as momentum. The scroll
-    /// distance is unchanged; this only makes macOS apply trackpad-like edge resistance instead of stretching a
-    /// boundary as though fingers were still dragging it. Slow precision movement stays in the direct phase.
-    @objc let stableDirectGestureMaxDuration: TimeInterval = 100.0 / 1000.0
-    @objc lazy var stableMomentumPromotionSpeed: Double = {
+    /// Mark that a gesture reached the fast range so a late mechanical settling report can receive the narrow
+    /// one-report tail treatment below. This does not change the phase of continuous wheel output.
+    @objc lazy var stableFastGestureSpeed: Double = {
         pxAtRefSpeed * refSpeed * 1.5
     }()
-
-    /// An opposite report while a fast animation is still moving may be mechanical ring rebound or an intentional
-    /// reversal. The captured TB800 rebound lasted four reports / 213ms, while deliberate slow movement may contain
-    /// only one report, so neither "drop one" nor "accept the second" is safe. Cancel the coast immediately, preserve
-    /// a small preview, and bound the candidate direction briefly unless it becomes decisive.
-    @objc let stableReboundSuppressionSpeed: Double = 800.0
-
-    /// Rebound belongs to the same fast physical spin and follows its previous report quickly. A later opposite
-    /// report is a new user action—commonly the first scroll after switching windows—and must not be swallowed just
-    /// because the old display-synchronized animation is still coasting.
-    @objc let stableReboundSuppressionInterval: TimeInterval = 80.0 / 1000.0
-
-    /// Long enough to contain the measured multi-report mechanical rebound. A real reversal is not forced to wait
-    /// for this timeout: it is confirmed early when its raw hardware velocity crosses the threshold below.
-    @objc let stableReboundHysteresisDuration: TimeInterval = 250.0 / 1000.0
-    @objc let stableReboundConfirmationVelocity: Double = 500.0
-
-    /// Never turn a lone opposing report into zero. This small total budget opens a valid gesture immediately and
-    /// remains visible as feedback for an intentional slow reversal, while limiting an entire rebound run to 24px.
-    @objc let stableReboundPreviewDistance: Double = 24.0
 
     /// A free-spinning ring can emit one last low-velocity report well after a fast gesture has visually stopped.
     /// Do not discard it: a resumed scroll is indistinguishable at arrival time. Instead, make that one report small

@@ -208,18 +208,15 @@ also its scroll-event rate.
 The accepted Regular path limits overload in pixels/second rather than pixels/report, so its maximum does not change
 with hardware report frequency. Initial distance and retained carry have separate bounds; this prevents a high maximum
 speed from becoming a large first jump or a delayed motion queue. Near overload it uses stronger release friction. A
-single immediate opposite report during a fast coast acts as a stop/rebound filter, while a sustained reversal
-continues from the next report. The filter has a short time limit so the first scroll after changing windows is kept
-even if an old animation is still coasting. `MFSCROLL_LEGACY` records input mapping and carry behavior; `MFSCROLL_OUTPUT` aggregates the integer
+direction change cancels the old coast immediately and preserves the first opposite report. Opposite hardware input
+is not held behind a rebound classifier: captured mechanical rebound and a deliberate slow reversal overlap in both
+timing and velocity, so suppressing one also pauses the other. `MFSCROLL_LEGACY` records input mapping and carry behavior; `MFSCROLL_OUTPUT` aggregates the integer
 pixel events applications actually receive, including effective event rate and maximum gap.
 
-Regular animated scrolling divides its continuous output into gesture and momentum phases. Ending the gesture phase
-before the coast lets macOS perform a short native rubber-band snap-back at content boundaries instead of waiting for
-MMF's complete, variable-duration animation. Because the TB800 has no finger-presence signal, sustained fast output
-is promoted to momentum after a short direct window; its valid hardware distance is preserved while macOS applies
-stronger momentum edge resistance. The promotion is latched so late ring reports do not repeatedly reopen a gesture.
-Direct gestures use the complete `MayBegin -> Began` opening sequence, and a frontmost-app change resets any session
-owned by the previous app so a newly activated browser does not ignore its first scroll.
+Regular animated scrolling emits phase-less high-resolution pixel-wheel events. It does not promote continuous wheel
+output to standalone momentum: Telegram ignores that stream, while Chromium can stall on synthetic gesture phases.
+Effects that intentionally emulate trackpad gestures remain on the separate `GestureScrollSimulator` path. A
+frontmost-app change resets any session owned by the previous app so a newly activated browser starts cleanly.
 
 Regular-path Smoothness is adaptive at the bottom of the speed range. **Smoothness** sets normal/fast blending,
 **Slow Smoothness** sets the zero-speed endpoint, and **Adaptive Until** sets where the smoothstep transition has

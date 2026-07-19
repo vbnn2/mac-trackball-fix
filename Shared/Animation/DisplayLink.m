@@ -52,6 +52,7 @@ typedef enum {
     dispatch_queue_t _displayLinkQueue;
     MFDisplayLinkRequestedState _requestedState;
     MFDisplayLinkWorkType _optimizedWorkType;
+    CFTimeInterval _lastCallbackTime;
 }
 
 @synthesize dispatchQueue=_displayLinkQueue;
@@ -262,11 +263,22 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         
         while (true) {
             CVReturn rt = CVDisplayLinkStart(self->_displayLink); /// This locks until the displayLinkCallback is done
-            if (rt == kCVReturnSuccess) break;
+            if (rt == kCVReturnSuccess) {
+                DDLogDebug("MFSCROLL_DISPLAY: action=start link=%{public}@ display=%u attempts=%lld result=%d",
+                           [self identifier],
+                           self->_previousDisplayUnderMousePointer,
+                           failedAttempts + 1,
+                           rt);
+                break;
+            }
             
             failedAttempts += 1;
             if (failedAttempts >= maxAttempts) {
-                DDLogInfo("DisplayLink.m: (%@) Failed to start CVDisplayLink after %lld tries. Last error code: %d", [self identifier], failedAttempts, rt);
+                DDLogInfo("MFSCROLL_DISPLAY: action=start-failed link=%{public}@ display=%u attempts=%lld result=%d",
+                          [self identifier],
+                          self->_previousDisplayUnderMousePointer,
+                          failedAttempts,
+                          rt);
                 break;
             }
         }
@@ -274,6 +286,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     
     /// Set requestedState
     ///     before async dispatching to main -> so that isRunning() works properly
+    _lastCallbackTime = 0;
     _requestedState = kMFDisplayLinkRequestedStateRunning;
     
     /// Make sure block is running on the main thread
@@ -486,9 +499,18 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         
         /// Premature return
         if (rt == kCVReturnError) {
+            DDLogDebug("MFSCROLL_DISPLAY: action=resolve-failed link=%{public}@ result=%d",
+                       [self identifier],
+                       rt);
             result = kCVReturnError; return; /// Coudln't get display under pointer
         }
         if (dsp == self->_previousDisplayUnderMousePointer) {
+            /// Do not call any CVDisplayLink getter here. The CoreVideo callback can hold its internal mutex while
+            /// synchronously waiting for this queue; a getter would then wait for that mutex and deadlock scrolling.
+            DDLogDebug("MFSCROLL_DISPLAY: action=keep link=%{public}@ display=%u requestedRunning=%d",
+                       [self identifier],
+                       dsp,
+                       self->_requestedState);
             result = kCVReturnSuccess; return; /// Display under pointer already linked to
         }
         
@@ -496,7 +518,13 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         self->_previousDisplayUnderMousePointer = dsp;
         
         /// Set new display
-        result = [self setDisplay:dsp]; return;
+        result = [self setDisplay:dsp];
+        DDLogDebug("MFSCROLL_DISPLAY: action=switch link=%{public}@ display=%u result=%d requestedRunning=%d",
+                   [self identifier],
+                   dsp,
+                   result,
+                   self->_requestedState);
+        return;
     });
     
 #else
@@ -620,6 +648,17 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
     DisplayLink *self = (__bridge DisplayLink *)displayLinkContext; /// [Aug 2025] Why are we getting this outside `dispatch_sync()`? Spending time outside `dispatch_sync()` increases chances of deadlock.
     
     dispatch_sync(self.dispatchQueue, ^{ /// [Aug 2025] Recovered notes from 3.0.0: Use sync so this is actually executed on the high-priority display-linked thread // Why are we using self.dispatchQueue instead of `self->_displayLinkQueue`? I think self.dispatchQueue might cause some weird timing stuff since objc props are often atomic and stuff..
+
+        CFTimeInterval callbackTime = CACurrentMediaTime();
+        if (self->_lastCallbackTime > 0
+            && self->_requestedState == kMFDisplayLinkRequestedStateRunning
+            && callbackTime - self->_lastCallbackTime > 0.100) {
+            DDLogDebug("MFSCROLL_DISPLAY: action=callback-resumed link=%{public}@ display=%u gapMs=%.2f",
+                       [self identifier],
+                       self->_previousDisplayUnderMousePointer,
+                       (callbackTime - self->_lastCallbackTime) * 1000.0);
+        }
+        self->_lastCallbackTime = callbackTime;
             
         DDLogDebug("DisplayLink.m: (%@) Callback", [self identifier]);
          

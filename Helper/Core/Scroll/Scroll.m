@@ -27,6 +27,7 @@
 #import "Actions.h"
 #import "EventUtility.h"
 #import "MathObjc.h"
+#import <stdatomic.h>
 
 @import IOKit;
 #import "MFHIDEventImports.h"
@@ -42,6 +43,9 @@
 #pragma mark - Variables - static
 
 static CFMachPortRef _eventTap;
+/// `CGEventTapEnable(false)` itself produces `kCGEventTapDisabledByUserInput` on this macOS build. Track the state
+/// requested by SwitchMaster separately so the disabled callback cannot undo a deliberate shutdown.
+static atomic_bool _eventTapShouldBeEnabled = false;
 static CGEventSourceRef _eventSource;
 
 static dispatch_queue_t _scrollQueue;
@@ -60,13 +64,8 @@ static ScrollConfig *_scrollConfig;
 static MFScrollAnimationCurveParameters *_animationParams;
 static ScrollAnalysisResult _lastScrollAnalysisResult;
 static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
-//static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
-/// A free-spinning ring can mechanically cross zero and report a short run in the opposite direction before
-/// settling back. Keep this state on `_scrollQueue`: it bounds that run without dropping a lone intentional report.
-static MFDirection _stableReboundCandidateDirection = kMFDirectionNone;
-static CFTimeInterval _stableReboundCandidateStartTime = 0;
-static double _stableReboundCandidateOutputDistance = 0;
+//static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
 /// Aggregate the events that actually reach applications. The animator can be display-synchronized while integer
 /// pixel quantization still skips output frames, so input/curve telemetry alone cannot prove visible cadence.
@@ -166,7 +165,7 @@ static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, M
     
     /// Create animator
     _animator = [[TouchAnimator alloc] init];
-    
+
     /// Create initial config instance
     ///     Edit: I don't think this makes sense. `_scrollConfig` will be retrieved as necessary on first consecutive ticks
     _scrollConfig = nil; /// [[ScrollConfig alloc] init];
@@ -190,9 +189,6 @@ void resetState_Unsafe(void) {
     [_animator cancel];
     [GestureScrollSimulator stopMomentumScroll]; /// Not sure if appropriate
     [ScrollAnalyzer resetState];
-    _stableReboundCandidateDirection = kMFDirectionNone;
-    _stableReboundCandidateStartTime = 0;
-    _stableReboundCandidateOutputDistance = 0;
 }
 
 //+ (void)suspend {
@@ -217,6 +213,7 @@ void resetState_Unsafe(void) {
     DDLogDebug("Scroll.m: startReceiving. isReceiving: %d", CGEventTapIsEnabled(_eventTap));
 
     /// Start event tap
+    atomic_store_explicit(&_eventTapShouldBeEnabled, true, memory_order_release);
     if (!CGEventTapIsEnabled(_eventTap)) {
         CGEventTapEnable(_eventTap, true);
     }
@@ -234,6 +231,7 @@ void resetState_Unsafe(void) {
     
     
     /// Stop event tap
+    atomic_store_explicit(&_eventTapShouldBeEnabled, false, memory_order_release);
     if (CGEventTapIsEnabled(_eventTap)) {
         CGEventTapEnable(_eventTap, false);
     }
@@ -281,13 +279,18 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
 
-        DDLogDebug("Scroll.m: eventTap was disabled by %@", type == kCGEventTapDisabledByTimeout ? @"timeout. Re-enabling." : @"user input.");
-        
-        /// This tap is the active scroll driver whenever SwitchMaster has enabled it. Leaving it disabled for
-        /// kCGEventTapDisabledByUserInput keeps the Helper alive but makes scrolling permanently inert until a
-        /// restart. Programmatic `stopReceiving` does not arrive through this callback, so re-enabling here does
-        /// not fight the user's enable switch.
-        CGEventTapEnable(_eventTap, true);
+        BOOL shouldBeEnabled = atomic_load_explicit(&_eventTapShouldBeEnabled, memory_order_acquire);
+        DDLogDebug("MFSCROLL_TAP: action=%{public}@ reason=%{public}@ requestedEnabled=%d",
+                   shouldBeEnabled ? @"re-enable" : @"keep-disabled",
+                   type == kCGEventTapDisabledByTimeout ? @"timeout" : @"user-input",
+                   shouldBeEnabled);
+
+        /// Recover from a real timeout/user-input disable only while SwitchMaster still wants interception. A
+        /// deliberate `stopReceiving` also generates this callback on macOS 26; unconditionally enabling here made
+        /// the VS Code compatibility shutdown last only a few milliseconds.
+        if (shouldBeEnabled) {
+            CGEventTapEnable(_eventTap, true);
+        }
         
         return event;
     }
@@ -320,7 +323,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     int64_t drawingTabletID  = CGEventGetIntegerValueField(event, kCGTabletEventDeviceID);
     bool isDiagonal = scrollDeltaAxis1 != 0 && scrollDeltaAxis2 != 0;
 
-    /// Raw input trace. `./dev.sh logs | grep MFDELTA`
+    /// Raw input trace. `./dev.sh logs-record`
     ///
     /// Kept rather than removed: every scroll-engine fix in this fork came out of this one line, and it costs
     /// nothing when nobody's streaming — DDLogDebug expands to an `os_log_type_enabled()` guard (Logging.h:51), and
@@ -333,7 +336,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     ///   `sudo log config --mode private_data:on`.
     /// - `line` vs `point` is the distinction that matters: point delta is already accelerated by macOS (one
     ///   `line=1` report was measured yielding point deltas of 1, 3, 8 and 13), so only `line` is a usable unit count.
-    DDLogDebug("MFDELTA: cont=%lld phase=%lld line=(%lld,%lld) point=(%lld,%lld) fixed=(%.3f,%.3f) diag=%d",
+    DDLogDebug("MFSCROLL_INPUT: cont=%lld phase=%lld line=(%lld,%lld) point=(%lld,%lld) fixed=(%.3f,%.3f) diag=%d",
               isPixelBased,
               scrollPhase,
               lineDeltaAxis1,
@@ -348,14 +351,13 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         || scrollPhase != 0 /// Not entirely sure if testing for 'scrollPhase' here makes sense
         || drawingTabletID != 0 /// Untested
         || isDiagonal) {
-        
         return event;
     }
     
     /// Filter out scroll events by wacom tablet
     if (CGEvent_IsWacomEvent(event))
         return event;
-    
+
     /// Get timestamp
     ///     Get timestamp here instead of _scrollQueue for accurate timing
     CFTimeInterval tickTime = CGEventGetTimestampInSeconds(event);
@@ -421,7 +423,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     BOOL scrollTargetAppChanged = previousScrollTargetBundleID != nil
         && ![currentScrollTargetBundleID isEqualToString:previousScrollTargetBundleID];
     if (scrollTargetAppChanged) {
-        DDLogDebug("MFSCROLL_TARGET: app-change %@ -> %@ action=reset-session",
+        DDLogDebug("MFSCROLL_TARGET: app-change %{public}@ -> %{public}@ action=reset-session",
                    previousScrollTargetBundleID,
                    currentScrollTargetBundleID);
         resetState_Unsafe();
@@ -510,6 +512,15 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// Get display  under mouse pointer
         CGDirectDisplayID displayID;
         [HelperUtility displayUnderMousePointer:&displayID withEvent:event];
+
+        CGPoint pointerLocation = CGEventGetLocation(event);
+        DDLogDebug("MFSCROLL_CONTEXT: target=%{public}@ display=%u pointer=(%.1f,%.1f) mouseMoved=%d animatorRequestedRunning=%d",
+                   currentScrollTargetBundleID,
+                   displayID,
+                   pointerLocation.x,
+                   pointerLocation.y,
+                   ScrollUtility.mouseDidMove,
+                   _animator.isRunning);
 
         /// Fork: drive the scroll animation from the display the pointer is actually on.
         ///     `_animator`'s CVDisplayLink has to be bound to an *active* display, or its callback stops firing
@@ -695,7 +706,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
             stableGestureReachedFastSpeed = NO;
             stableFastTailReportHandled = NO;
         }
-        if (modeledOutputSpeed >= _scrollConfig.stableMomentumPromotionSpeed) {
+        if (modeledOutputSpeed >= _scrollConfig.stableFastGestureSpeed) {
             stableGestureReachedFastSpeed = YES;
             /// Re-arm after every genuinely fast section, including fast -> slow -> fast within one gesture.
             stableFastTailReportHandled = NO;
@@ -782,76 +793,11 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// but the physical tick that requested the reversal must still be delivered.
         
         if (_lastScrollAnalysisResult.scrollDirectionDidChange) {
-            double currentAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
             /// Always terminate the old gesture before opening the opposite one, even if the last sampled
             /// animation speed happens to be zero. Leaving phase state alive at that boundary can make a view
             /// ignore the new same-direction stream until another reversal.
             DDLogDebug("Scroll.m: Direction change – cancel scroll and keep current tick.");
             [_animator cancel];
-
-            /// The TB800 trace disproved the old one-report rebound assumption: the mechanical rebound lasted
-            /// four reports / 213ms, while a deliberate slow movement may contain only one report. Start a short
-            /// hysteresis window instead. The shared clamp below preserves a small immediate response and bounds
-            /// the whole candidate run; a decisive reversal escapes as soon as its raw velocity is high enough.
-            BOOL isImmediateFastRebound = _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia
-                && currentAnimationSpeed >= _scrollConfig.stableReboundSuppressionSpeed
-                && physicalInputGap <= _scrollConfig.stableReboundSuppressionInterval;
-            if (isImmediateFastRebound) {
-                _stableReboundCandidateDirection = scrollDirection;
-                _stableReboundCandidateStartTime = tickTS;
-                _stableReboundCandidateOutputDistance = 0;
-                DDLogDebug("MFSCROLL_REVERSAL: action=begin-hysteresis currentV=%.1f gapMs=%.1f inputPx=%lld direction=%ld",
-                           currentAnimationSpeed,
-                           physicalInputGap * 1000.0,
-                           pxToScrollForThisTick,
-                           (long)scrollDirection);
-            } else if (_scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia
-                       && currentAnimationSpeed >= _scrollConfig.stableReboundSuppressionSpeed) {
-                DDLogDebug("MFSCROLL_REVERSAL: action=keep-new-input currentV=%.1f gapMs=%.1f keptPx=%lld direction=%ld",
-                           currentAnimationSpeed,
-                           physicalInputGap * 1000.0,
-                           pxToScrollForThisTick,
-                           (long)scrollDirection);
-            }
-        }
-
-        if (_stableReboundCandidateDirection != kMFDirectionNone) {
-            if (scrollDirection != _stableReboundCandidateDirection) {
-                DDLogDebug("MFSCROLL_REVERSAL: action=returned-to-original elapsedMs=%.1f candidateOutputPx=%.1f direction=%ld",
-                           (tickTS - _stableReboundCandidateStartTime) * 1000.0,
-                           _stableReboundCandidateOutputDistance,
-                           (long)scrollDirection);
-                _stableReboundCandidateDirection = kMFDirectionNone;
-                _stableReboundCandidateStartTime = 0;
-                _stableReboundCandidateOutputDistance = 0;
-            } else {
-                CFTimeInterval reboundElapsed = tickTS - _stableReboundCandidateStartTime;
-                double rawVelocity = scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw;
-                BOOL candidateIsUnconfirmed = reboundElapsed <= _scrollConfig.stableReboundHysteresisDuration
-                    && rawVelocity < _scrollConfig.stableReboundConfirmationVelocity;
-                if (candidateIsUnconfirmed) {
-                    double remainingPreviewDistance = MAX(0,
-                        _scrollConfig.stableReboundPreviewDistance - _stableReboundCandidateOutputDistance);
-                    int64_t unclampedDistance = pxToScrollForThisTick;
-                    pxToScrollForThisTick = MIN(pxToScrollForThisTick, llround(remainingPreviewDistance));
-                    _stableReboundCandidateOutputDistance += pxToScrollForThisTick;
-                    DDLogDebug("MFSCROLL_REVERSAL: action=bound-candidate elapsedMs=%.1f rawV=%.1f inputPx=%lld outputPx=%lld budgetLeftPx=%.1f direction=%ld",
-                               reboundElapsed * 1000.0,
-                               rawVelocity,
-                               unclampedDistance,
-                               pxToScrollForThisTick,
-                               MAX(0, _scrollConfig.stableReboundPreviewDistance - _stableReboundCandidateOutputDistance),
-                               (long)scrollDirection);
-                } else {
-                    DDLogDebug("MFSCROLL_REVERSAL: action=confirmed elapsedMs=%.1f rawV=%.1f direction=%ld",
-                               reboundElapsed * 1000.0,
-                               rawVelocity,
-                               (long)scrollDirection);
-                    _stableReboundCandidateDirection = kMFDirectionNone;
-                    _stableReboundCandidateStartTime = 0;
-                    _stableReboundCandidateOutputDistance = 0;
-                }
-            }
         }
         
         /// Debug
@@ -862,7 +808,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     ///
     /// Send scroll events
     ///
-    
+
     if (pxToScrollForThisTick == 0) {
         
         DDLogWarn("Scroll.m: pxToScrollForThisTick is 0");
@@ -1310,19 +1256,6 @@ typedef enum {
     kMFScrollOutputTypeCommandTab,
 } MFScrollOutputType;
 
-/// Post a zero-delta momentum boundary for an animated continuous scroll.
-/// Normal ring movement remains an ordinary continuous pixel-wheel stream. Only a promoted hard spin is marked as
-/// momentum, so scroll views can finish rubber-band overscroll promptly without treating every wheel stream as a
-/// synthetic trackpad-finger gesture.
-static void postContinuousScrollPhase(IOHIDEventPhaseBits scrollPhase, CGMomentumScrollPhase momentumPhase) {
-    CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitPixel, 2, 0, 0);
-    CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
-    CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, scrollPhase);
-    CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, momentumPhase);
-    CGEventPost(kCGHIDEventTap, event);
-    CFRelease(event);
-}
-
 /// Output
 
 static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputType, MFAnimationCallbackPhase animatorPhase, MFMomentumHint momentumHint, ScrollConfig *config) {
@@ -1332,7 +1265,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
     if (animatorPhase != kMFAnimationCallbackPhaseNone) {
         eventPhase = [TouchAnimator IOHIDPhaseWithAnimationCallbackPhase:animatorPhase];
     }
-    
+
     /// Debug
     if (runningPreRelease()) {
         
@@ -1479,73 +1412,13 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         
         /// --- ContinuousScroll ---
 
-        /// Keep the base part of the curve as ordinary continuous wheel movement and mark only the drag part as
-        /// momentum. Continuous wheel events are intentionally not trackpad gestures: opening a ScrollPhase session
-        /// here can leave Chromium waiting after a click, even while it receives non-zero deltas at display cadence.
-        /// The browser then appears to wake up only when the stream changes to MomentumPhase several hundred
-        /// milliseconds later. The original stable continuous-scroll path also left ScrollPhase undefined.
-        ///
-        /// A free-spinning ring keeps producing physical reports after the user's finger leaves it. Since the TB800
-        /// has no touch sensor, new reports repeatedly restart the animator's base curve and would otherwise keep a
-        /// hard spin in the direct phase until the ring nearly stops. After a short direct window, promote sustained
-        /// high-speed output to momentum and latch it for the rest of the animation session. No distance is removed;
-        /// only macOS's edge-resistance mode changes. Slow movement remains direct for precise control.
-        static MFMomentumHint lastContinuousMomentumHint = kMFMomentumHintNone;
-        static BOOL continuousMomentumLatched = NO;
-        static CFTimeInterval continuousGestureStartTime = 0;
-        static CFTimeInterval continuousLastOutputTime = 0;
-
-        CFTimeInterval continuousOutputTime = CACurrentMediaTime();
-        if (lastContinuousMomentumHint == kMFMomentumHintNone
-            || animatorPhase == kMFAnimationCallbackPhaseStart) {
-            continuousGestureStartTime = continuousOutputTime;
-            continuousLastOutputTime = continuousOutputTime;
-            continuousMomentumLatched = NO;
-        }
-
-        double continuousOutputInterval = continuousOutputTime - continuousLastOutputTime;
-        double continuousOutputSpeed = continuousOutputInterval > 0.0
-            ? hypot((double)dx, (double)dy) / continuousOutputInterval
-            : 0.0;
-        continuousLastOutputTime = continuousOutputTime;
-
-        BOOL shouldPromoteFastRing = momentumHint != kMFMomentumHintNone
-            && continuousOutputTime - continuousGestureStartTime >= config.stableDirectGestureMaxDuration
-            && continuousOutputSpeed >= config.stableMomentumPromotionSpeed;
-        if (momentumHint == kMFMomentumHintMomentum || shouldPromoteFastRing) {
-            if (!continuousMomentumLatched && shouldPromoteFastRing) {
-                DDLogDebug("MFSCROLL_PHASE: promote-fast-ring outputV=%.1f threshold=%.1f directMs=%.1f",
-                           continuousOutputSpeed,
-                           config.stableMomentumPromotionSpeed,
-                           (continuousOutputTime - continuousGestureStartTime) * 1000.0);
-            }
-            continuousMomentumLatched = YES;
-        }
-
-        MFMomentumHint effectiveMomentumHint = continuousMomentumLatched
-            ? kMFMomentumHintMomentum
-            : momentumHint;
+        /// Continuous output models a high-resolution wheel, not a trackpad-finger gesture. Keep both phase fields
+        /// unset for the entire stream. Some apps (Telegram in the Jul 2026 trace) ignore standalone MomentumPhase
+        /// events which have no matching ScrollPhase gesture; Chromium can conversely stall while a synthetic
+        /// ScrollPhase session is open. Phase-less pixel-wheel events are the common semantics both app families
+        /// accept. The animator still provides the same smoothing and glide—only the event classification changes.
         CGMomentumScrollPhase continuousMomentumPhase = kCGMomentumScrollPhaseNone;
         eventPhase = kIOHIDEventPhaseUndefined;
-
-        if (effectiveMomentumHint == kMFMomentumHintMomentum) {
-            if (lastContinuousMomentumHint == kMFMomentumHintGesture) {
-                continuousMomentumPhase = kCGMomentumScrollPhaseBegin;
-                DDLogDebug("MFSCROLL_PHASE: wheel=direct momentum=begin");
-            } else if (animatorPhase == kMFAnimationCallbackPhaseEnd
-                       || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
-                continuousMomentumPhase = kCGMomentumScrollPhaseEnd;
-            } else if (lastContinuousMomentumHint == kMFMomentumHintMomentum) {
-                continuousMomentumPhase = kCGMomentumScrollPhaseContinue;
-            } else {
-                continuousMomentumPhase = kCGMomentumScrollPhaseBegin;
-            }
-        } else if (effectiveMomentumHint == kMFMomentumHintGesture) {
-            if (lastContinuousMomentumHint == kMFMomentumHintMomentum) {
-                postContinuousScrollPhase(kIOHIDEventPhaseUndefined, kCGMomentumScrollPhaseEnd);
-                DDLogDebug("MFSCROLL_PHASE: momentum=end wheel=direct");
-            }
-        }
         
         /// Create base event
         
@@ -1607,20 +1480,11 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         /// Our own HID tap immediately passes continuous events through, so this does not recurse into
         /// the scroll engine. Session-tap injection can bypass routing/gesture state that some apps use,
         /// which matches the captured failure: events were posted, but the target view stayed stuck.
-        if (dx != 0 || dy != 0 || continuousMomentumPhase != kCGMomentumScrollPhaseNone) {
+        if (dx != 0 || dy != 0) {
             CGEventPost(kCGHIDEventTap, event);
         }
         CFRelease(event);
 
-        lastContinuousMomentumHint = effectiveMomentumHint;
-        if (animatorPhase == kMFAnimationCallbackPhaseEnd
-            || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
-            lastContinuousMomentumHint = kMFMomentumHintNone;
-            continuousMomentumLatched = NO;
-            continuousGestureStartTime = 0;
-            continuousLastOutputTime = 0;
-        }
-        
     } else if (outputType == kMFScrollOutputTypeLineScroll) {
         
         /// --- LineScroll ---

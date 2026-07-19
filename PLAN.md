@@ -38,8 +38,8 @@ The Regular path retains the hardware-tested behavior described in `DEVELOPING.m
 - separately bounded first-report distance and overload carry;
 - stronger release friction only near the speed ceiling;
 - adaptive slow-speed smoothing with one-report late-tail protection;
-- fast-scroll momentum phase promotion for native edge resistance;
-- immediate coast cancellation and bounded mechanical-rebound handling on reversal;
+- phase-less high-resolution wheel output for compatibility across Telegram and Chromium;
+- immediate coast cancellation with undelayed reversal input;
 - app-switch and display-rebinding safeguards;
 - `MFSCROLL_LEGACY`, `MFSCROLL_OUTPUT`, `MFSCROLL_TAIL`, and `MFSCROLL_LATENCY` telemetry.
 
