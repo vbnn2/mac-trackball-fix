@@ -358,6 +358,37 @@ import Cocoa
     /// from `u_slowSmoothnessAmount` back to that value. A smoothstep transition avoids a perceptible boundary, and
     /// the slow value never reduces a higher normal value. Both thresholds are exposed in the Scrolling tab.
 
+    /// A new gesture has no cadence measurement, so its first report is deliberately small and cannot yet reveal
+    /// whether the ring is accelerating. Keep that report visibly responsive instead of spreading its typical 20px
+    /// across the normal ~160ms base curve.
+    @objc let stableInitialResponseBaseDurationMax: TimeInterval = 80.0 / 1000.0
+
+    /// The normal Glide setting intentionally gives established motion a long release tail, but applying that tail
+    /// to the first small report can more than double the capped duration above. Use high friction for that report
+    /// only; the next report immediately returns to the user's configured Glide behavior.
+    @objc let stableInitialResponseDragCoefficient: Double = 40.0
+
+    /// Only a rapid report burst needs the short response treatment. Deliberate slow ring movement commonly emits
+    /// one report every 160–260ms; it needs the normal longer curve to overlap the next report, otherwise the page
+    /// visibly scrolls, pauses, then scrolls again. This is intentionally far shorter than the 500ms grouping
+    /// window, which still preserves velocity estimation and gesture continuity for slow input.
+    @objc let stableActiveResponseInputGapMax: TimeInterval = 100.0 / 1000.0
+
+    /// During a rapid input burst, bound the directly-driven portion of each follow-up report. The normal Low
+    /// Inertia curve can otherwise grow to 270ms after slow smoothing is confirmed, which makes an accelerating
+    /// gesture visibly lag even though events are delivered on time.
+    @objc let stableActiveResponseBaseDurationMax: TimeInterval = 110.0 / 1000.0
+
+    /// Apply stronger friction during a rapid burst so Glide remains a release effect rather than extending every
+    /// fresh report into a long tail. The configured Glide coefficient resumes for slow or sparse input.
+    @objc let stableActiveResponseDragCoefficient: Double = 32.0
+
+    /// USB report grouping can make the second report of an accelerating spin arrive 100–200ms late. Treating that
+    /// single interval as deliberate slow movement immediately selects maximum Slow Smoothness and creates a false
+    /// stall. Require sustained evidence, blending from normal smoothness on report 1 to full slow smoothing on
+    /// report 3. Fast input still selects normal smoothness through the speed curve itself.
+    @objc let stableSlowSmoothingConfirmationReports: Int = 3
+
     /// Keep the first report bounded even though the sustained speed ceiling is intentionally high. The first report
     /// has no measured duration, so applying the full pixels/second ceiling to an assumed interval would create a
     /// large initial lurch.

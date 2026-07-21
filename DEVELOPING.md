@@ -298,7 +298,8 @@ keep those ranges synchronized when changing a tuning formula.
 ./dev.sh run                  # rebuild and relaunch the complete app
 ./dev.sh run-helper           # advanced: foreground Helper with direct logs
 ./dev.sh logs                 # stream a launchd-started Helper's logs (App + Helper)
-./dev.sh logs-record          # save MFSCROLL telemetry in the background
+./dev.sh logs-record          # keep the latest 2,000 MFSCROLL events in the background
+./dev.sh logs-record-snapshot # refresh the readable log while recording continues
 ./dev.sh logs-record-stop     # stop recording and print the saved file path
 MMF_LOG_ALL=1 ./dev.sh logs   # ...plus system frameworks (TCC / launchd / XPC issues)
 ./dev.sh logs-dump 30m        # past logs — sparse, see below

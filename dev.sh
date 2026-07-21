@@ -18,7 +18,8 @@
 #   stop      Kill any running Helper / app instances
 #   logs      Stream the App's + Helper's own logs live (MMF_LOG_ALL=1 to include system logs)
 #   logs-dump [since]  Show past logs (default 15m). Sparse: os_log doesn't persist info/debug.
-#   logs-record  Record MFSCROLL logs in the background until logs-record-stop
+#   logs-record  Keep the latest 2,000 MFSCROLL events in a background rolling capture
+#   logs-record-snapshot  Refresh the readable log without stopping the recorder
 #   logs-record-stop  Stop background recording and print the saved file path
 #   clean     Wipe DerivedData for this project
 
@@ -36,8 +37,17 @@ ARCH_SETTINGS=("ARCHS=arm64" "ONLY_ACTIVE_ARCH=YES")
 RELEASE_SCHEME="App - Release"
 SCROLL_LOG_FILE="${MMF_SCROLL_LOG_FILE:-/tmp/mac-trackball-fix-scroll.log}"
 SCROLL_LOG_LABEL="com.pixeption.mac-trackball-fix.scroll-log"
+SCROLL_LOG_LIMIT=2000
+SCROLL_LOG_SEGMENT_SIZE=100
 
 cd "$(dirname "$0")"
+DEV_SCRIPT_PATH="$PWD/$(basename "$0")"
+
+set_scroll_log_paths() {
+  SCROLL_LOG_SEGMENT_PREFIX="${SCROLL_LOG_FILE}.segment"
+  SCROLL_LOG_STATUS_FILE="${SCROLL_LOG_FILE}.recorder-status"
+}
+set_scroll_log_paths
 
 die() {
   echo "!! $*" >&2
@@ -46,6 +56,77 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+clear_scroll_log_segments() {
+  local segment
+  for segment in "$SCROLL_LOG_SEGMENT_PREFIX".*; do
+    [ -f "$segment" ] && rm -f "$segment"
+  done
+  return 0
+}
+
+snapshot_scroll_log() {
+  local snapshot_file="${SCROLL_LOG_FILE}.snapshot.$$"
+  local segments=("$SCROLL_LOG_SEGMENT_PREFIX".*)
+  local segment
+
+  {
+    if [ -e "${segments[0]}" ]; then
+      # The zero-padded sequence numbers make shell glob order chronological.
+      for segment in "${segments[@]}"; do
+        # A live recorder may rotate the oldest segment after the glob expands.
+        [ -f "$segment" ] && /bin/cat "$segment" || true
+      done
+    fi
+  } | /usr/bin/tail -n "$SCROLL_LOG_LIMIT" > "$snapshot_file"
+
+  /bin/mv -f "$snapshot_file" "$SCROLL_LOG_FILE"
+}
+
+store_scroll_log_stream() {
+  local segments=("$SCROLL_LOG_SEGMENT_PREFIX".*)
+  local current_segment sequence_text sequence_number segment_event_count oldest_sequence oldest_segment line
+
+  if [ -e "${segments[0]}" ]; then
+    current_segment="${segments[${#segments[@]} - 1]}"
+    sequence_text="${current_segment##*.}"
+    sequence_number=$((10#$sequence_text))
+    segment_event_count="$(wc -l < "$current_segment" | tr -d ' ')"
+  else
+    sequence_number=0
+    printf -v current_segment '%s.%012d' "$SCROLL_LOG_SEGMENT_PREFIX" "$sequence_number"
+    : > "$current_segment"
+    segment_event_count=0
+  fi
+
+  while IFS= read -r line; do
+    # `log stream` also emits headers and dropped-message notices. They are useful on a terminal,
+    # but only actual MFSCROLL telemetry counts toward this bounded diagnostic capture.
+    case "$line" in
+      *"] MFSCROLL_"*) ;;
+      *) continue ;;
+    esac
+
+    if [ "$segment_event_count" -ge "$SCROLL_LOG_SEGMENT_SIZE" ]; then
+      sequence_number=$((sequence_number + 1))
+      printf -v current_segment '%s.%012d' "$SCROLL_LOG_SEGMENT_PREFIX" "$sequence_number"
+      : > "$current_segment"
+      segment_event_count=0
+
+      # Keep one overlap segment while the newest segment fills. The snapshot's tail then contains
+      # exactly the newest 2,000 events instead of dropping up to 99 events at a chunk boundary.
+      # Physical storage remains bounded to at most 2,100 short telemetry lines.
+      oldest_sequence=$((sequence_number - (SCROLL_LOG_LIMIT / SCROLL_LOG_SEGMENT_SIZE) - 1))
+      if [ "$oldest_sequence" -ge 0 ]; then
+        printf -v oldest_segment '%s.%012d' "$SCROLL_LOG_SEGMENT_PREFIX" "$oldest_sequence"
+        rm -f "$oldest_segment"
+      fi
+    fi
+
+    printf '%s\n' "$line" >> "$current_segment"
+    segment_event_count=$((segment_event_count + 1))
+  done
 }
 
 # Ask xcodebuild where the products actually land, rather than hardcoding the
@@ -383,20 +464,44 @@ case "${1:-run}" in
     fi
 
     : > "$SCROLL_LOG_FILE"
+    : > "$SCROLL_LOG_STATUS_FILE"
+    clear_scroll_log_segments
     # launchctl owns the recorder so it survives after this script or a coding-agent
     # command session exits. A plain background/nohup process can be reaped with its shell.
     launchctl submit -l "$SCROLL_LOG_LABEL" \
-      -o "$SCROLL_LOG_FILE" \
-      -e "$SCROLL_LOG_FILE" \
-      -- /usr/bin/log stream --level debug --style compact \
-      --predicate 'senderImagePath CONTAINS "Mac Mouse Fix Helper" AND eventMessage CONTAINS "MFSCROLL_"'
+      -o "$SCROLL_LOG_STATUS_FILE" \
+      -e "$SCROLL_LOG_STATUS_FILE" \
+      -- "$DEV_SCRIPT_PATH" logs-record-worker "$SCROLL_LOG_FILE"
     sleep 0.5
     launchctl print "$scroll_log_target" >/dev/null 2>&1 \
-      || die "Log recorder failed to start. See: $SCROLL_LOG_FILE"
+      || die "Log recorder failed to start. See: $SCROLL_LOG_STATUS_FILE"
 
-    echo "==> Recording MFSCROLL logs in the background"
+    echo "==> Recording the latest $SCROLL_LOG_LIMIT MFSCROLL events in the background"
+    echo "    Snapshot: $SCROLL_LOG_FILE"
+    echo "    Run './dev.sh logs-record-snapshot' to refresh it without stopping"
+    echo "    Run './dev.sh logs-record-stop' when the long-running capture is no longer needed"
+    ;;
+
+  logs-record-worker)
+    # Internal launchd entry point. The explicit path argument preserves MMF_SCROLL_LOG_FILE,
+    # since `launchctl submit` does not reliably forward the caller's complete environment.
+    SCROLL_LOG_FILE="${2:-$SCROLL_LOG_FILE}"
+    set_scroll_log_paths
+    /usr/bin/log stream --level debug --style compact \
+      --predicate 'senderImagePath CONTAINS "Mac Mouse Fix Helper" AND eventMessage CONTAINS "MFSCROLL_"' \
+      | store_scroll_log_stream
+    ;;
+
+  logs-record-filter)
+    # Internal test entry point: accepts `log stream`-style lines on stdin.
+    store_scroll_log_stream
+    ;;
+
+  logs-record-snapshot)
+    snapshot_scroll_log
+    echo "==> Refreshed rolling scroll log snapshot"
     echo "    File: $SCROLL_LOG_FILE"
-    echo "    Perform the scroll test, then run './dev.sh logs-record-stop' or tell the coding agent: done"
+    echo "    Events: $(wc -l < "$SCROLL_LOG_FILE" | tr -d ' ') (maximum $SCROLL_LOG_LIMIT)"
     ;;
 
   logs-record-stop)
@@ -405,9 +510,10 @@ case "${1:-run}" in
       die "No background scroll log recorder was found"
     fi
     launchctl bootout "$scroll_log_target"
+    snapshot_scroll_log
     echo "==> Scroll log recording stopped"
     echo "    File: $SCROLL_LOG_FILE"
-    echo "    Lines: $(wc -l < "$SCROLL_LOG_FILE" | tr -d ' ')"
+    echo "    Events: $(wc -l < "$SCROLL_LOG_FILE" | tr -d ' ') (maximum $SCROLL_LOG_LIMIT)"
     ;;
 
   stop)

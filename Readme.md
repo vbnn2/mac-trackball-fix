@@ -100,7 +100,8 @@ Useful commands:
 | `./dev.sh app` | Build and launch only the GUI |
 | `./dev.sh install` | Copy the built app to `/Applications` and launch it |
 | `./dev.sh logs` | Stream live app/helper debug logs |
-| `./dev.sh logs-record` | Record scroll telemetry in the background to `/tmp/mac-trackball-fix-scroll.log` |
+| `./dev.sh logs-record` | Keep a rolling background capture of the latest 2,000 scroll-telemetry events |
+| `./dev.sh logs-record-snapshot` | Refresh `/tmp/mac-trackball-fix-scroll.log` without stopping its recorder |
 | `./dev.sh logs-record-stop` | Stop the background scroll recorder |
 | `./dev.sh logs-dump 30m` | Show the limited logs persisted by macOS |
 | `./dev.sh test` | Build and run the manual `Tests` playground app |
