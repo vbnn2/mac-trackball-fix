@@ -65,6 +65,18 @@ static MFScrollAnimationCurveParameters *_animationParams;
 static ScrollAnalysisResult _lastScrollAnalysisResult;
 static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
 
+/// Slow trackball motion can place more than the normal 500ms gesture timeout between reports. Keep cadence memory
+/// separate from ScrollAnalyzer's gesture grouping so those reports can still form one visually continuous motion.
+/// Explicit state resets (click, app change, config/modifier change) clear this memory.
+static CFTimeInterval _stableSlowCadenceEstimate;
+static double _stablePreviousModeledOutputSpeed;
+
+/// A fast free-spin can be followed by one mechanical one-unit report after the intended motion has ended. Keep
+/// this guard outside ScrollAnalyzer so an unconfirmed rebound cannot change cadence or direction history.
+static BOOL _stableSettlingTailGuardArmed;
+static MFDirection _stableSettlingTailDirection;
+static CFTimeInterval _stableSettlingTailLastFastInputTime;
+
 //static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
 /// Aggregate the events that actually reach applications. The animator can be display-synchronized while integer
@@ -189,6 +201,11 @@ void resetState_Unsafe(void) {
     [_animator cancel];
     [GestureScrollSimulator stopMomentumScroll]; /// Not sure if appropriate
     [ScrollAnalyzer resetState];
+    _stableSlowCadenceEstimate = 0;
+    _stablePreviousModeledOutputSpeed = 0;
+    _stableSettlingTailGuardArmed = NO;
+    _stableSettlingTailDirection = kMFDirectionNone;
+    _stableSettlingTailLastFastInputTime = 0;
 }
 
 //+ (void)suspend {
@@ -543,14 +560,92 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     ///  -> With user settings etc. applied
     
     scrollDirection = [ScrollUtility directionForInputAxis:inputAxis inputDelta:scrollDelta invertSetting:_scrollConfig.u_invertDirection horizontalModifier:(_modifications.effectMod == kMFScrollEffectModificationHorizontalScroll)]; /// Why do we need to get the scrollDirection again? We already calculated it during the "preliminary scrollAnalysis". Can it ever change betweent he 2 times we calculate it?
+
+    /// Intercept the narrow mechanical-rebound signature before ScrollAnalyzer sees it. A blanket late-report drop
+    /// previously made real scroll starts sticky, so this guard is armed only by a fast gesture and only matches a
+    /// one-unit/one-point report. It never releases an isolated report later: that would merely move the burst.
+    ///
+    /// Same-direction ambiguity gets at most one raw pixel when no glide remains; while a glide is active, leaving
+    /// it untouched is the smoothest response. An ambiguous reversal cancels the old direction and emits exactly
+    /// one raw pixel immediately. The guard then disarms, so a genuine continuation never waits for confirmation.
+    int64_t settlingUnits = MAX(1, llabs(lineDelta));
+    int64_t settlingPointDelta = llabs(scrollDelta);
+    CFTimeInterval timeSinceFastInput = _stableSettlingTailLastFastInputTime > 0
+        ? tickTS - _stableSettlingTailLastFastInputTime
+        : DBL_MAX;
+    double rawSettlingVelocity = physicalInputGap > 0 && physicalInputGap != DBL_MAX
+        ? (double)settlingUnits / physicalInputGap
+        : DBL_MAX;
+    BOOL isSettlingTailCandidate = _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia
+        && _stableSettlingTailGuardArmed
+        && timeSinceFastInput >= 0
+        && timeSinceFastInput <= _scrollConfig.stableSettlingTailWindowMax
+        && physicalInputGap >= _scrollConfig.stableFastTailInputGapMin
+        && settlingUnits == 1
+        && settlingPointDelta <= _scrollConfig.stableSettlingTailPointDeltaMax
+        && rawSettlingVelocity <= _scrollConfig.stableFastTailRawVelocityMax;
+
+    if (isSettlingTailCandidate) {
+        BOOL sameDirection = scrollDirection == _stableSettlingTailDirection;
+        double currentAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
+        BOOL animationWasRunning = _animator.isRunning;
+        int64_t immediatePixels = 0;
+
+        if (sameDirection) {
+            if (!animationWasRunning) {
+                immediatePixels = _scrollConfig.stableSettlingTailImmediatePixels;
+                sendScroll(immediatePixels,
+                           scrollDirection,
+                           YES,
+                           kMFAnimationCallbackPhaseNone,
+                           kMFMomentumHintNone,
+                           _scrollConfig,
+                           _modifications);
+            }
+            DDLogDebug("MFSCROLL_TAIL: action=absorb-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=%d immediatePx=%lld guard=disarm",
+                       physicalInputGap * 1000.0,
+                       timeSinceFastInput * 1000.0,
+                       currentAnimationSpeed,
+                       animationWasRunning,
+                       immediatePixels);
+        } else {
+            [_animator cancel];
+            immediatePixels = _scrollConfig.stableSettlingTailImmediatePixels;
+            sendScroll(immediatePixels,
+                       scrollDirection,
+                       YES,
+                       kMFAnimationCallbackPhaseNone,
+                       kMFMomentumHintNone,
+                       _scrollConfig,
+                       _modifications);
+            DDLogDebug("MFSCROLL_TAIL: action=bounded-reversal gapMs=%.1f sinceFastMs=%.1f currentV=%.1f oldDirection=%ld candidateDirection=%ld immediatePx=%lld guard=disarm",
+                       physicalInputGap * 1000.0,
+                       timeSinceFastInput * 1000.0,
+                       currentAnimationSpeed,
+                       (long)_stableSettlingTailDirection,
+                       (long)scrollDirection,
+                       immediatePixels);
+        }
+
+        _stableSettlingTailGuardArmed = NO;
+        _stableSettlingTailDirection = kMFDirectionNone;
+        _stableSettlingTailLastFastInputTime = 0;
+        CFRelease(event);
+        return;
+    }
+
+    if ((_stableSettlingTailGuardArmed && scrollDirection != _stableSettlingTailDirection)
+        || timeSinceFastInput > _scrollConfig.stableSettlingTailWindowMax) {
+        _stableSettlingTailGuardArmed = NO;
+        _stableSettlingTailDirection = kMFDirectionNone;
+        _stableSettlingTailLastFastInputTime = 0;
+    }
     
     /// Run full scrollAnalysis
     ScrollAnalysisResult scrollAnalysisResult = [ScrollAnalyzer updateWithTickOccuringAt:tickTS direction:scrollDirection units:llabs(lineDelta) config:_scrollConfig];
 
-    /// Note [Jul 16 2026]: never drop a lone trailing detent outright. A settling detent and the first tick of a
-    ///     resumed scroll are identical at arrival time. An earlier timing-only heuristic dropped 112 ticks, 87 of
-    ///     which were real scroll starts, producing a sticky delay. The stable path below instead remembers whether
-    ///     this gesture actually became fast and attenuates—rather than discards—one late low-velocity report.
+    /// Any ambiguous one-unit settling report has already been handled above. Reports reaching the analyzer are
+    /// confirmed, substantial, outside the settling window, or were not preceded by a fast gesture.
 
     
     /// Store scrollAnalysisResult
@@ -605,17 +700,19 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     double stableOutputSpeedRatio = 0;
     BOOL stableRateLimited = NO;
     BOOL stableOverloadControlEnabled = NO;
-    BOOL stableActiveResponseInput = NO;
+    BOOL stableHasMeasuredTickInterval = NO;
+    BOOL stableSlowCadenceContinuationForTick = NO;
+    CFTimeInterval stableSlowCadenceForTick = 0;
     /// A new gesture's first report has no cadence measurement. Do not classify that unknown report as "very slow"
     /// and apply the maximum adaptive duration: doing so delays every scroll start by hundreds of milliseconds.
-    /// USB grouping can also make one measured interval look slow during an accelerating spin, so require several
-    /// consecutive slow measurements before fully enabling the speed-derived slow smoothing.
+    /// As soon as the second report supplies a real interval, use the speed-derived blend directly. Counting reports
+    /// here made careful scrolling stay on normal Smoothness for three reports and then jump abruptly to Slow
+    /// Smoothness. Acceleration is already filtered in continuous time by ScrollAnalyzer, so a second history gate
+    /// only adds latency and makes the response depend on report count.
     /// A fast gesture's first sparse tail report must also remain brief, but intentional continued slow movement
     /// must regain adaptive smoothing. Track whether one tail report has already been handled; a second slow report
     /// is evidence of continuation and returns to the normal speed-derived curve.
     double stableAdaptiveSlowSmoothingBlendForTick = 0.0;
-    static NSUInteger stableConsecutiveSlowReportCount = 0;
-    NSUInteger stableSlowReportCountForTick = 0;
     static BOOL stableGestureReachedFastSpeed = NO;
     static BOOL stableFastTailReportHandled = NO;
     BOOL stableFastTailReport = NO;
@@ -629,7 +726,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         
         /// Get tickInterval
         double timeBetweenTicks = scrollAnalysisResult.timeBetweenTicks;
-        BOOL hasMeasuredTickInterval = timeBetweenTicks != DBL_MAX;
+        stableHasMeasuredTickInterval = timeBetweenTicks != DBL_MAX;
         
         /// Validate tickInterval
         assert(timeBetweenTicks == DBL_MAX
@@ -695,29 +792,79 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         /// instead. The first report has no interval, so retain the old bounded-start behavior for that one report.
         pxForThisTickBeforeRateLimit = pxForThisTickDouble;
         stableOverloadControlEnabled = _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
-        stableActiveResponseInput = stableOverloadControlEnabled
-            && hasMeasuredTickInterval
-            && physicalInputGap <= _scrollConfig.stableActiveResponseInputGapMax;
-
-        if (stableOverloadControlEnabled && !hasMeasuredTickInterval) {
-            stableAdaptiveSlowSmoothingBlendForTick = 0.0;
-            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=unknown action=use-normal-smoothness");
-        }
 
         double modeledOutputSpeed = _scrollConfig.pxAtRefSpeed
             * _scrollConfig.refSpeed
             * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma);
         stableOutputSpeedRatio = modeledOutputSpeed / _scrollConfig.stableMaximumOutputSpeed;
 
+        /// A timeout only says that the animator/analyzer should start a new gesture. It does not prove that sparse
+        /// trackball movement stopped. Cadence is a scalar timing signal, so preserve it through a small slow
+        /// reversal while the direction-change path below cancels the old-direction animator immediately. Reject a
+        /// late tail after fast motion and any larger accelerating report.
+        double adaptiveSpeedEnd = _scrollConfig.stableMaximumOutputSpeed
+            * _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio;
+        double slowCadenceSpeedMax = MIN(adaptiveSpeedEnd, _scrollConfig.stableFastGestureSpeed);
+        BOOL previousInputWasSlow = _stablePreviousModeledOutputSpeed > 0
+            && _stablePreviousModeledOutputSpeed < slowCadenceSpeedMax;
+        stableSlowCadenceContinuationForTick = stableOverloadControlEnabled
+            && firstConsecutive
+            && previousInputWasSlow
+            && unitsForThisTick <= 2
+            && (scrollAnalysisResult.scrollDirectionDidChange
+                || physicalInputGap > _scrollConfig.consecutiveScrollTickIntervalMax)
+            && physicalInputGap <= _scrollConfig.stableSlowCadenceMemoryMaxInterval;
+
+        if (stableSlowCadenceContinuationForTick) {
+            if (_stableSlowCadenceEstimate <= 0) {
+                _stableSlowCadenceEstimate = physicalInputGap;
+            } else {
+                _stableSlowCadenceEstimate += _scrollConfig.stableSlowCadenceEstimateAlpha
+                    * (physicalInputGap - _stableSlowCadenceEstimate);
+            }
+            stableSlowCadenceForTick = _stableSlowCadenceEstimate;
+            stableAdaptiveSlowSmoothingBlendForTick = 1.0;
+            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=remembered gapMs=%.1f estimateMs=%.1f reversal=%d action=use-slow-smoothness",
+                       physicalInputGap * 1000.0,
+                       stableSlowCadenceForTick * 1000.0,
+                       scrollAnalysisResult.scrollDirectionDidChange);
+        } else if (stableOverloadControlEnabled && !stableHasMeasuredTickInterval) {
+            stableAdaptiveSlowSmoothingBlendForTick = 0.0;
+            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=unknown action=use-normal-smoothness");
+        }
+
+        if (stableOverloadControlEnabled
+            && stableHasMeasuredTickInterval
+            && modeledOutputSpeed < slowCadenceSpeedMax
+            && unitsForThisTick <= 2) {
+            if (_stableSlowCadenceEstimate <= 0) {
+                _stableSlowCadenceEstimate = physicalInputGap;
+            } else {
+                _stableSlowCadenceEstimate += _scrollConfig.stableSlowCadenceEstimateAlpha
+                    * (physicalInputGap - _stableSlowCadenceEstimate);
+            }
+        } else if (unitsForThisTick > 2
+                   || modeledOutputSpeed >= slowCadenceSpeedMax
+                   || (firstConsecutive
+                       && physicalInputGap > _scrollConfig.stableSlowCadenceMemoryMaxInterval)) {
+            /// Acceleration invalidates the slow prediction on the same report. Its duration and velocity are then
+            /// derived from current input, and the animator's retarget curve begins responding immediately.
+            _stableSlowCadenceEstimate = 0;
+        }
+
+        _stablePreviousModeledOutputSpeed = modeledOutputSpeed;
+
         if (firstConsecutive) {
             stableGestureReachedFastSpeed = NO;
             stableFastTailReportHandled = NO;
-            stableConsecutiveSlowReportCount = 0;
         }
         if (modeledOutputSpeed >= _scrollConfig.stableFastGestureSpeed) {
             stableGestureReachedFastSpeed = YES;
             /// Re-arm after every genuinely fast section, including fast -> slow -> fast within one gesture.
             stableFastTailReportHandled = NO;
+            _stableSettlingTailGuardArmed = YES;
+            _stableSettlingTailDirection = scrollDirection;
+            _stableSettlingTailLastFastInputTime = tickTS;
         }
 
         /// Hardware traces show the visible secondary burst as a real ~50px report arriving 150–320ms after a
@@ -752,42 +899,22 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                        pxForThisTickDouble);
         }
 
-        if (stableOverloadControlEnabled) {
-            NSUInteger confirmationReports = MAX(1, _scrollConfig.stableSlowSmoothingConfirmationReports);
-            BOOL isMeasuredSlowReport = hasMeasuredTickInterval
-                && stableOutputSpeedRatio < _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio;
-
-            if (!isMeasuredSlowReport) {
-                stableConsecutiveSlowReportCount = 0;
-            } else if (stableConsecutiveSlowReportCount < confirmationReports) {
-                stableConsecutiveSlowReportCount += 1;
-            }
-
-            stableSlowReportCountForTick = stableConsecutiveSlowReportCount;
-            if (confirmationReports == 1) {
-                stableAdaptiveSlowSmoothingBlendForTick = isMeasuredSlowReport ? 1.0 : 0.0;
-            } else if (stableConsecutiveSlowReportCount > 0) {
-                stableAdaptiveSlowSmoothingBlendForTick = CLIP(
-                    (double)(stableConsecutiveSlowReportCount - 1) / (double)(confirmationReports - 1),
-                    0.0,
-                    1.0);
-            }
-
-            if (stableFastTailReport) {
-                /// Preserve the existing tail rule: the first sparse settling report stays brief, while a second
-                /// report proves intentional continued movement and may regain full adaptive smoothing.
-                stableConsecutiveSlowReportCount = MAX(stableConsecutiveSlowReportCount,
-                                                       confirmationReports - 1);
-                stableSlowReportCountForTick = stableConsecutiveSlowReportCount;
+        if (stableOverloadControlEnabled
+            && (stableHasMeasuredTickInterval || stableSlowCadenceContinuationForTick)) {
+            stableAdaptiveSlowSmoothingBlendForTick = 1.0;
+            if (stableFastTailReport && stableHasMeasuredTickInterval) {
+                /// Preserve the existing tail rule: one isolated settling report stays brief in proportion to how
+                /// much visible motion is still continuous. The next measured report returns to direct speed-based
+                /// adaptation without waiting for an event counter.
                 stableAdaptiveSlowSmoothingBlendForTick = stableFastTailContinuity;
             }
         }
 
         if (stableOverloadControlEnabled) {
-            double rateInterval = hasMeasuredTickInterval
+            double rateInterval = stableHasMeasuredTickInterval
                 ? MAX(scrollAnalysisResult.DEBUG_timeBetweenTicksRaw, _scrollConfig.velocityMeasurementIntervalMin)
                 : 0;
-            stableRateLimitPx = hasMeasuredTickInterval
+            stableRateLimitPx = stableHasMeasuredTickInterval
                 ? _scrollConfig.stableMaximumOutputSpeed * rateInterval
                 : _scrollConfig.stableMaximumInitialDistance;
 
@@ -1063,22 +1190,29 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 double effectiveDurationFactor = 0.4 + effectiveSmoothnessAmount * 1.2;
                 baseDuration *= effectiveDurationFactor / selectedDurationFactor;
             }
+            if (stableSlowCadenceContinuationForTick) {
+                /// Aim the full hybrid response at the observed sparse cadence. TouchAnimator's biased subpixelator
+                /// still emits a pixel on the first display frame, while the remaining distance is distributed far
+                /// enough to overlap the likely next report. A faster report replans this curve immediately.
+                double cadenceDuration = MIN(
+                    stableSlowCadenceForTick * _scrollConfig.stableSlowCadenceBaseDurationRatio,
+                    _scrollConfig.stableSlowCadenceBaseDurationMax);
+                baseDuration = MAX(baseDuration, cadenceDuration);
+            }
             if (stableFastTailReport) {
                 double durationScale = _scrollConfig.stableFastTailDurationScale
                     + stableFastTailContinuity * (1.0 - _scrollConfig.stableFastTailDurationScale);
                 baseDuration *= durationScale;
             }
-            if (stableActiveResponseInput && !stableFastTailReport) {
-                /// Slow Smoothness is useful to prevent an isolated sparse tick from looking abrupt, but once the
-                /// ring is still feeding us reports it must not make the visible page motion trail the input by
-                /// hundreds of milliseconds. Keep velocity grouping intact and bound only the response curve.
-                baseDuration = MIN(baseDuration, _scrollConfig.stableActiveResponseBaseDurationMax);
-            }
-            
+
             /// Get curve and duration
             
             double duration;
             Curve *c;
+            BOOL velocityRetargeted = NO;
+            double retargetStartSpeed = magnitudeOfVector(currentSpeed);
+            double retargetTargetSpeed = delta / baseDuration;
+            double retargetBlendDuration = 0.0;
             
             if (!pCurve.useDragCurve) {
                 
@@ -1095,6 +1229,36 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 
                 Bezier *baseCurve = pCurve.baseCurve;
                 double speedSmoothing = pCurve.speedSmoothing;
+
+                /// Regular scrolling normally uses a linear base curve. Restarting that curve for every hardware
+                /// report preserves remaining distance but throws away the animator's velocity: output jumps to the
+                /// new curve's average speed. Build a short cubic transition whose initial slope exactly matches the
+                /// current output speed and whose exit slope reaches the new distance/duration target. New input
+                /// therefore begins accelerating on this report while velocity remains continuous across the frame.
+                if (stableOverloadControlEnabled
+                    && isRunning
+                    && baseCurve != nil
+                    && retargetStartSpeed > 0.0
+                    && delta > 0.0
+                    && baseDuration > 0.0) {
+                    retargetBlendDuration = MIN(24.0 / 1000.0, baseDuration * 0.25);
+                    double blendUnit = CLIP(retargetBlendDuration / baseDuration, 0.001, 0.25);
+                    double startSlope = retargetStartSpeed * baseDuration / delta;
+                    double p2x = 1.0 - blendUnit;
+                    double p2y = p2x; /// Exit slope 1.0 -> `delta / baseDuration`.
+                    double p1x = blendUnit;
+                    if (startSlope > 0.0 && startSlope * p1x > p2y) {
+                        p1x = MAX(0.001, p2y / startSlope);
+                    }
+                    double p1y = CLIP(startSlope * p1x, 0.0, p2y);
+                    baseCurve = [[Bezier alloc] initWithControlPoints:@[
+                        @[@0, @0],
+                        @[@(p1x), @(p1y)],
+                        @[@(p2x), @(p2y)],
+                        @[@1, @1],
+                    ] defaultEpsilon:0.01];
+                    velocityRetargeted = YES;
+                }
                 if (baseCurve == nil) {
                     
                     /// Create baseCurve as speedSmoothing curve.
@@ -1123,17 +1287,6 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                     effectiveDragCoefficient += stableFastness
                         * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
                 }
-                if (stableOverloadControlEnabled && firstConsecutive) {
-                    /// The first report is a small startup impulse, not established motion. Do not let the user's
-                    /// normal long Glide tail turn its short response phase back into a perceptible slow ramp.
-                    effectiveDragCoefficient = MAX(effectiveDragCoefficient,
-                                                   _scrollConfig.stableInitialResponseDragCoefficient);
-                }
-                if (stableActiveResponseInput && !stableFastTailReport) {
-                    effectiveDragCoefficient = MAX(effectiveDragCoefficient,
-                                                   _scrollConfig.stableActiveResponseDragCoefficient);
-                }
-
                 HybridCurve *hc = [[BezierHybridCurve alloc]
                      initWithBaseCurve:baseCurve
                      minDuration:baseDuration
@@ -1169,15 +1322,7 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                 effectiveDragCoefficientForLog += stableFastness
                     * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
             }
-            if (stableOverloadControlEnabled && firstConsecutive && pCurve.useDragCurve) {
-                effectiveDragCoefficientForLog = MAX(effectiveDragCoefficientForLog,
-                                                     _scrollConfig.stableInitialResponseDragCoefficient);
-            }
-            if (stableActiveResponseInput && !stableFastTailReport && pCurve.useDragCurve) {
-                effectiveDragCoefficientForLog = MAX(effectiveDragCoefficientForLog,
-                                                     _scrollConfig.stableActiveResponseDragCoefficient);
-            }
-            DDLogDebug("MFSCROLL_LEGACY: rawV=%.1f filteredV=%.1f rawPx=%.1f tickPx=%lld rateCapPx=%.1f limited=%d retainedPx=%.1f carryCapPx=%.1f droppedPx=%.1f totalPx=%.1f currentV=%.1f smoothness=%.2f adaptiveBlend=%.2f slowConfirm=%lu activeInput=%d baseMs=%.1f durationMs=%.1f glideCoeff=%.2f cadenceMs=%.2f direction=%ld",
+            DDLogDebug("MFSCROLL_LEGACY: rawV=%.1f filteredV=%.1f rawPx=%.1f tickPx=%lld rateCapPx=%.1f limited=%d retainedPx=%.1f carryCapPx=%.1f droppedPx=%.1f totalPx=%.1f currentV=%.1f smoothness=%.2f adaptiveBlend=%.2f cadenceKnown=%d slowCadence=%d cadenceTargetMs=%.1f retarget=%d targetV=%.1f blendMs=%.1f baseMs=%.1f durationMs=%.1f glideCoeff=%.2f cadenceMs=%.2f direction=%ld",
                        scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
                        scrollAnalysisResult.velocityInUnitsPerSecond,
                        pxForThisTickBeforeRateLimit,
@@ -1191,8 +1336,12 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
                        magnitudeOfVector(currentSpeed),
                        effectiveSmoothnessAmount,
                        stableAdaptiveSlowSmoothingBlendForTick,
-                       (unsigned long)stableSlowReportCountForTick,
-                       stableActiveResponseInput,
+                       stableHasMeasuredTickInterval,
+                       stableSlowCadenceContinuationForTick,
+                       stableSlowCadenceForTick * 1000.0,
+                       velocityRetargeted,
+                       retargetTargetSpeed,
+                       retargetBlendDuration * 1000.0,
                        baseDuration * 1000.0,
                        duration * 1000.0,
                        effectiveDragCoefficientForLog,

@@ -363,31 +363,16 @@ import Cocoa
     /// across the normal ~160ms base curve.
     @objc let stableInitialResponseBaseDurationMax: TimeInterval = 80.0 / 1000.0
 
-    /// The normal Glide setting intentionally gives established motion a long release tail, but applying that tail
-    /// to the first small report can more than double the capped duration above. Use high friction for that report
-    /// only; the next report immediately returns to the user's configured Glide behavior.
-    @objc let stableInitialResponseDragCoefficient: Double = 40.0
+    /// Keep enough cadence history to recognize extremely slow same-direction trackball movement even when its
+    /// reports cross the 500ms gesture-grouping timeout. Acceleration, direction changes, clicks, and target changes
+    /// clear this memory immediately.
+    @objc let stableSlowCadenceMemoryMaxInterval: TimeInterval = 1.5
+    @objc let stableSlowCadenceEstimateAlpha: Double = 0.5
 
-    /// Only a rapid report burst needs the short response treatment. Deliberate slow ring movement commonly emits
-    /// one report every 160–260ms; it needs the normal longer curve to overlap the next report, otherwise the page
-    /// visibly scrolls, pauses, then scrolls again. This is intentionally far shorter than the 500ms grouping
-    /// window, which still preserves velocity estimation and gesture continuity for slow input.
-    @objc let stableActiveResponseInputGapMax: TimeInterval = 100.0 / 1000.0
-
-    /// During a rapid input burst, bound the directly-driven portion of each follow-up report. The normal Low
-    /// Inertia curve can otherwise grow to 270ms after slow smoothing is confirmed, which makes an accelerating
-    /// gesture visibly lag even though events are delivered on time.
-    @objc let stableActiveResponseBaseDurationMax: TimeInterval = 110.0 / 1000.0
-
-    /// Apply stronger friction during a rapid burst so Glide remains a release effect rather than extending every
-    /// fresh report into a long tail. The configured Glide coefficient resumes for slow or sparse input.
-    @objc let stableActiveResponseDragCoefficient: Double = 32.0
-
-    /// USB report grouping can make the second report of an accelerating spin arrive 100–200ms late. Treating that
-    /// single interval as deliberate slow movement immediately selects maximum Slow Smoothness and creates a false
-    /// stall. Require sustained evidence, blending from normal smoothness on report 1 to full slow smoothing on
-    /// report 3. Fast input still selects normal smoothness through the speed curve itself.
-    @objc let stableSlowSmoothingConfirmationReports: Int = 3
+    /// The HybridCurve's drag portion extends beyond its base duration, so target 75% of the observed cadence here.
+    /// The cap limits the tail after a single very sparse report; incoming input always replans it immediately.
+    @objc let stableSlowCadenceBaseDurationRatio: Double = 0.75
+    @objc let stableSlowCadenceBaseDurationMax: TimeInterval = 900.0 / 1000.0
 
     /// Keep the first report bounded even though the sustained speed ceiling is intentionally high. The first report
     /// has no measured duration, so applying the full pixels/second ceiling to an assumed interval would create a
@@ -425,6 +410,14 @@ import Cocoa
     @objc let stableFastTailContinuitySpeed: Double = 400.0
     @objc let stableFastTailDistanceScale: Double = 0.25
     @objc let stableFastTailDurationScale: Double = 0.55
+
+    /// After a fast free-spin, the hardware can emit one final one-unit report after the visible motion is already
+    /// settling. Treat only that narrow signature as ambiguous. Same-direction reports may contribute one raw pixel
+    /// without restarting the curve; opposite reports stop the old motion and contribute only their raw pixel rather
+    /// than an accelerated burst. The guard then disarms, so every later report is handled immediately.
+    @objc let stableSettlingTailWindowMax: TimeInterval = 800.0 / 1000.0
+    @objc let stableSettlingTailPointDeltaMax: Int64 = 1
+    @objc let stableSettlingTailImmediatePixels: Int64 = 1
 
     // MARK: Invert ball scrolling (fork)
 

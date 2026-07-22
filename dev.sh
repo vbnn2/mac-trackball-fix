@@ -71,14 +71,20 @@ snapshot_scroll_log() {
   local segments=("$SCROLL_LOG_SEGMENT_PREFIX".*)
   local segment
 
+  # Never replace a readable capture with an empty file when the recorder has stopped or failed before creating
+  # its first segment. This is especially important because the readable snapshot may be the only copy left after
+  # a reproduction session.
+  if [ ! -e "${segments[0]}" ]; then
+    echo "!! No rolling log segments were found; keeping the existing snapshot unchanged" >&2
+    return 1
+  fi
+
   {
-    if [ -e "${segments[0]}" ]; then
-      # The zero-padded sequence numbers make shell glob order chronological.
-      for segment in "${segments[@]}"; do
-        # A live recorder may rotate the oldest segment after the glob expands.
-        [ -f "$segment" ] && /bin/cat "$segment" || true
-      done
-    fi
+    # The zero-padded sequence numbers make shell glob order chronological.
+    for segment in "${segments[@]}"; do
+      # A live recorder may rotate the oldest segment after the glob expands.
+      [ -f "$segment" ] && /bin/cat "$segment" || true
+    done
   } | /usr/bin/tail -n "$SCROLL_LOG_LIMIT" > "$snapshot_file"
 
   /bin/mv -f "$snapshot_file" "$SCROLL_LOG_FILE"
