@@ -49,6 +49,44 @@ class TouchAnimator: TouchAnimatorBase {
     
     var subPixelator = VectorSubPixelator.biased()
     /// ^ This biased subpixelator should make SubTouchAnimator  also work negative value ranges. So it can also be properly used for for momentum scrolling in GestureScrollAnimator.m
+
+    /// A new input can recover an already-stalled display link, but a cold start has no later input to drive that
+    /// check. Keep one generation-scoped watchdog for the interval before the first callback. It does not delay or
+    /// replace the normal start; it only retries the same animation if CoreVideo accepted the start request but
+    /// produced no callback.
+    private var coldStartWatchdogGeneration: UInt64 = 0
+    private let coldStartWatchdogDelay: CFTimeInterval = 0.110
+    private let coldStartWatchdogMaxAttempts = 3
+
+    private func armColdStartWatchdog_Unsafe() {
+        coldStartWatchdogGeneration &+= 1
+        scheduleColdStartWatchdog_Unsafe(generation: coldStartWatchdogGeneration, attempt: 1)
+    }
+
+    private func scheduleColdStartWatchdog_Unsafe(generation: UInt64, attempt: Int) {
+        displayLink.dispatchQueue.asyncAfter(deadline: .now() + coldStartWatchdogDelay) { [weak self] in
+            guard let self,
+                  generation == self.coldStartWatchdogGeneration,
+                  self.isFirstDisplayLinkCallback_AfterColdStart,
+                  self.isRunning_Unsafe,
+                  self.displayLink.invalidateIfStalled_Unsafe() else {
+                return
+            }
+
+            DDLogInfo("MFSCROLL_DISPLAY: action=watchdog-cold-restart attempt=\(attempt)")
+
+            /// `invalidateIfStalled_Unsafe` enqueues CoreVideo's stop on the main queue. `start_Unsafe` enqueues the
+            /// matching start behind it, preserving order. Animator state and the original input distance remain
+            /// untouched, so the eventual first callback still takes the ordinary cold-start path.
+            self.displayLink.start_Unsafe(callback: { [unowned self] timeInfo in
+                self.displayLinkCallback(timeInfo)
+            })
+
+            if attempt < self.coldStartWatchdogMaxAttempts {
+                self.scheduleColdStartWatchdog_Unsafe(generation: generation, attempt: attempt + 1)
+            }
+        }
+    }
     
     
     // MARK: Other interface
@@ -72,6 +110,24 @@ class TouchAnimator: TouchAnimatorBase {
                      integerCallback: @escaping TouchAnimatorCallback) {
         
         displayLink.dispatchQueue.async(flags: defaultDFs) {
+
+            /// A CVDisplayLink can remain in requested-running state while its display has stopped delivering
+            /// callbacks. Retargeting that zombie animator never calls `start_Unsafe`, so scrolling stays frozen
+            /// until pointer movement wakes the display. Invalidate it before calculating params; the ordinary
+            /// cold-start path below then restarts it immediately without delaying healthy input.
+            let recoveredStalledDisplayLink = self.displayLink.invalidateIfStalled_Unsafe()
+            if recoveredStalledDisplayLink {
+                if self.thisAnimationHasProducedDeltas,
+                   let staleCallback = self.clientCallback as? TouchAnimatorCallback {
+                    staleCallback(Vector(x: 0, y: 0),
+                                  kMFAnimationCallbackPhaseCanceled,
+                                  self.lastMomentumHint)
+                }
+                self.thisAnimationHasProducedDeltas = false
+                self.lastAnimationSpeed = Vector(x: 0, y: 0)
+                self.subPixelator.reset()
+                DDLogInfo("MFSCROLL_DISPLAY: action=animator-cold-restart")
+            }
             
             /// Get startParams
             
@@ -96,8 +152,13 @@ class TouchAnimator: TouchAnimatorBase {
             /// ^ This is always true for some reason. Make sure to actually pass a Vector in an NSValue! Edit: Randomly, this starting working on 29.05.22
             
             /// Start animator
-            
+
+            let startsCold = !self.isRunning_Unsafe
             super.startWithUntypedCallback_Unsafe(durationRaw: p["duration"] as! Double?, durationRawInFrames: p["durationInFrames"] as! Int?, value: vectorFromNSValue(p["vector"] as! NSValue), animationCurve: p["curve"] as! Curve, callback: integerCallback)
+
+            if startsCold {
+                self.armColdStartWatchdog_Unsafe()
+            }
             
             /// Debug
             

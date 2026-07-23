@@ -56,6 +56,9 @@ typedef void(^DisplayLinkCallback)(DisplayLinkCallbackTimeInfo timeInfo);
 - (void)stop_Unsafe;
 - (BOOL)isRunning;
 - (BOOL)isRunning_Unsafe;
+/// Marks a requested-running link as stopped when it has produced no callbacks for 100 ms.
+/// Must be called on `dispatchQueue`. The next normal animator start recreates the cold-start timing state.
+- (BOOL)invalidateIfStalled_Unsafe;
 
 - (CFTimeInterval)bestTimeBetweenFramesEstimate;
 - (CFTimeInterval)timeBetweenFrames;

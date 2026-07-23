@@ -53,6 +53,7 @@ typedef enum {
     MFDisplayLinkRequestedState _requestedState;
     MFDisplayLinkWorkType _optimizedWorkType;
     CFTimeInterval _lastCallbackTime;
+    CFTimeInterval _requestedStartTime;
 }
 
 @synthesize dispatchQueue=_displayLinkQueue;
@@ -287,6 +288,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     /// Set requestedState
     ///     before async dispatching to main -> so that isRunning() works properly
     _lastCallbackTime = 0;
+    _requestedStartTime = CACurrentMediaTime();
     _requestedState = kMFDisplayLinkRequestedStateRunning;
     
     /// Make sure block is running on the main thread
@@ -367,6 +369,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         ///     before async dispatching to main -> so that isRunning() works properly
         
         _requestedState = kMFDisplayLinkRequestedStateStopped;
+        _requestedStartTime = 0;
         
         if ((NO)) {
             
@@ -420,6 +423,41 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     
     /// Return
     return result;
+}
+
+- (BOOL)invalidateIfStalled_Unsafe {
+
+    /// `isRunning_Unsafe` intentionally reflects requested state, because CVDisplayLink start/stop happens
+    /// asynchronously on the main queue. That means a parked CVDisplayLink can remain "running" forever even
+    /// though it has stopped delivering frames. New input then only retargets the old animator and cannot restart
+    /// the underlying link. Pointer movement happens to wake the display, which made this look mouse-dependent.
+    if (_requestedState != kMFDisplayLinkRequestedStateRunning) {
+        return NO;
+    }
+
+    CFTimeInterval now = CACurrentMediaTime();
+    CFTimeInterval lastActivity = _lastCallbackTime > 0 ? _lastCallbackTime : _requestedStartTime;
+    CFTimeInterval stalledFor = lastActivity > 0 ? now - lastActivity : 0;
+    if (stalledFor <= 0.100) {
+        return NO;
+    }
+
+    /// Change requested state before scheduling CoreVideo work so the animator's normal start path performs a
+    /// cold start. Stop and the subsequent start are both enqueued on the serial main queue, preserving order.
+    _requestedState = kMFDisplayLinkRequestedStateStopped;
+    _lastCallbackTime = 0;
+    _requestedStartTime = 0;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CVReturn stopResult = CVDisplayLinkStop(self->_displayLink);
+        DDLogInfo("MFSCROLL_DISPLAY: action=recover-stall link=%{public}@ display=%u stalledMs=%.2f stopResult=%d",
+                  [self identifier],
+                  self->_previousDisplayUnderMousePointer,
+                  stalledFor * 1000.0,
+                  stopResult);
+    });
+
+    return YES;
 }
 
 #pragma mark - Other interface

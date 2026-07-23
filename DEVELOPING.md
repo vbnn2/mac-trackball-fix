@@ -273,6 +273,9 @@ keep those ranges synchronized when changing a tuning formula.
 
 ### Rules for coding agents
 
+- Before any scroll diagnosis or change, read
+  `Helper/Core/Scroll/SCROLL_REGRESSION_LOG.md` in full. Preserve its invariants, run the adjacent regression cases,
+  and append a dated entry for every material scroll fix.
 - Build the `App` scheme so the Helper is embedded. Do not run the standalone Helper product.
 - Use `./dev.sh`; do not treat the upstream `./run` localization tool as the build entry point.
 - Preserve unrelated work in a dirty tree and keep fork changes marked with `Fork:` where the

@@ -412,12 +412,15 @@ import Cocoa
     @objc let stableFastTailDurationScale: Double = 0.55
 
     /// After a fast free-spin, the hardware can emit one final one-unit report after the visible motion is already
-    /// settling. Treat only that narrow signature as ambiguous. Same-direction reports may contribute one raw pixel
-    /// without restarting the curve; opposite reports stop the old motion and contribute only their raw pixel rather
-    /// than an accelerated burst. The guard then disarms, so every later report is handled immediately.
+    /// settling. Treat only that narrow signature as ambiguous. Same-direction reports leave a live glide alone.
+    /// When no useful glide exists, emit a short, bounded micro-glide: large enough that a deliberate first report is
+    /// visible, but much smaller than the normal accelerated tick so mechanical settling cannot become a second
+    /// gesture. A new report cancels/retargets this animator immediately.
     @objc let stableSettlingTailWindowMax: TimeInterval = 800.0 / 1000.0
     @objc let stableSettlingTailPointDeltaMax: Int64 = 1
-    @objc let stableSettlingTailImmediatePixels: Int64 = 1
+    @objc let stableSettlingTailResponsiveDistanceMax: Int64 = 10
+    @objc let stableSettlingTailResponsiveDistanceMin: Int64 = 4
+    @objc let stableSettlingTailResponsiveDuration: TimeInterval = 50.0 / 1000.0
 
     // MARK: Invert ball scrolling (fork)
 

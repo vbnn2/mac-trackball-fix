@@ -141,6 +141,60 @@ static void legacyRecordOutput(int64_t px, MFDirection direction) {
 
 static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications);
 
+/// Give an ambiguous one-unit settling report a visible but tightly bounded response. This deliberately bypasses
+/// ScrollAnalyzer so a possible mechanical rebound cannot change cadence/direction history. The normal TouchAnimator
+/// queue still makes a following real report cancel or retarget this motion immediately.
+static void startSettlingTailMicroGlide(int64_t distance,
+                                       MFDirection direction,
+                                       CFTimeInterval inputTime,
+                                       double inputQueueDelayMs,
+                                       ScrollConfig *config,
+                                       MFScrollModificationResult modifications) {
+    ScrollConfig *configForBlock = config;
+    MFScrollModificationResult modificationsForBlock = modifications;
+
+    [_animator startWithParams:^NSDictionary<NSString *,id> * _Nonnull(Vector valueLeft,
+                                                                        BOOL isRunning,
+                                                                        Curve *animationCurve,
+                                                                        Vector currentSpeed) {
+        (void)valueLeft;
+        (void)isRunning;
+        (void)animationCurve;
+        (void)currentSpeed;
+
+        /// This is a standalone bounded response, never retained distance from the old gesture.
+        [_animator resetSubPixelator_Unsafe];
+        Bezier *curve = [[Bezier alloc] initWithControlPoints:@[
+            @[@0, @0],
+            @[@0.20, @0.50],
+            @[@0.55, @0.90],
+            @[@1, @1],
+        ] defaultEpsilon:0.01];
+        return @{
+            @"duration": @(configForBlock.stableSettlingTailResponsiveDuration),
+            @"vector": nsValueFromVector(vectorFromDeltaAndDirection(distance, direction)),
+            @"curve": curve,
+        };
+    } integerCallback:^(Vector distanceDeltaVec,
+                        MFAnimationCallbackPhase animationPhase,
+                        MFMomentumHint momentumHint) {
+        int64_t distanceDelta = (int64_t)magnitudeOfVector(distanceDeltaVec);
+        if (animationPhase == kMFAnimationCallbackPhaseStart) {
+            DDLogDebug("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f path=settling-micro-glide",
+                       MAX(0.0, (CACurrentMediaTime() - inputTime) * 1000.0),
+                       inputQueueDelayMs);
+        }
+        legacyRecordOutput(distanceDelta, direction);
+        sendScroll(distanceDelta,
+                   direction,
+                   YES,
+                   animationPhase,
+                   momentumHint,
+                   configForBlock,
+                   modificationsForBlock);
+    }];
+}
+
 #pragma mark - Public functions
 
 + (void)load_Manual {
@@ -565,9 +619,10 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
     /// previously made real scroll starts sticky, so this guard is armed only by a fast gesture and only matches a
     /// one-unit/one-point report. It never releases an isolated report later: that would merely move the burst.
     ///
-    /// Same-direction ambiguity gets at most one raw pixel when no glide remains; while a glide is active, leaving
-    /// it untouched is the smoothest response. An ambiguous reversal cancels the old direction and emits exactly
-    /// one raw pixel immediately. The guard then disarms, so a genuine continuation never waits for confirmation.
+    /// Same-direction ambiguity leaves an active glide untouched. With no useful motion, a bounded micro-glide makes
+    /// an intentional isolated report visible without amplifying mechanical settling into a full accelerated tick.
+    /// An ambiguous reversal cancels the old direction and starts the same bounded response immediately. The guard
+    /// then disarms, so a genuine continuation never waits for confirmation.
     int64_t settlingUnits = MAX(1, llabs(lineDelta));
     int64_t settlingPointDelta = llabs(scrollDelta);
     CFTimeInterval timeSinceFastInput = _stableSettlingTailLastFastInputTime > 0
@@ -589,42 +644,51 @@ static void heavyProcessing(CGEventRef event, int64_t scrollDeltaAxis1, int64_t 
         BOOL sameDirection = scrollDirection == _stableSettlingTailDirection;
         double currentAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
         BOOL animationWasRunning = _animator.isRunning;
-        int64_t immediatePixels = 0;
+        double activeMotionUnit = CLIP(
+            currentAnimationSpeed / _scrollConfig.stableFastTailContinuitySpeed,
+            0.0,
+            1.0);
+        int64_t microGlidePixels = (int64_t)llround(
+            _scrollConfig.stableSettlingTailResponsiveDistanceMax
+            + activeMotionUnit
+            * (_scrollConfig.stableSettlingTailResponsiveDistanceMin
+               - _scrollConfig.stableSettlingTailResponsiveDistanceMax));
+        BOOL microGlideStarted = NO;
 
         if (sameDirection) {
             if (!animationWasRunning) {
-                immediatePixels = _scrollConfig.stableSettlingTailImmediatePixels;
-                sendScroll(immediatePixels,
-                           scrollDirection,
-                           YES,
-                           kMFAnimationCallbackPhaseNone,
-                           kMFMomentumHintNone,
-                           _scrollConfig,
-                           _modifications);
+                startSettlingTailMicroGlide(microGlidePixels,
+                                            scrollDirection,
+                                            tickTS,
+                                            inputQueueDelayMs,
+                                            _scrollConfig,
+                                            _modifications);
+                microGlideStarted = YES;
             }
-            DDLogDebug("MFSCROLL_TAIL: action=absorb-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=%d immediatePx=%lld guard=disarm",
+            DDLogDebug("MFSCROLL_TAIL: action=%{public}@ gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=%d microPx=%lld durationMs=%.1f guard=disarm",
+                       microGlideStarted ? @"micro-same" : @"continue-same",
                        physicalInputGap * 1000.0,
                        timeSinceFastInput * 1000.0,
                        currentAnimationSpeed,
                        animationWasRunning,
-                       immediatePixels);
+                       microGlideStarted ? microGlidePixels : 0,
+                       microGlideStarted ? _scrollConfig.stableSettlingTailResponsiveDuration * 1000.0 : 0.0);
         } else {
             [_animator cancel];
-            immediatePixels = _scrollConfig.stableSettlingTailImmediatePixels;
-            sendScroll(immediatePixels,
-                       scrollDirection,
-                       YES,
-                       kMFAnimationCallbackPhaseNone,
-                       kMFMomentumHintNone,
-                       _scrollConfig,
-                       _modifications);
-            DDLogDebug("MFSCROLL_TAIL: action=bounded-reversal gapMs=%.1f sinceFastMs=%.1f currentV=%.1f oldDirection=%ld candidateDirection=%ld immediatePx=%lld guard=disarm",
+            startSettlingTailMicroGlide(microGlidePixels,
+                                        scrollDirection,
+                                        tickTS,
+                                        inputQueueDelayMs,
+                                        _scrollConfig,
+                                        _modifications);
+            DDLogDebug("MFSCROLL_TAIL: action=micro-reversal gapMs=%.1f sinceFastMs=%.1f currentV=%.1f oldDirection=%ld candidateDirection=%ld microPx=%lld durationMs=%.1f guard=disarm",
                        physicalInputGap * 1000.0,
                        timeSinceFastInput * 1000.0,
                        currentAnimationSpeed,
                        (long)_stableSettlingTailDirection,
                        (long)scrollDirection,
-                       immediatePixels);
+                       microGlidePixels,
+                       _scrollConfig.stableSettlingTailResponsiveDuration * 1000.0);
         }
 
         _stableSettlingTailGuardArmed = NO;

@@ -123,7 +123,7 @@ import QuartzCore
     
     var lastAnimationValue: Vector = Vector(x: 0, y: 0) /// animationValue when the displayLink was last called
     var lastAnimationTimeUnit: Double = 0.0
-    private var lastMomentumHint: MFMomentumHint = kMFMomentumHintNone
+    var lastMomentumHint: MFMomentumHint = kMFMomentumHintNone
     var lastAnimationSpeed: Vector = Vector(x: 0, y: 0)
     
     var lastFrameTime: Double = -1 /// Time at which the displayLink was last called
