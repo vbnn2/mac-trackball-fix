@@ -58,10 +58,16 @@ import Cocoa
         cache = nil
 //        ReactiveScrollConfig.shared.handleScrollConfigChanged(newValue: shared)
         SwitchMaster.shared.scrollConfigChanged(scrollConfig: shared)
+        /// Cached config instances are intentionally immutable snapshots. End any animation that still owns the
+        /// previous snapshot so the next physical report opens with the new direction, curve, and modifier policy.
+        DDLogDebug("MFSCROLL_CONFIG: action=reload-reset")
+        Scroll.resetState()
     }
     @objc static func devToggles_deleteCache() { /// [May 2025] Added this function as a hack for DevToggles.m
         shared = ScrollConfig()
         cache = nil
+        DDLogDebug("MFSCROLL_CONFIG: action=dev-cache-reset")
+        Scroll.resetState()
     }
     private static var cache: [_HT<MFScrollModificationResult, MFAxis, CGDirectDisplayID>: ScrollConfig]? = nil
     
@@ -364,8 +370,8 @@ import Cocoa
     @objc let stableInitialResponseBaseDurationMax: TimeInterval = 80.0 / 1000.0
 
     /// Keep enough cadence history to recognize extremely slow same-direction trackball movement even when its
-    /// reports cross the 500ms gesture-grouping timeout. Acceleration, direction changes, clicks, and target changes
-    /// clear this memory immediately.
+    /// reports cross the 500ms gesture-grouping timeout. Acceleration, clicks, and target changes clear this memory
+    /// immediately; a slow reversal can retain its scalar cadence only through the shorter reversal taper below.
     @objc let stableSlowCadenceMemoryMaxInterval: TimeInterval = 1.5
     @objc let stableSlowCadenceEstimateAlpha: Double = 0.5
 
@@ -373,6 +379,17 @@ import Cocoa
     /// The cap limits the tail after a single very sparse report; incoming input always replans it immediately.
     @objc let stableSlowCadenceBaseDurationRatio: Double = 0.75
     @objc let stableSlowCadenceBaseDurationMax: TimeInterval = 900.0 / 1000.0
+
+    /// The three-report tick-time average intentionally smooths steady motion and deceleration, but it must not keep
+    /// animation duration slow after the velocity model has already detected acceleration. Use the current raw
+    /// interval only when it is materially shorter than the average; smaller timing jitter keeps the smoother.
+    @objc let stableAccelerationCadenceRawIntervalRatioMax: Double = 0.75
+
+    /// A very close slow reversal is usually part of careful continuous movement, so preserve its cadence in full.
+    /// Past this point, fade cadence influence to zero at `consecutiveScrollTickIntervalMax`: a later reversal is a
+    /// fresh deliberate input and must not turn its first ~20px into a long sparse-cadence glide. Same-direction
+    /// sparse input keeps the existing full-cadence range through that boundary.
+    @objc let stableSlowCadenceReversalFullBlendMaxInterval: TimeInterval = 200.0 / 1000.0
 
     /// Keep the first report bounded even though the sustained speed ceiling is intentionally high. The first report
     /// has no measured duration, so applying the full pixels/second ceiling to an assumed interval would create a
@@ -412,11 +429,13 @@ import Cocoa
     @objc let stableFastTailDurationScale: Double = 0.55
 
     /// After a fast free-spin, the hardware can emit one final one-unit report after the visible motion is already
-    /// settling. Treat only that narrow signature as ambiguous. Same-direction reports leave a live glide alone.
+    /// settling. Captures place that mechanical rebound within 150–320 ms of the last fast input; a later report
+    /// is a resumed physical scroll and must take the normal first-report path. Same-direction reports leave a
+    /// live glide alone.
     /// When no useful glide exists, emit a short, bounded micro-glide: large enough that a deliberate first report is
     /// visible, but much smaller than the normal accelerated tick so mechanical settling cannot become a second
     /// gesture. A new report cancels/retargets this animator immediately.
-    @objc let stableSettlingTailWindowMax: TimeInterval = 800.0 / 1000.0
+    @objc let stableSettlingTailWindowMax: TimeInterval = 320.0 / 1000.0
     @objc let stableSettlingTailPointDeltaMax: Int64 = 1
     @objc let stableSettlingTailResponsiveDistanceMax: Int64 = 10
     @objc let stableSettlingTailResponsiveDistanceMin: Int64 = 4

@@ -49,6 +49,10 @@ typedef enum {
     CGDirectDisplayID *_previousDisplaysUnderMousePointer; /// Old and unused, use `_previousDisplayUnderMousePointer` instead
     CGDirectDisplayID _previousDisplayUnderMousePointer;
     BOOL _displayLinkIsOutdated;
+    /// The CoreVideo object is recreated on the main queue, while routing decisions live on `_displayLinkQueue`.
+    /// Guard that short handoff so queue work never touches a CVDisplayLink that main is replacing.
+    BOOL _displayLinkRefreshInFlight;
+    BOOL _startRequestedWhileRefreshInFlight;
     dispatch_queue_t _displayLinkQueue;
     MFDisplayLinkRequestedState _requestedState;
     MFDisplayLinkWorkType _optimizedWorkType;
@@ -145,6 +149,8 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         
         /// Init `_displayLinkIsOutdated` flag
         _displayLinkIsOutdated = NO;
+        _displayLinkRefreshInFlight = NO;
+        _startRequestedWhileRefreshInFlight = NO;
         
         /// Init `_requestedState`
         _requestedState = kMFDisplayLinkRequestedStateStopped;
@@ -240,14 +246,24 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
 
 - (void)start_UnsafeWithCallback:(DisplayLinkCallback _Nonnull)callback {
 
-    
+    /// Store callback
+    self.callback = callback;
+
+    /// A watchdog can request another cold start while main is still recreating the prior CVDisplayLink. Record one
+    /// coalesced request and let the refresh completion enqueue it; reading or starting the pointer here would race
+    /// its replacement. Requested state remains truthful so the watchdog can continue supervising this attempt.
+    if (_displayLinkRefreshInFlight) {
+        _startRequestedWhileRefreshInFlight = YES;
+        _lastCallbackTime = 0;
+        _requestedStartTime = CACurrentMediaTime();
+        _requestedState = kMFDisplayLinkRequestedStateRunning;
+        DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred refreshInFlight=1");
+        return;
+    }
+
     /// Debug
     DDLogDebug("DisplayLink.m: (%@) starting", [self identifier]);
-    
-    /// Store callback
-    
-    self.callback = callback;
-    
+
     /// Start the displayLink
     ///     If something goes wrong see notes in old SmoothScroll.m > handleInput: method
     
@@ -256,11 +272,45 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     ///     We don't wanna use `dispatch_sync(dispatch_get_main_queue())` here because if were already running on the main thread(/queue?) then that'll crash
     
     /// Define block that starts displayLink
+
+    /// Consume only the invalidation known at this serial-queue boundary. A later display notification can set the
+    /// flag again while main is refreshing; the completion below deliberately does not clear that newer request.
+    BOOL refreshBeforeStart = _displayLinkIsOutdated;
+    CGDirectDisplayID refreshDisplayID = _previousDisplayUnderMousePointer;
+    if (refreshBeforeStart) {
+        _displayLinkIsOutdated = NO;
+        _displayLinkRefreshInFlight = YES;
+    }
     
     void (^startDisplayLinkBlock)(void) = ^{
+
+        /// A display add/remove/enable notification invalidates the CVDisplayLink even when the pointer remains on
+        /// the same display. The old routing path returned early in that case, so it never reached `setDisplay:`
+        /// and left an obsolete link to be discovered only by the 110 ms cold-start watchdog. Recreate and bind the
+        /// link in this main-queue start block instead. It runs after a queued stale-link stop and immediately before
+        /// `CVDisplayLinkStart`, preserving their required ordering without blocking the display-link queue.
+        CVReturn refreshResult = kCVReturnSuccess;
+        if (refreshBeforeStart) {
+            [self setUpNewDisplayLinkWithActiveDisplays];
+
+            refreshResult = refreshDisplayID != 0
+                ? CVDisplayLinkSetCurrentCGDisplay(self->_displayLink, refreshDisplayID)
+                : kCVReturnSuccess;
+            DDLogDebug("MFSCROLL_DISPLAY: action=refresh-before-start link=%{public}@ display=%u result=%d",
+                       [self identifier],
+                       refreshDisplayID,
+                       refreshResult);
+            if (refreshResult != kCVReturnSuccess) {
+                DDLogInfo("MFSCROLL_DISPLAY: action=refresh-failed link=%{public}@ display=%u result=%d",
+                          [self identifier],
+                          refreshDisplayID,
+                          refreshResult);
+            }
+        }
         
         int64_t failedAttempts = 0;
         int64_t maxAttempts = 100;
+        BOOL startFailed = NO;
         
         while (true) {
             CVReturn rt = CVDisplayLinkStart(self->_displayLink); /// This locks until the displayLinkCallback is done
@@ -275,6 +325,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
             
             failedAttempts += 1;
             if (failedAttempts >= maxAttempts) {
+                startFailed = YES;
                 DDLogInfo("MFSCROLL_DISPLAY: action=start-failed link=%{public}@ display=%u attempts=%lld result=%d",
                           [self identifier],
                           self->_previousDisplayUnderMousePointer,
@@ -283,6 +334,31 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
                 break;
             }
         }
+
+        dispatch_async(self->_displayLinkQueue, ^{
+            if (refreshBeforeStart) {
+                self->_displayLinkRefreshInFlight = NO;
+            }
+            if (refreshResult != kCVReturnSuccess || startFailed) {
+                /// Force the watchdog retry to recreate CoreVideo instead of repeatedly starting the same failed
+                /// object. Do not clear a newer reconfiguration request on success.
+                self->_displayLinkIsOutdated = YES;
+            }
+            if (refreshBeforeStart || startFailed) {
+                DDLogDebug("MFSCROLL_DISPLAY: action=start-complete display=%u refreshed=%d refreshResult=%d startFailed=%d refreshPending=%d",
+                           refreshDisplayID,
+                           refreshBeforeStart,
+                           refreshResult,
+                           startFailed,
+                           self->_displayLinkIsOutdated);
+            }
+            if (self->_startRequestedWhileRefreshInFlight) {
+                self->_startRequestedWhileRefreshInFlight = NO;
+                DisplayLinkCallback pendingCallback = self.callback;
+                DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred-resume");
+                [self start_UnsafeWithCallback:pendingCallback];
+            }
+        });
     };
     
     /// Set requestedState
@@ -542,11 +618,14 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
                        rt);
             result = kCVReturnError; return; /// Coudln't get display under pointer
         }
-        if (dsp == self->_previousDisplayUnderMousePointer) {
+        if (dsp == self->_previousDisplayUnderMousePointer && !self->_displayLinkIsOutdated) {
             /// Do not call any CVDisplayLink getter here. The CoreVideo callback can hold its internal mutex while
             /// synchronously waiting for this queue; a getter would then wait for that mutex and deadlock scrolling.
+            NSString *linkIdentifier = self->_displayLinkRefreshInFlight
+                ? @"refresh-in-flight"
+                : [self identifier];
             DDLogDebug("MFSCROLL_DISPLAY: action=keep link=%{public}@ display=%u requestedRunning=%d",
-                       [self identifier],
+                       linkIdentifier,
                        dsp,
                        self->_requestedState);
             result = kCVReturnSuccess; return; /// Display under pointer already linked to
@@ -557,8 +636,11 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         
         /// Set new display
         result = [self setDisplay:dsp];
+        NSString *linkIdentifier = self->_displayLinkRefreshInFlight
+            ? @"refresh-in-flight"
+            : [self identifier];
         DDLogDebug("MFSCROLL_DISPLAY: action=switch link=%{public}@ display=%u result=%d requestedRunning=%d",
-                   [self identifier],
+                   linkIdentifier,
                    dsp,
                    result,
                    self->_requestedState);
@@ -610,11 +692,20 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     
     /// Note: [Apr 2025] Why doesn't this have the `_Unsafe` suffix? .. Maybe cause it's not made public in the header? Perhaps we should make it a static c function to signify that.
     
-    /// Setup new displayLink if displays have been attached / removed
-    ///     Note: Not sure if this is necessary
-    if (_displayLinkIsOutdated) {
-        [self setUpNewDisplayLinkWithActiveDisplays];
-        _displayLinkIsOutdated = NO;
+    /// Defer replacement until `start_UnsafeWithCallback:`'s main-queue block. Recreating here can race the
+    /// asynchronous CoreVideo stop from stalled-link recovery, while the start block is naturally ordered after
+    /// that stop and before the matching `CVDisplayLinkStart`.
+    if (_displayLinkIsOutdated || _displayLinkRefreshInFlight) {
+        if (_displayLinkRefreshInFlight) {
+            /// The requested display may have changed after main captured its rebind target. Preserve a refresh for
+            /// the next cold start rather than touching the CVDisplayLink currently being recreated.
+            _displayLinkIsOutdated = YES;
+        }
+        DDLogDebug("MFSCROLL_DISPLAY: action=refresh-pending display=%u requestedRunning=%d refreshInFlight=%d",
+                   displayID,
+                   _requestedState,
+                   _displayLinkRefreshInFlight);
+        return kCVReturnSuccess;
     }
     
     /// Set new display
@@ -639,18 +730,16 @@ void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSu
     /// This is called whenever a display is added or removed. 
     ///     If that happens we need to set up a new displayLink for it to be compatible with all the new displays (I think)
     ///     I got this idea, because the CVDisplayLinkCreateWithActiveCGDisplays() docs say that it "determines the displays actively used by the host computer and creates a display link compatible with all of them.". I took this to mean that when a new display is attached, we need to call CVDisplayLinkCreateWithActiveCGDisplays() again. But I'm not sure if that's true. Either way, I guess recreating the displayLink when a new display is attached doesn't hurt.
-    /// To optimize, in this function, we only set the `_displayLinkIsOutdated` flag to true.
+    /// To optimize, this callback only queues the `_displayLinkIsOutdated` update.
     ///     Then we use that flag in `- setDisplay`, to set up a new displayLink when needed.
     ///     That way, the displayLink won't be recreated when the user isn't even using Mac Mouse Fix.
     /// Update: [Mar 2025]
     ///     - TODO: Test this! This is way to complicated and important to just not test and optimize it.
     ///     - CGDisplayReconfigurationCallBack docs say this is called twice, once before, once after display reconfiguration, but it says in the 'before' callbacks, the flags are always set only to `kCGDisplayBeginConfigurationFlag` – so we're ignoring that here.
     ///     - Threading:
-    ///         Comments above CGDisplayChangeSummaryFlags definition say that callbacks might be called from different threads.
-    ///         As I understand it would always be called from the 'event-processing thread' (which is what we call the 'displayLink thread' I think) in our case since our code doesn't manually change the display configuration (Not sure about this).
-    ///         Either way, the code that uses the mutable state we manipulate here `_displayLinkIsOutdated` runs on the `_displayLinkQueue`, so there's potential for a race-condition here.
-    ///             (After thinking about it, only race condition I can see is when there's a *double* display configuration change and, the second change is swallowed, and doesn't cause a -[setUpNewDisplayLinkWithActiveDisplays] call)
-    ///             TODO: Probably dispatch this workload to the `_displayLinkQueue` to be very safe against race conditions.
+    ///         Comments above CGDisplayChangeSummaryFlags definition say that callbacks might be called from different
+    ///         threads. Serialize the mutation with all readers on `_displayLinkQueue`; this also preserves a second
+    ///         invalidation that arrives while a first refresh is in flight.
     ///     - Optimization/Architecture:
     ///         - We do this for each DisplayLink instance separately. Would it make sense to only do it once for all DisplayLink instances? ... Probably wouldn't bring practical benefit though, and might make code more error-prone.
     
@@ -662,11 +751,19 @@ void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSu
         (flags & kCGDisplayEnabledFlag) ||
         (flags & kCGDisplayDisabledFlag))
     {
-        DDLogInfo("DisplayLink.m: (%@) added / removed. Flagging the displayLink as outdated. display: %d, flags: %@", [self identifier], display, MFCGDisplayChangeSummaryFlags_ToString(flags));
-        self->_displayLinkIsOutdated = YES;
+        NSString *flagDescription = MFCGDisplayChangeSummaryFlags_ToString(flags);
+        dispatch_async(self->_displayLinkQueue, ^{
+            self->_displayLinkIsOutdated = YES;
+            DDLogInfo("MFSCROLL_DISPLAY: action=reconfiguration-pending display=%u flags=%{public}@ refreshInFlight=%d",
+                      display,
+                      flagDescription,
+                      self->_displayLinkRefreshInFlight);
+        });
     }
     else {
-        DDLogDebug("DisplayLink.m: (%@) Ignored display reconfiguration. display: %d, flags: %@", [self identifier], display, MFCGDisplayChangeSummaryFlags_ToString(flags));
+        DDLogDebug("MFSCROLL_DISPLAY: action=reconfiguration-ignored display=%u flags=%{public}@",
+                   display,
+                   MFCGDisplayChangeSummaryFlags_ToString(flags));
     }
     
 }

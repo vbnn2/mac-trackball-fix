@@ -244,6 +244,577 @@ two fixed-pointer cold starts at `16:43:05.707` and `16:43:05.748` produced thei
 arrived. No recovery or display-start-failure marker appeared. A naturally parked display is still needed to observe
 the autonomous `watchdog-cold-restart` path directly.
 
+### 2026-07-23 — switching windows could retain the previous window's scroll session
+
+Symptom: the first scroll after switching windows could feel delayed or unusually slow.
+
+Evidence:
+
+- In helper PID `79346`, the captured Arc-to-Telegram switch at `22:21:56.676` was not a queue or display stall.
+  The first report reached output in `13.14 ms` with `1.58 ms` queued; the first opposite report `22 ms` later reached
+  output in `14.14 ms` with `0.48 ms` queued. There was no tap disable, display recovery, or start failure.
+- That capture did show only an application bundle in `MFSCROLL_CONTEXT`. Code reset on a bundle-ID change or a
+  mouse-down, but a keyboard-driven switch between two windows of the same application changed neither. The exact
+  same-app failure was not identifiable in old telemetry because no window identity was recorded; attributing the
+  reported feeling to retained same-app window state is therefore a code-supported inference, not a captured
+  reproduction.
+- Direct testing on macOS 26 found both `kCGMouseEventWindowUnderMousePointer*` fields were zero on physical TB800
+  HID-tap reports. The existing `NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:` WindowServer lookup took
+  about `37 us` per call over 1,000 calls and resolved the live Arc target as window `1387`.
+
+Fix (`Helper/Core/Scroll/Scroll.m`):
+
+- Resolve the routed window ID for every handled physical report, using the event field when available and the
+  measured non-AX point lookup when the HID event leaves it zero.
+- Compare the window ID before analyzer classification. A real change ends the old synthetic phase and clears
+  animator, cadence, tail, and analyzer state, then processes the same physical report normally.
+- Add `window=` to `MFSCROLL_INPUT` and `MFSCROLL_CONTEXT`, and log the transition as
+  `MFSCROLL_TARGET: window-change ... action=reset-session`.
+- Keep bundle-ID and mouse-down resets as fallbacks. Do not defer or discard the first report.
+
+Verification:
+
+- `git diff --check` and `./dev.sh build` passed. `./dev.sh run` rebuilt and restarted the helper.
+- On restarted helper PID `89177`, physical reports recorded `window=1387`. Fresh starts produced first output in
+  `8.03 ms` with `0.48 ms` queued; an active-motion settling reversal produced its micro-glide in `6.84 ms` with
+  `0.49 ms` queued.
+- A controlled VS Code-to-Arc transition produced
+  `MFSCROLL_TARGET: window-change app=com.microsoft.VSCode->company.thebrowser.Browser window=1470->1387` at
+  `22:29:30.834`. The same report then used unknown-cadence normal smoothness and produced output in `17.69 ms`
+  with `1.32 ms` queued.
+- Existing live slow-to-fast input continued to retarget on each report. No display recovery, display-start failure,
+  or event-tap timeout occurred. The one `MFSCROLL_TAP reason=user-input` marker accompanied helper restart and was
+  re-enabled as requested.
+
+Remaining tradeoff: target identity is the frontmost hittable window at the pointer. Transient panels legitimately
+have their own window IDs and will start a clean session when they become the scroll target. A manual Command-backtick
+same-app switch is still required to confirm the new `window-change` marker and feel in the originally reported case.
+
+### 2026-07-24 — a resumed downward scroll was mistaken for a settling reversal
+
+Symptom: scrolling down after a fast gesture could move briefly, snap back a little, then continue down.
+
+Evidence from helper PID `82864`:
+
+- At `12:54:02.499`, the first physical downward report was one line/one point (`line=(-1,0)`, `point=(-1,0)`) and
+  reached the scroll queue in `0.42 ms`.
+- At `12:54:02.501`, the broad settling guard classified it as
+  `MFSCROLL_TAIL action=micro-reversal`, cancelled the old direction, and injected a `9px`, `50 ms` opposite glide.
+  Its first output arrived in `3.02 ms`, so this was not a queue, display-link, target-window, or event-tap delay.
+- A physical continuation in that same direction arrived `50 ms` later (`point=(-7,0)`), then larger same-direction
+  reports at `40 ms` and `49 ms`. Those reports took the ordinary path and first output arrived in `11.09 ms` with
+  `0.59 ms` queued. This proves the first report was the start of resumed input, not an isolated rebound.
+- The recorder also contained reversal candidates at `265 ms`, `376 ms`, `484 ms`, and `708 ms` after fast input.
+  The existing evidence for actual mechanical settling is only `150–320 ms`; the former `800 ms` window admitted
+  clearly later resumed input.
+
+Root cause: the one-shot guard's `800 ms` eligibility window exceeded the measured mechanical-rebound interval. It
+therefore applied a deliberately bounded reversal response to a real new scroll start, creating the visible snap.
+
+Fix (`Helper/Core/Config/ScrollConfig.swift`): restrict `stableSettlingTailWindowMax` to `320 ms`. A one-unit tail in
+the observed rebound interval remains non-deferred and outside `ScrollAnalyzer`; a later report disarms the guard and
+is processed immediately by the regular direction-change path, which cancels old motion while delivering that same
+physical report.
+
+Verification:
+
+- `git diff --check` passed; `./dev.sh build` and `./dev.sh run` succeeded, and restarted helper PID `2553`
+  re-enabled its event tap.
+- Captured-regression replay preserves the `265 ms` in-window rebound candidate and routes the `376 ms`, `484 ms`,
+  and `708 ms` candidates to normal input processing. This covers the stop-after-fast and late/resumed-reversal
+  branches without adding a confirmation delay or altering analyzer history for an actual rebound.
+- A fresh physical-device pass of the full matrix is still required after deployment: stop after fast motion,
+  hardware rebound, active-motion reversal, slow reversal after a pause, and a normal slow-to-fast sequence.
+
+Remaining tradeoff: a real rebound that arrives after `320 ms` will receive normal first-report amplitude rather than
+the micro-glide. This is preferable to suppressing a deliberate resumed scroll, and the guard still never defers or
+discards an input report.
+
+### 2026-07-24 — display reconfiguration could leave a stale link until watchdog recovery
+
+Symptom: a scroll could feel briefly stuck after recent display/window activity.
+
+Evidence from helper PID `11467`:
+
+- Unified logs recorded display reconfiguration callbacks at `15:13:16.753` and `15:14:20.156–.172`, marking
+  `DisplayLink` instances outdated for displays `4` and `9`.
+- The first subsequently captured physical scroll at `15:19:09.126` targeted VS Code on display `4`. Its routing
+  record at `15:19:09.135` was `MFSCROLL_DISPLAY action=keep ... display=4`, which means the same-display early
+  return bypassed `setDisplay:`—the only old route that refreshed an outdated link.
+- That captured gesture was healthy (`21.10 ms` input-to-first-output, `5.34 ms` queue time, then `100–120 Hz`
+  output), so the reported stall was not captured directly. The stale-link attribution is a code-supported
+  inference from the reconfiguration and routing records, not a claim that this healthy gesture stalled.
+
+Root cause: after a display reconfiguration, scrolling on the unchanged display returned through `action=keep`.
+The stale `CVDisplayLink` was therefore not replaced before the next start; if CoreVideo had stopped invoking it, the
+existing cold-start watchdog could only recover it after `110 ms`.
+
+Fix (`Shared/Animation/DisplayLink.m`): same-display routing no longer bypasses an outdated link. It records a
+pending refresh, and `start_UnsafeWithCallback:` recreates and rebinds the link in its ordered main-queue start block,
+after any stale-link stop and immediately before `CVDisplayLinkStart`. A live active animation is not interrupted;
+its next cold start refreshes safely. The normal report is still handled immediately and the watchdog remains a
+fallback rather than the first recovery mechanism.
+
+Verification:
+
+- `git diff --check`, `./dev.sh build`, and `./dev.sh run` passed. The rolling recorder remained active across the
+  restart.
+- On fresh helper PID `14638`, a physical same-display start at `15:24:16.191` reached first output in `20.91 ms`
+  with `1.27 ms` queued. Its opposite report at `15:24:16.293` reached first output in `9.61 ms` with `0.76 ms`
+  queued; subsequent slow-to-fast reports sustained `111.8–120.3 Hz` output. A second cold start at `15:24:18.002`
+  reached first output in `19.70 ms` with `2.39 ms` queued. No `watchdog-cold-restart`, `recover-stall`,
+  `refresh-failed`, event-tap disable, or output gap was recorded.
+- A physical display-reconfiguration pass is still required: fixed-pointer scroll after reconfiguration, active
+  scroll during reconfiguration, and idle-display scroll should produce `refresh-before-start` only where expected
+  and no stall-recovery marker.
+
+Remaining tradeoff: a display reconfiguration during an active, still-callbacking animation defers replacement until
+the next cold start so CoreVideo stop/release cannot race its callback. If callbacks actually stop, the next physical
+report still uses the existing stale-link recovery and then starts a refreshed link.
+
+### 2026-07-24 — stale slow-cadence memory made a resumed first report look stuck
+
+Symptom: after a brief pause, the first scroll report felt stuck or delayed even though output eventually continued.
+
+Evidence from helper PID `14638`:
+
+- The report at `15:58:32.516` followed the prior physical report by `1,094 ms`. It entered the queue in
+  `0.82 ms` and produced its first output in `10.68 ms`; there was no display recovery, event-tap disable, or
+  target change.
+- Despite that healthy delivery, `MFSCROLL_ADAPTIVE` classified it as remembered cadence with a `639.4 ms` estimate.
+  `MFSCROLL_LEGACY` then selected `smoothness=.92`, `baseMs=479.5`, `durationMs=483.0`, and `targetV=41.7` for a
+  `20px` first report. The next physical report `78 ms` later immediately restored normal retargeting. The visible
+  problem was therefore the deliberately too-low initial output rate, not a queue or display-link stall.
+- The previous report was slow and within the `1.5 s` cadence-memory horizon, but the `1,094 ms` gap is well beyond
+  the `500 ms` gesture boundary. Treating its remembered cadence at full strength conflicts with the first-report
+  responsiveness invariant.
+
+Root cause: the sparse-cadence continuation branch applied full slow smoothing and the full cadence-derived duration
+for every gap up to `1.5 s`. Its explicit purpose was to support truly sparse movement, but at the stale end of that
+window it turned an opening report into a nearly half-second glide.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): retain the same `1.5 s` memory, but smoothly taper its smoothing and
+cadence-duration influence from full strength at the `500 ms` gesture boundary to zero at the memory limit. The
+physical report still starts immediately and carries no confirmation gate; a subsequent measured report still
+retargets normally. Short-gap sparse motion keeps the existing full slow-cadence treatment.
+
+Verification: `git diff --check`, `./dev.sh build`, and `./dev.sh run` passed; the restarted helper PID `25748`
+re-enabled its event tap and the rolling recorder remains active. The target capture's `1,094 ms` gap should log
+`memoryBlend≈0.41`, use `action=taper-stale-cadence`, and have a substantially shorter initial duration without
+`recover-stall`, `watchdog-cold-restart`, or a queue-time increase. A fresh physical slow-restart pass is pending on
+that helper; the `483 ms` trace above is the pre-deployment baseline.
+
+Remaining tradeoff: a deliberately continuous one-unit cadence near `1.5 s` will start more crisply than before
+rather than preserving a long overlap. This favors the documented first-report responsiveness guarantee; short
+sparse gaps remain fully blended.
+
+### 2026-07-24 — live same-direction settling candidates could discard resumed input
+
+Symptom: scrolling again shortly after a fast burst could feel stuck or delayed even though the display link and
+queue were healthy.
+
+Evidence from helper PID `25783`:
+
+- Four fresh physical one-unit, same-direction reports reached the narrow settling guard at `22:32:45.568`,
+  `22:33:44.120`, `22:34:19.387`, and `22:36:33.396`. Their gaps were `200–270 ms`, and each logged
+  `MFSCROLL_TAIL action=continue-same ... animatorRunning=1 microPx=0`.
+- The detailed `22:36:33.396` case followed an active fast downward glide: output was still running at
+  `120 Hz` at `22:36:33.327`, the candidate reported a `20px` physical tick, and its live animation speed was
+  `296.9 px/s`. The guard immediately returned without an `MFSCROLL_LEGACY` retarget record or added distance;
+  only the decaying old glide remained. That is a confirmed input-suppression path, not a queue delay.
+- Surrounding fresh starts on the same helper remained healthy: for example `22:36:34.508` reached first output in
+  `11.23 ms` with `0.60 ms` queued. The capture contains no stalled-link recovery, display-start failure, or
+  event-tap disable.
+
+Root cause: the accepted old same-direction policy (“leave a running glide untouched”) implemented that policy by
+returning before `ScrollAnalyzer` and `TouchAnimator` saw the physical report. While it avoided a secondary tail,
+it also violated the immediate-retarget invariant and could leave a deliberate resume with no new distance after the
+old glide expired.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): a live same-direction settling candidate now disarms the guard but continues
+through the ordinary one-shot tail blend and velocity-preserving animator retarget on the same report. The blend
+still limits the ambiguous first distance/duration and is logged as
+`MFSCROLL_TAIL action=blend source=settling-same`. Stopped same-direction candidates retain the bounded `50 ms`
+micro-glide, and opposite candidates still cancel old direction and use their bounded micro-glide unchanged.
+
+Verification:
+
+- `git diff --check`, `./dev.sh build`, and `./dev.sh run` passed. The replacement helper PID `24694` re-enabled
+  its event tap at `22:40:36.632`; the rolling recorder remained active.
+- The affected path was checked against the matrix constraints: no timer or report-count gate was added; a live
+  same-direction report retains current velocity and is capped by the existing one-shot tail blend; stopped tails
+  and opposite rebound/reversal handling remain isolated from `ScrollAnalyzer` as before. Fresh-start, slow
+  cadence, target-window, and display-recovery code paths are not changed.
+- The fresh physical target case was captured on PID `24694`: at `22:41:03.788`, a one-unit same-direction report
+  `226 ms` after fast input logged `retarget-same`, then `blend source=settling-same`, and the normal path logged
+  `retarget=1` with `19.9px` added distance at `22:41:03.789`. The next active output arrived at `22:41:03.795`
+  (`7 ms` later), while output remained `120 Hz` with a `9.20 ms` maximum active gap. There was no recovery,
+  display-start failure, or tap disable.
+- Adjacent physical cases remained healthy: the fresh start at `22:41:03.277` reached first output in `10.18 ms`
+  with `0.88 ms` queued and accelerated into `119.9 Hz` output; a `303 ms` opposite settling candidate at
+  `22:40:47.297` retained its unchanged `micro-reversal` path and reached first output in `9.92 ms` with
+  `0.70 ms` queued. The remaining manual matrix cases are fast stop with no input, a hardware rebound, and a slow
+  reversal after a long pause; they are not altered by this branch and should continue to be sampled in the rolling
+  capture.
+
+Remaining tradeoff: a real same-direction rebound during a still-live tail now adds one bounded blended response
+instead of being ignored. That is intentionally preferable to discarding an indistinguishable physical resumed
+scroll; the guard remains one-shot and the next report resumes ordinary adaptive behavior.
+
+### 2026-07-25 — a near-boundary slow reversal retained full sparse cadence
+
+Symptom: a slow scroll could feel stuck even though it began on time.
+
+Evidence from helper PID `24694`:
+
+- The physical one-unit reversal at `20:29:31.409` followed the prior slow report by `483 ms`. It entered the
+  scroll queue in `1.25 ms` and sent its first output in `15.97 ms`, so neither the queue nor a display-link start
+  was delayed.
+- `MFSCROLL_ADAPTIVE` nevertheless recorded `memoryBlend=1.00 ... reversal=1 action=use-slow-smoothness`.
+  `MFSCROLL_LEGACY` selected `targetV=55.2`, `baseMs=362.3`, and `durationMs=373.1` for its `20px` input. That is
+  a deliberately very low post-first-frame response and explains the perceived stuck/slow movement.
+- The same rolling capture has normal `0.41–1.78 ms` queue time and `5.24–19.50 ms` first-output latency, with no
+  tap disable, stalled-link recovery, watchdog restart, display-start failure, or refresh failure. A close `174 ms`
+  slow reversal at `20:29:28.896` selected a shorter `190.4 ms` response, showing that short deliberate reversals
+  still need cadence continuity.
+
+Root cause: the prior stale-cadence fix tapered only after the `500 ms` gesture boundary. Slow reversals took the
+same full-cadence branch at every gap below that boundary, so the `483 ms` direction change treated a new opening
+report as if it must overlap another sparse report and spread it over `373 ms`.
+
+Fix (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/Scroll.m`): retain full slow-cadence influence
+for reversals through `200 ms`, then continuously taper it to zero at the existing `500 ms` gesture boundary. The
+general `500 ms–1.5 s` stale-memory taper remains unchanged for same-direction sparse input. The new telemetry
+records the independent `memoryBlend`, `reversalBlend`, final `blend`, and
+`action=taper-reversal-cadence`. No report is deferred, confirmed, or discarded; the normal direction-change path
+still cancels old motion and processes the physical report immediately.
+
+Verification:
+
+- `git diff --check` and `./dev.sh build` passed (only existing unrelated deprecation/unused-code warnings).
+  `./dev.sh run` rebuilt and restarted the helper; the current PID `14724` re-enabled its event tap at
+  `20:32:47.442`, and the rolling recorder remains active.
+- Regression-boundary review: the captured `174 ms` reversal remains at full cadence; the captured `483 ms`
+  reversal now has `reversalBlend≈0.06` instead of `1.00`; reversals at or beyond `500 ms` receive the bounded
+  normal first-report response; same-direction sparse input retains its previous `500 ms–1.5 s` taper. Fast-tail
+  settling, target-window reset, output-rate bounds, and display-link recovery are not modified.
+- A fresh physical pass on PID `14724` is still required for the relevant matrix: close slow reversal, `400–500 ms`
+  slow reversal, extremely slow same-direction continuation, fast stop/rebound, and normal slow-to-fast input.
+  The target path should emit `taper-reversal-cadence` and a substantially shorter duration without queue or
+  display-recovery markers.
+
+Remaining tradeoff: a deliberately continuous reversal between `200–500 ms` is now crisper than before rather than
+fully overlapped. The smooth taper preserves close careful reversals while prioritizing the documented first-report
+responsiveness invariant at the ambiguous boundary.
+
+### 2026-07-25 — post-fix slow-start and stuck-scroll regression audit
+
+Symptom checked: scrolling was reported as sometimes slow to start or briefly stuck after the near-boundary reversal
+fix above.
+
+Evidence from the current helper PID `14724`:
+
+- The target `467 ms` reversal at `23:07:11.441` recorded
+  `memoryBlend=1.00 reversalBlend=0.11 ... action=taper-reversal-cadence`. Its response was reduced to
+  `durationMs=180.8` from the pre-fix captured `373.1 ms`, and its first output arrived in `13.01 ms` with
+  `0.56 ms` queued. Subsequent active output ran at `119.6–120.3 Hz` with roughly `9.35–9.42 ms` maximum gaps.
+- Adjacent reversal boundaries preserved their intended behavior: a `196 ms` reversal retained full cadence
+  continuity, a `292 ms` reversal used `reversalBlend=0.69`, and `551 ms`, `585 ms`, `1,227 ms`, and `1,462 ms`
+  reversals used zero reversal blend and the bounded normal `167.9 ms` response. Their first outputs remained
+  within one or two display frames.
+- Across the reviewed starts, `MFSCROLL_LATENCY` recorded `7.61–19.29 ms` input-to-first-output and
+  `0.48–3.53 ms` queue time. Large aggregate `MFSCROLL_OUTPUT maxGapMs` values occurred only in windows that
+  straddled an idle/quantized tail and a fresh restart; after physical input resumed, active output returned to
+  approximately `116–120 Hz`.
+- The Browser-to-Kitty switch at `23:09:24.804` emitted
+  `window-change ... action=reset-session`. The first Kitty report used
+  `cadence=unknown action=use-normal-smoothness` and produced output in `10.45 ms` with `0.82 ms` queued. This
+  confirms that the target reset did not leak old cadence or distance into the new app.
+- Fast-tail regression cases at `23:09:32.819` and `23:09:34.391` emitted
+  `action=retarget-same` followed by `source=settling-same` and a normal `retarget=1`; the physical resumed
+  reports were not discarded. Slow-to-fast samples likewise retargeted every new physical report and reached
+  display cadence.
+- No unexplained tap disable, display-link recovery/watchdog restart, display-start failure, refresh failure, or
+  target-window churn was present. Display starts returned `result=0`; the only later target resets were explicit
+  mouse-down records.
+
+Conclusion: the captured slow-start/stuck symptom does not reproduce as a queue, display-link, target-reset, or
+animator regression. The previously diagnosed near-boundary reversal problem is fixed in this build, so no further
+scroll code was changed during this audit. In particular, the ordinary sparse same-direction response was left
+unchanged because the capture shows timely first output and immediate acceleration on subsequent reports; shortening
+it without contrary evidence would regress continuous sparse scrolling.
+
+Verification: refreshed the rolling snapshot with `./dev.sh logs-record-snapshot`, correlated physical input,
+adaptive choice, animator retarget, latency, output cadence, target reset, display-link, and event-tap telemetry,
+and ran `git diff --check`.
+
+Remaining coverage: this physical pass covered vertical scrolling in Browser and Kitty on display `4`, including
+app switching, close and paused reversals, slow-to-fast input, ordinary tail settling, and fast-tail resumed input.
+Horizontal scrolling, other attached displays, zoom/effect paths, Safari rubber-banding, Telegram, Finder,
+VS Code/Xcode, and scrolling after a genuinely parked display were not represented in this capture and remain
+manual matrix items rather than claimed passes.
+
+### 2026-07-25 — an expired bounded fast-tail response weakened the next real report
+
+Symptom: after a fast gesture, starting again in the same direction could feel slow or briefly stuck.
+
+Evidence from helper PID `14724`:
+
+- The Browser gesture opened normally at `23:20:52.368`: an app-change reset cleared the prior session, unknown
+  cadence selected the bounded normal response, and first output arrived in `13.32 ms` with `1.67 ms` queued.
+  The gesture accelerated normally and produced active output at `120.3 Hz`.
+- At `23:20:52.877`, a one-unit same-direction report arrived `312 ms` after fast input while `161.8 px/s` of the
+  old animation remained. It was correctly accepted rather than discarded:
+  `action=retarget-same`, `source=settling-same`, and `retarget=1` were all present. The ambiguous response was
+  bounded to `9.9px`, `baseMs=142.1`, and `durationMs=191.5`; active output remained `119.9 Hz`.
+- The next one-unit physical report arrived `216 ms` later at `23:20:53.093`, after that bounded response had
+  finished (`currentV=0.0`, `retarget=0`). It was delivered promptly—`13.27 ms` to first output with `1.85 ms`
+  queued—but inherited `cadenceKnown=1`, maximum slow smoothing, `targetV=74.0`, `baseMs=270.3`, and
+  `durationMs=292.2`. The `25 ms` and `51 ms` follow-up reports retargeted normally, confirming that the visible
+  hesitation was the weak second start rather than a queue, tap, target, or display-link stall.
+
+Root cause: the fast-tail state intentionally makes a second physical report regain normal speed-derived slow
+smoothing, proving continuation without a report-count gate. It did so even when the first bounded tail response had
+already ended. That conflated a visibly continuous sparse movement with a new same-direction opening after an
+ambiguous tail, allowing a stopped animator to restart at only `74 px/s`.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): remember for one physical report that a bounded fast-tail response was just
+accepted. The next report consumes that marker immediately. If the bounded response has already stopped and the
+next report is still a small, slow, same-direction continuation within the analyzer gesture, apply the existing
+`80 ms` opening base-duration cap before the measured slow-smoothing factor. Record the path as
+`MFSCROLL_TAIL action=restart-after-expired-tail`.
+
+Preserved behavior:
+
+- The ambiguous first tail report keeps its existing distance and duration bounds; hardware rebound is not enlarged.
+- If its animation is still running, sparse continuity is unchanged.
+- The report is neither delayed nor discarded, analyzer/cadence history remains intact, and slow smoothing still
+  begins from measured input rather than an event-count confirmation gate.
+- Direction changes, faster/larger continuations, ordinary extremely slow input, stale-cadence/reversal tapers,
+  target resets, display recovery, and non-Regular effect paths do not enter the new condition.
+
+Verification:
+
+- `git diff --check` passed. `./dev.sh build` succeeded, and `./dev.sh run` rebuilt, launched the app, and restarted
+  its embedded helper. The replacement helper re-enabled its event tap; the rolling recorder remains active.
+- For the captured `23:20:53.093` parameters, the new condition caps the pre-smoothing base response at `80 ms`
+  instead of retaining the old roughly `162 ms` pre-smoothing value. It preserves the measured slow-smoothing
+  factor, yielding a substantially shorter response while the following faster report can still retarget on that
+  same report.
+- Fresh adjacent-path telemetry on replacement helper PID `50666` remained healthy. The fixed-pointer fresh start at
+  `23:24:32.940` produced output in `16.66 ms` with `0.71 ms` queued; active output returned to `116–120 Hz`.
+  A close `178 ms` reversal preserved full slow cadence and responded in `18.86 ms` with `0.65 ms` queued, while a
+  `763 ms` reversal used zero reversal blend and the normal `167.9 ms` response. A `199 ms` live same-direction tail
+  at `23:24:34.331` still logged `retarget-same`, kept the full `20.2px`, and continued at display cadence. No tap
+  disable, display recovery, start failure, or refresh failure accompanied these cases.
+- Regression-path review covered fresh starts, live same-direction tail continuation, first hardware-rebound
+  bounding, stopped-tail continuation, fast follow-up input, direction reversal, ordinary sparse cadence,
+  app/window resets, and display-link recovery invariants. Only the stopped, small, same-direction second report
+  after a bounded fast tail changes.
+
+Remaining verification: a fresh physical reproduction on the replacement helper must capture
+`action=restart-after-expired-tail` and confirm the shorter response by feel, with normal first-output latency and
+active output cadence. Stop-with-no-input and an isolated hardware rebound should remain silent after their existing
+one bounded response.
+
+### 2026-07-25 — tick-interval averaging delayed slow-to-fast acceleration
+
+Symptom: scrolling could still feel slow or briefly stuck at the start even after the expired fast-tail response was
+shortened.
+
+Evidence from helper PID `50666`:
+
+- The new expired-tail path was captured at `23:26:35.424` and behaved as designed:
+  `action=restart-after-expired-tail` capped its base response at `132.9 ms` after the measured slow-smoothing
+  factor, down from the old `270.3 ms` behavior. The first output arrived in `8.44 ms` with `0.50 ms` queued.
+- Input then accelerated only `34 ms` later at `23:26:35.458`. The velocity model immediately rose from
+  `3.8` to `26.9 units/s`, but `ScrollAnalyzer`'s three-report tick average still reported `183.34 ms`.
+  Animation duration therefore remained at `baseMs=263.3`, `durationMs=320.3`, and only `targetV=149.4`.
+  A larger report `36 ms` later still used a stale `112 ms` cadence and only reached `targetV=577.2`.
+- A separate ordinary slow-to-fast case reproduced the same mechanism more clearly. At `23:27:22.787`, the
+  legitimate second one-unit report after `482 ms` selected slow smoothing, `targetV=66.6`, and a `288.0 ms`
+  response. The next report arrived after only `38 ms`, but the duration path used a `262.47 ms` averaged cadence
+  and selected just `targetV=154.0`. The following `33 ms` report still used `185.31 ms`; only the next report
+  finally reached a current `33.33 ms` cadence and `targetV=1713.5`.
+- Delivery was healthy in both cases: the relevant first outputs were `8.44–13.94 ms`, queue time was
+  `0.50–2.73 ms`, active output returned to approximately `120 Hz`, and there was no tap disable, display recovery,
+  start failure, refresh failure, or target reset causing the hesitation.
+
+Root cause: the time-based velocity filter correctly recognized acceleration on the current physical report, but
+the directly-driven animation-duration curve still consumed the symmetric three-report average of tick intervals.
+After sparse input, that average stayed slow for two faster reports and contradicted the invariant that acceleration
+must replan the active response on the same report.
+
+Fix (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/Scroll.m`): for the Regular stable engine, use the
+current raw interval for animation-duration cadence only when both of these are true on the same report:
+
+- modeled output speed increased; and
+- the raw interval is at most `75%` of the smoothed interval.
+
+The path logs `MFSCROLL_ADAPTIVE ... action=use-raw-acceleration-cadence`. `MFSCROLL_LEGACY` now records both the
+analyzer's `cadenceMs` and the duration curve's `baseCadenceMs`.
+
+Preserved behavior: constant sparse input still uses the three-report average and measured slow smoothing;
+deceleration continues to use the smoother; distance mapping, output-rate limits, retained carry, tail bounding,
+direction cancellation, stale-cadence/reversal tapers, target resets, and display recovery are unchanged. No input
+is delayed, confirmed, or discarded.
+
+Verification:
+
+- `git diff --check` and `./dev.sh build` passed. `./dev.sh run` rebuilt, launched the app, and restarted its helper.
+- On replacement helper PID `52446`, a fresh first report used unknown-cadence normal smoothing and the bounded
+  `80 ms` base response, reaching output in `20.53 ms` with `0.80 ms` queued. Subsequent active output ran at
+  `119.6–120.5 Hz`.
+- A live one-unit same-direction settling report at `23:29:36.947` retained the existing
+  `retarget-same`/`source=settling-same` path and continued at `120.1 Hz`; its unchanged steady/decelerating cadence
+  recorded equal `cadenceMs` and `baseCadenceMs`.
+
+Remaining verification: the replacement helper has not yet captured a materially faster follow-up after sparse
+input, so a fresh `action=use-raw-acceleration-cadence` record and feel check remain required. Constant extremely
+slow input, a slow-to-fast ramp, fast-to-slow settling, close and paused reversals, and an app/window switch should
+continue to be sampled in the rolling capture.
+
+Remaining tradeoff: a genuinely anomalous short packet can shorten one response if modeled speed rises with it.
+The `75%` interval threshold excludes ordinary timing jitter, while unchanged distance and rate caps prevent that
+one report from creating an output burst.
+
+### 2026-07-25 — post-fix verification of slow-to-fast duration cadence
+
+The replacement helper PID `52446` captured the previously missing acceleration case twice, including the combined
+expired-tail restart that had produced the reported hesitation:
+
+- At `23:30:31.535`, a one-unit report after `462 ms` correctly took
+  `action=restart-after-expired-tail`, retained the bounded `132.9 ms` opening base, and produced its first output in
+  `12.02 ms`. At `23:30:31.556`, the next report arrived after `26 ms`; the analyzer's intentional three-report
+  average was still `242.3 ms`, while `action=use-raw-acceleration-cadence` selected `baseCadenceMs=26.01`. This
+  reduced the response base to `206.9 ms` and raised the target to `202.2 px/s` on that same report.
+- At `23:30:31.580`, the next accelerating report used `baseCadenceMs=20.00` instead of the still-stale
+  `cadenceMs=169.33`, reducing the response base to `128.8 ms` and raising the target to `995.9 px/s`. Once the
+  rolling average caught up, `cadenceMs` and `baseCadenceMs` again matched. Active output then ran at
+  `119.7–119.9 Hz` with maximum callback gaps below `9.4 ms`.
+- A second independent sequence at `23:31:17.693–23:31:17.758` reproduced the same combined path:
+  `restart-after-expired-tail`, then raw `39 ms` versus smoothed `251.3 ms`, followed by raw `28 ms` versus smoothed
+  `174.7 ms`. Its restart reached first output in `8.69 ms` with `2.05 ms` queued.
+
+This verifies the root-cause fix rather than merely the symptom: the current measured cadence now reaches the
+animation-duration curve on the first materially faster report, while the analyzer's smoothing, velocity model,
+distance, and carry remain untouched.
+
+Adjacent regression evidence from the same helper:
+
+- `24` fresh animation starts reached first output in `5.88–17.07 ms`; queue time was `0.46–5.52 ms`.
+- `156` Regular-engine reports exercised both vertical directions and `132` live retargets. None were rate-limited
+  and none dropped retained distance.
+- Slow/paused reversals at `23:30:53.750`, `23:30:55.630`, and `23:31:06.857` retained the existing reversal taper;
+  their first outputs arrived in `12.14`, `14.50`, and `12.59 ms`, respectively.
+- Same-direction settling reports retained `action=retarget-same`; post-fast stopping produced no later secondary
+  output burst in the captured intervals.
+- Window switches Browser -> kitty at `23:30:43.942` and kitty -> Browser at `23:30:51.038` logged
+  `action=reset-session`, and each target accepted the next first report.
+- No `MFSCROLL_TAP` disable, display stall recovery, watchdog/animator cold restart, display-link start failure, or
+  refresh failure occurred.
+
+Verification commands: `git diff --check`, `./dev.sh build`, `./dev.sh run`, `./dev.sh logs-record-snapshot`, plus
+targeted `MFSCROLL_INPUT`, `ADAPTIVE`, `TAIL`, `LEGACY`, `LATENCY`, `OUTPUT`, `TARGET`, `TAP`, and `DISPLAY`
+correlation in the rolling capture. Build and deployment passed.
+
+Remaining tradeoff: the current capture covers the affected vertical path, slow/fast transitions, reversals,
+stopping, and a same-display app/window switch. Horizontal input, Safari/Chromium boundary behavior, and switching
+between physical displays were not manually exercised in this verification pass. The cadence bypass is confined to
+the Regular stable engine's duration input and does not alter those routing or effect paths.
+
+### 2026-07-25 — deep scroll audit: stale restart duration and four latent session/liveness regressions
+
+Symptom: a new slow report could still feel stuck after a pause, and repeated scroll fixes had left adjacent
+direction, modifier/config, settling-tail, and display-recovery paths vulnerable to regressions.
+
+Current telemetry before attribution:
+
+- The rolling capture on helper PID `52446` contained `157` handled physical reports and `157`
+  `MFSCROLL_LEGACY` records. Its `22` cold starts reached first output in `5.88–17.99 ms` with
+  `0.55–5.52 ms` queued. There was no tap disable, display recovery/start failure, rate limiting, dropped carry, or
+  target change around the reported pauses. The symptom was therefore not a queue, event-tap, or display-link stall.
+- The slow openings were response-shape records: `23:31:08.053` followed a `788 ms` gap with
+  `memoryBlend=0.71`, `baseMs=429.7`, and `targetV=46.5`; `23:31:23.273` followed `874 ms` with
+  `baseMs=452.6`; and `23:31:25.196` followed `978 ms` with `baseMs=434.3`. The old formula multiplied a
+  decreasing stale-memory blend by a cadence target that continued growing with the pause. Its maximum landed near
+  `0.8–1.0 s`, making those later restarts slower than a report near the `500 ms` gesture boundary.
+- A `109 ms` reversal immediately after the `874 ms` case used the stale `491.5 ms` scalar estimate. Direction
+  cancellation still worked on the Regular curve, but the estimate showed that a close opposite decision could
+  inherit the preceding same-direction pause.
+
+Confirmed root causes and changes:
+
+1. In `Helper/Core/Scroll/Scroll.m`, a stale report updated the cadence EMA before choosing its own duration.
+   The restart now uses only cadence known before that physical report, capped by the `500 ms` gesture boundary; the
+   current gap may update memory only for a future report. The existing memory/reversal tapers still decay to zero,
+   and a reversal clamps the retained estimate to its actual cross-direction gap. New
+   `priorEstimateMs`, `durationRefMs`, and `cadenceDurationRefMs` fields expose the distinction.
+2. Direction cancellation lived inside the custom acceleration branch. System/Apple acceleration could therefore
+   append an opposite report to the old animation session. Cancellation now runs after both acceleration branches,
+   logs `MFSCROLL_DIRECTION action=cancel-old-session appleAcceleration=...`, terminates the old phase, and still
+   delivers the current physical report.
+3. Modifier state was sampled only after preliminary analysis and only at a gesture boundary; cached config reloads
+   did not end an animation already holding the old snapshot. Modifiers are now sampled on every handled physical
+   report before direction analysis. A change resets the session immediately, and
+   `ScrollConfig.reload()` / `devToggles_deleteCache()` enqueue the same reset so the next report opens with the new
+   curve, direction, and effect policy.
+4. The stopped `micro-same` settling path returned before the local fast-tail marker was updated, so its next report
+   could receive a second bound. Fast-tail classification is now resettable scroll-session state, and `micro-same`
+   marks its one allowed response handled while arming the existing expired-response continuation cap.
+5. `Shared/Animation/DisplayLink.m` wrote the outdated flag from an arbitrary display-callback thread and cleared it
+   on main, so a second reconfiguration could be lost while CoreVideo was being recreated. All invalidation state is
+   now serialized on the display-link queue. A refresh-in-flight guard prevents queue work from touching the replaced
+   pointer, coalesces a concurrent start, and never clears a newer invalidation. Rebind/start failures preserve the
+   outdated flag for a recreating retry. `Helper/Core/Touch/TouchAnimator.swift` now aborts after three callback-less
+   cold retries, discards only the never-delivered animation, and returns requested state to stopped instead of
+   leaving future reports attached to a zombie animator.
+
+Preserved behavior:
+
+- No timer, confirmation window, physical-report gate, or delayed replay was added. The first report still emits on
+  the first available display callback.
+- Constant sparse input may continue learning its cadence for later reports; a single resumed report can no longer
+  use its own silence to make itself slower. Acceleration still switches immediately to raw cadence, while
+  deceleration keeps the smoother.
+- Fast-tail distance/duration bounds, the `320 ms` mechanical-settling window, live velocity-preserving retargets,
+  expired-tail opening cap, rate/carry limits, target-window reset, and non-Regular effect behavior are unchanged.
+- Display reconfiguration during a healthy active animation remains deferred to a cold start; the change makes that
+  handoff race-free rather than interrupting visible motion.
+
+Verification:
+
+- `git diff --check` passed, and repeated `./dev.sh build` runs completed with `BUILD SUCCEEDED`. The final build was
+  deployed through `./dev.sh run`; helper PID `60239` logged `MFSCROLL_CONFIG action=reload-reset` on startup.
+- Physical pass PID `58902` covered `139` handled reports. `137` entered the Regular modeled path and the other two
+  were intentional `micro-reversal` responses; all produced visible output. Seventeen cold/micro starts measured
+  `10.44–21.71 ms` first-output latency and `0.53–4.26 ms` queue time. Same-direction live tails logged one
+  `retarget-same` plus one `blend`, while direction changes logged cancellation and kept the current tick.
+- Physical pass PID `59463` covered `95/95` handled/modelled reports across slow starts, `838 ms` same-direction
+  restart, slow-to-fast and fast-to-slow motion, active and paused reversals, fast settling, clicks, and Kitty /
+  Browser / Finder target changes. Excluding sparse/idle windows, `30` active output windows ran at
+  `104.3–120.3 Hz` with a maximum `17.53 ms` gap. There was no unexplained tap disable, recovery/watchdog record,
+  start/refresh failure, rate-limited report, or dropped carry.
+- The intermediate boundary cap changed the captured `838 ms` start to `durationRefMs=493.3`,
+  `baseMs=283.8`, and `durationMs=303.6`, already well below the pre-fix `429–453 ms` class. That pass then showed
+  why the final refinement was needed: the current gap had raised its own estimate. Replaying the final formula with
+  a fixed prior cadence from `500–1500 ms` is monotonically non-increasing (`225.0 ms` to `132.9 ms` for a
+  representative `300 ms` prior estimate); the current report never increases its duration reference.
+- Static branch review confirms the shared cancellation runs for both `useAppleAcceleration` values, modifier/config
+  resets precede preliminary analysis, every reset clears the tail markers, and all display invalidation/refresh
+  flag writes are queue-confined. The refresh-in-flight path has an explicit deferred-start resume and the terminal
+  watchdog leaves `isRunning_Unsafe == false`.
+
+Remaining manual coverage: the physical passes used the Regular custom-acceleration vertical path on display `4`.
+System acceleration, live modifier/effect changes, horizontal input, Safari/Chromium rubber-banding, Telegram,
+VS Code/Xcode, attached-display reconfiguration, and a genuinely parked display were branch/build checked but not
+physically forced in the final build. Those cases must remain in the matrix and should not be claimed as live passes.
+
+Remaining tradeoff: a cadence learned from several genuinely sparse reports can still lengthen a later report, which
+is required for continuous extremely slow motion. The fix removes only self-lengthening by the current pause. After
+three completely callback-less display restarts, the undelivered request is dropped so future input can recover;
+silently retaining it would reintroduce both the zombie-session bug and a delayed snap.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

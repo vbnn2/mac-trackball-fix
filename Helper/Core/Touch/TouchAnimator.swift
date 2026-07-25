@@ -84,7 +84,36 @@ class TouchAnimator: TouchAnimatorBase {
 
             if attempt < self.coldStartWatchdogMaxAttempts {
                 self.scheduleColdStartWatchdog_Unsafe(generation: generation, attempt: attempt + 1)
+            } else {
+                self.scheduleColdStartAbort_Unsafe(generation: generation)
             }
+        }
+    }
+
+    private func scheduleColdStartAbort_Unsafe(generation: UInt64) {
+        displayLink.dispatchQueue.asyncAfter(deadline: .now() + coldStartWatchdogDelay) { [weak self] in
+            guard let self,
+                  generation == self.coldStartWatchdogGeneration,
+                  self.isFirstDisplayLinkCallback_AfterColdStart,
+                  self.isRunning_Unsafe,
+                  self.displayLink.invalidateIfStalled_Unsafe() else {
+                return
+            }
+
+            /// Three restarts without one callback are terminal for this request. Leaving requested-running set made
+            /// all later reports retarget an animator that could never run. Drop only the never-delivered animation
+            /// and return to a true cold state so the next physical report can open a fresh CoreVideo session.
+            self.coldStartWatchdogGeneration &+= 1
+            self.animationValueTotal = Vector(x: 0, y: 0)
+            self.lastAnimationValue = Vector(x: 0, y: 0)
+            self.lastAnimationSpeed = Vector(x: 0, y: 0)
+            self.lastMomentumHint = kMFMomentumHintNone
+            self.thisAnimationHasProducedDeltas = false
+            self.isFirstDisplayLinkCallback_AfterColdStart = false
+            self.isFirstDisplayLinkCallback_AfterRunningStart = false
+            self.isLastDisplayLinkCallback = false
+            self.subPixelator.reset()
+            DDLogInfo("MFSCROLL_DISPLAY: action=watchdog-cold-abort attempts=\(self.coldStartWatchdogMaxAttempts)")
         }
     }
     
