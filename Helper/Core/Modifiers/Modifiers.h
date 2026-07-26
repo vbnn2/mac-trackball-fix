@@ -52,6 +52,7 @@ typedef enum {
 + (void)buttonModsChangedTo:(MF_SWIFT_UNBRIDGED(ButtonModifierState))newModifiers NS_REFINED_FOR_SWIFT;
 
 + (void)handleModificationHasBeenUsed;
++ (void)handleModificationHasBeenUsedWithModifiers:(MF_SWIFT_UNBRIDGED(NSDictionary *))modifiers NS_REFINED_FOR_SWIFT;
 
 + (MFModifierPriority)kbModPriority;
 + (MFModifierPriority)btnModPriority;

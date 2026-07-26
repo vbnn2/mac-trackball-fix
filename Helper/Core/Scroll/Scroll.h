@@ -10,6 +10,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <Foundation/Foundation.h>
 #import "Constants.h"
+#import "ScrollModifiers.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -23,6 +24,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)isReceiving;
 
 + (void)resetState;
++ (void)modifierStateDidChange:(MFScrollModificationResult)modifications;
 //+ (void)suspend;
 
 + (void)appSwitcherModificationHasBeenDeactivated;

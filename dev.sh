@@ -12,6 +12,7 @@
 #   run-helper  Build and run only the embedded Helper in the foreground (advanced)
 #   app       Build and launch only the main app GUI
 #   test      Build + run the "Tests" scratch app (there is NO unit test suite)
+#   scroll-tests  Run deterministic scroll policy regressions
 #   install   Build, then copy the app to /Applications (stable path for permissions)
 #   publish-check  Validate Developer ID and notarization prerequisites
 #   publish   Archive, notarize, staple, verify, and package an arm64 Release build
@@ -158,6 +159,30 @@ do_build() {
   set -e
   [ "$build_status" -eq 0 ] || die "Build failed"
   [ -x "$(HELPER_BIN)" ] || die "Build did not produce a Helper binary"
+}
+
+do_scroll_tests() {
+  require_command clang
+
+  local test_dir
+  test_dir="$(mktemp -d)"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/ScrollCadencePolicyTests.c \
+    -o "$test_dir/scroll-cadence-tests"
+  "$test_dir/scroll-cadence-tests"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/DisplayLinkLifecyclePolicyTests.c \
+    -o "$test_dir/display-link-lifecycle-tests"
+  "$test_dir/display-link-lifecycle-tests"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/ScrollOutputPolicyTests.c \
+    -o "$test_dir/scroll-output-tests"
+  "$test_dir/scroll-output-tests"
+
+  rm -rf "$test_dir"
 }
 
 do_stop() {
@@ -400,6 +425,10 @@ case "${1:-run}" in
     open "$(build_dir)/$TEST_SCHEME.app"
     ;;
 
+  scroll-tests)
+    do_scroll_tests
+    ;;
+
   install)
     do_build
     do_stop
@@ -493,7 +522,9 @@ case "${1:-run}" in
     # since `launchctl submit` does not reliably forward the caller's complete environment.
     SCROLL_LOG_FILE="${2:-$SCROLL_LOG_FILE}"
     set_scroll_log_paths
-    /usr/bin/log stream --level debug --style compact \
+    # MFSCROLL telemetry uses info level, so recording it does not globally enable
+    # the helper's numerous unrelated per-frame debug traces.
+    /usr/bin/log stream --level info --style compact \
       --predicate 'senderImagePath CONTAINS "Mac Mouse Fix Helper" AND eventMessage CONTAINS "MFSCROLL_"' \
       | store_scroll_log_stream
     ;;

@@ -27,6 +27,9 @@
 #import "Actions.h"
 #import "EventUtility.h"
 #import "MathObjc.h"
+#import "ScrollCadencePolicy.h"
+#import "ScrollOutputPolicy.h"
+#import "ScrollSyntheticEvent.h"
 #import <stdatomic.h>
 
 @import IOKit;
@@ -60,6 +63,7 @@ static AXUIElementRef _systemWideAXUIElement; // TODO: should probably move this
 #pragma mark - Variables - dynamic
 
 static MFScrollModificationResult _modifications;
+static BOOL _modificationUsageNotified;
 static ScrollConfig *_scrollConfig;
 static MFScrollAnimationCurveParameters *_animationParams;
 static ScrollAnalysisResult _lastScrollAnalysisResult;
@@ -70,6 +74,10 @@ static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
 /// Explicit state resets (click, app change, config/modifier change) clear this memory.
 static CFTimeInterval _stableSlowCadenceEstimate;
 static double _stablePreviousModeledOutputSpeed;
+/// Sparse cadence may bootstrap only from an immediately preceding accepted report that
+/// was itself genuine low-unit, low-speed motion. Modeled speed alone is insufficient:
+/// a decelerated multi-unit report can be slow numerically while still ending a fast spin.
+static BOOL _stablePreviousReportCanSeedSlowCadence;
 
 /// A fast free-spin can be followed by one mechanical one-unit report after the intended motion has ended. Keep
 /// this guard outside ScrollAnalyzer so an unconfirmed rebound cannot change cadence or direction history.
@@ -131,7 +139,7 @@ static void legacyRecordOutput(int64_t px, MFDirection direction) {
             ? (double)_legacyOutputIntervalCount / _legacyOutputIntervalSum
             : 0;
         double outputSpeed = (double)_legacyOutputPixelSum / windowDuration;
-        DDLogDebug("MFSCROLL_OUTPUT: eventHz=%.1f maxGapMs=%.2f outputV=%.1f events=%lu outputPx=%lld direction=%ld",
+        DDLogInfo("MFSCROLL_OUTPUT: eventHz=%.1f maxGapMs=%.2f outputV=%.1f events=%lu outputPx=%lld direction=%ld",
                    eventHz,
                    _legacyOutputMaxGap * 1000.0,
                    outputSpeed,
@@ -189,7 +197,7 @@ static void startSettlingTailMicroGlide(int64_t distance,
                         MFMomentumHint momentumHint) {
         int64_t distanceDelta = (int64_t)magnitudeOfVector(distanceDeltaVec);
         if (animationPhase == kMFAnimationCallbackPhaseStart) {
-            DDLogDebug("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f path=settling-micro-glide",
+            DDLogInfo("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f path=settling-micro-glide",
                        MAX(0.0, (CACurrentMediaTime() - inputTime) * 1000.0),
                        inputQueueDelayMs);
         }
@@ -263,15 +271,40 @@ void resetState_Unsafe(void) {
     DDLogDebug("Scroll.m: reset-animator");
     [_animator cancel];
     [GestureScrollSimulator stopMomentumScroll]; /// Not sure if appropriate
+    /// Command-Tab owns a synthetic Command key-down outside TouchAnimator. Every
+    /// session reset must release it, including modifier release when the scroll tap
+    /// is disabled before another wheel report can arrive.
+    [Scroll appSwitcherModificationHasBeenDeactivated];
     [ScrollAnalyzer resetState];
     _stableSlowCadenceEstimate = 0;
     _stablePreviousModeledOutputSpeed = 0;
+    _stablePreviousReportCanSeedSlowCadence = NO;
     _stableSettlingTailGuardArmed = NO;
     _stableSettlingTailDirection = kMFDirectionNone;
     _stableSettlingTailLastFastInputTime = 0;
     _stableGestureReachedFastSpeed = NO;
     _stableFastTailReportHandled = NO;
     _stableFastTailContinuationPending = NO;
+}
+
++ (void)modifierStateDidChange:(MFScrollModificationResult)modifications {
+    dispatch_async(_scrollQueue, ^{
+        MFScrollModificationResult effectiveModifications = modifications;
+        if (HelperState.shared.trackballModeIsActive) {
+            effectiveModifications.effectMod = kMFScrollEffectModificationZoom;
+        }
+
+        if (![ScrollModifiers scrollModsAreEqual:effectiveModifications other:_modifications]) {
+            _modificationUsageNotified = NO;
+            DDLogInfo("MFSCROLL_CONFIG: action=modifier-callback oldInput=%ld oldEffect=%ld newInput=%ld newEffect=%ld reset-session=1",
+                       (long)_modifications.inputMod,
+                       (long)_modifications.effectMod,
+                       (long)effectiveModifications.inputMod,
+                       (long)effectiveModifications.effectMod);
+            resetState_Unsafe();
+            _modifications = effectiveModifications;
+        }
+    });
 }
 
 //+ (void)suspend {
@@ -363,7 +396,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
 
         BOOL shouldBeEnabled = atomic_load_explicit(&_eventTapShouldBeEnabled, memory_order_acquire);
-        DDLogDebug("MFSCROLL_TAP: action=%{public}@ reason=%{public}@ requestedEnabled=%d",
+        DDLogInfo("MFSCROLL_TAP: action=%{public}@ reason=%{public}@ requestedEnabled=%d",
                    shouldBeEnabled ? @"re-enable" : @"keep-disabled",
                    type == kCGEventTapDisabledByTimeout ? @"timeout" : @"user-input",
                    shouldBeEnabled);
@@ -378,6 +411,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return event;
     }
 
+    /// Our continuous/gesture output re-enters the HID tap by design so apps
+    /// receive normal routing semantics. Pass it through before field decoding,
+    /// target lookup, and raw-input telemetry. In the latest capture, these
+    /// self-generated events were over 90% of tap traffic.
+    if (type == kCGEventScrollWheel && MFScrollEventIsSynthetic(event)) {
+        return event;
+    }
+
     /// A click or drag changes which view owns the next scroll gesture, even when the frontmost bundle identifier
     /// stays the same. End the old session on the scroll queue, preserving event order with future wheel input, and
     /// pass the button event through untouched. This also mirrors trackpad behavior: pressing the pointer cancels
@@ -387,7 +428,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         || type == kCGEventOtherMouseDown) {
         int64_t buttonNumber = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1;
         dispatch_async(_scrollQueue, ^{
-            DDLogDebug("MFSCROLL_TARGET: mouse-down button=%lld action=reset-session",
+            DDLogInfo("MFSCROLL_TARGET: mouse-down button=%lld action=reset-session",
                        buttonNumber);
             resetState_Unsafe();
         });
@@ -427,9 +468,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     /// Raw input trace. `./dev.sh logs-record`
     ///
-    /// Kept rather than removed: every scroll-engine fix in this fork came out of this one line, and it costs
-    /// nothing when nobody's streaming — DDLogDebug expands to an `os_log_type_enabled()` guard (Logging.h:51), and
-    /// OS_LOG_TYPE_DEBUG is off unless a `log stream --level debug` is attached.
+    /// Kept rather than removed: every scroll-engine fix in this fork came out of this one line. It is emitted at
+    /// info level so the rolling recorder can capture it without globally enabling debug logs; MMF-generated wheel
+    /// events return above, keeping this path limited to physical or otherwise external input.
     ///
     /// Notes:
     /// - Logged *before* the early-out below, so passed-through (continuous / diagonal) events appear too. That's
@@ -438,7 +479,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     ///   `sudo log config --mode private_data:on`.
     /// - `line` vs `point` is the distinction that matters: point delta is already accelerated by macOS (one
     ///   `line=1` report was measured yielding point deltas of 1, 3, 8 and 13), so only `line` is a usable unit count.
-    DDLogDebug("MFSCROLL_INPUT: cont=%lld phase=%lld line=(%lld,%lld) point=(%lld,%lld) fixed=(%.3f,%.3f) diag=%d window=%lld",
+    DDLogInfo("MFSCROLL_INPUT: cont=%lld phase=%lld line=(%lld,%lld) point=(%lld,%lld) fixed=(%.3f,%.3f) diag=%d window=%lld",
               isPixelBased,
               scrollPhase,
               lineDeltaAxis1,
@@ -541,7 +582,7 @@ static void heavyProcessing(CGEventRef event,
         && scrollTargetWindowID != previousScrollTargetWindowID;
     if (scrollTargetAppChanged || scrollTargetWindowChanged) {
         NSString *reason = scrollTargetWindowChanged ? @"window-change" : @"app-change";
-        DDLogDebug("MFSCROLL_TARGET: %{public}@ app=%{public}@->%{public}@ window=%lld->%lld action=reset-session",
+        DDLogInfo("MFSCROLL_TARGET: %{public}@ app=%{public}@->%{public}@ window=%lld->%lld action=reset-session",
                    reason,
                    previousScrollTargetBundleID ?: @"",
                    currentScrollTargetBundleID,
@@ -567,13 +608,22 @@ static void heavyProcessing(CGEventRef event,
     }
 
     if (![ScrollModifiers scrollModsAreEqual:newMods other:_modifications]) {
-        DDLogDebug("MFSCROLL_CONFIG: action=modifier-change oldInput=%ld oldEffect=%ld newInput=%ld newEffect=%ld reset-session=1",
+        DDLogInfo("MFSCROLL_CONFIG: action=modifier-change oldInput=%ld oldEffect=%ld newInput=%ld newEffect=%ld reset-session=1",
                    (long)_modifications.inputMod,
                    (long)_modifications.effectMod,
                    (long)newMods.inputMod,
                    (long)newMods.effectMod);
         resetState_Unsafe();
         _modifications = newMods;
+        _modificationUsageNotified = NO;
+    }
+
+    BOOL modificationsAreActive =
+        _modifications.inputMod != kMFScrollInputModificationNone
+        || _modifications.effectMod != kMFScrollEffectModificationNone;
+    if (modificationsAreActive && !_modificationUsageNotified) {
+        [ScrollModifiers handleCurrentModificationHasBeenUsedWithEvent:event];
+        _modificationUsageNotified = YES;
     }
 
     /// Run preliminary scrollAnalysis
@@ -637,11 +687,19 @@ static void heavyProcessing(CGEventRef event,
         }
         
         /// Get display  under mouse pointer
-        CGDirectDisplayID displayID;
-        [HelperUtility displayUnderMousePointer:&displayID withEvent:event];
+        CGDirectDisplayID displayID = kCGNullDirectDisplay;
+        CVReturn displayResolveResult =
+            [HelperUtility displayUnderMousePointer:&displayID withEvent:event];
+        if (displayResolveResult != kCVReturnSuccess
+            || displayID == kCGNullDirectDisplay) {
+            displayID = CGMainDisplayID();
+            DDLogInfo("MFSCROLL_DISPLAY: action=context-fallback result=%d fallbackDisplay=%u",
+                      displayResolveResult,
+                      displayID);
+        }
 
         CGPoint pointerLocation = CGEventGetLocation(event);
-        DDLogDebug("MFSCROLL_CONTEXT: target=%{public}@ window=%lld display=%u pointer=(%.1f,%.1f) mouseMoved=%d animatorRequestedRunning=%d",
+        DDLogInfo("MFSCROLL_CONTEXT: target=%{public}@ window=%lld display=%u pointer=(%.1f,%.1f) mouseMoved=%d animatorRequestedRunning=%d",
                    currentScrollTargetBundleID,
                    scrollTargetWindowID,
                    displayID,
@@ -660,7 +718,7 @@ static void heavyProcessing(CGEventRef event,
         ///     `linkToDisplayUnderMousePointerWithEvent:` no-ops when the display hasn't changed, so it's cheap,
         ///     and it runs on every gesture start (this block) — including mid-momentum — so it isn't stranded
         ///     the way the old `!isRunning`-gated relink was.
-        [_animator.displayLink linkToDisplayUnderMousePointerWithEvent:event];
+        [_animator.displayLink linkToDisplay:displayID];
         /// Get scrollConfig
         _scrollConfig = [ScrollConfig scrollConfigWithModifiers:newMods inputAxis:inputAxis display:displayID];
         
@@ -728,7 +786,7 @@ static void heavyProcessing(CGEventRef event,
                 /// It will receive the below one-shot tail blend, then TouchAnimator will retarget with its
                 /// preserved live velocity on this same report.
                 stableSettlingTailSameDirectionCandidate = YES;
-                DDLogDebug("MFSCROLL_TAIL: action=retarget-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=1 guard=disarm",
+                DDLogInfo("MFSCROLL_TAIL: action=retarget-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=1 guard=disarm",
                            physicalInputGap * 1000.0,
                            timeSinceFastInput * 1000.0,
                            currentAnimationSpeed);
@@ -744,7 +802,7 @@ static void heavyProcessing(CGEventRef event,
                                             inputQueueDelayMs,
                                             _scrollConfig,
                                             _modifications);
-                DDLogDebug("MFSCROLL_TAIL: action=micro-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=0 microPx=%lld durationMs=%.1f continuation=armed guard=disarm",
+                DDLogInfo("MFSCROLL_TAIL: action=micro-same gapMs=%.1f sinceFastMs=%.1f currentV=%.1f animatorRunning=0 microPx=%lld durationMs=%.1f continuation=armed guard=disarm",
                            physicalInputGap * 1000.0,
                            timeSinceFastInput * 1000.0,
                            currentAnimationSpeed,
@@ -759,7 +817,7 @@ static void heavyProcessing(CGEventRef event,
                                         inputQueueDelayMs,
                                         _scrollConfig,
                                         _modifications);
-            DDLogDebug("MFSCROLL_TAIL: action=micro-reversal gapMs=%.1f sinceFastMs=%.1f currentV=%.1f oldDirection=%ld candidateDirection=%ld microPx=%lld durationMs=%.1f guard=disarm",
+            DDLogInfo("MFSCROLL_TAIL: action=micro-reversal gapMs=%.1f sinceFastMs=%.1f currentV=%.1f oldDirection=%ld candidateDirection=%ld microPx=%lld durationMs=%.1f guard=disarm",
                        physicalInputGap * 1000.0,
                        timeSinceFastInput * 1000.0,
                        currentAnimationSpeed,
@@ -773,6 +831,7 @@ static void heavyProcessing(CGEventRef event,
         _stableSettlingTailDirection = kMFDirectionNone;
         _stableSettlingTailLastFastInputTime = 0;
         if (!stableSettlingTailSameDirectionCandidate) {
+            _stablePreviousReportCanSeedSlowCadence = NO;
             CFRelease(event);
             return;
         }
@@ -843,7 +902,8 @@ static void heavyProcessing(CGEventRef event,
     double stableRateLimitPx = 0;
     double stableOutputSpeedRatio = 0;
     BOOL stableRateLimited = NO;
-    BOOL stableOverloadControlEnabled = NO;
+    BOOL stableAdaptiveControlEnabled = NO;
+    BOOL stableBoundsEnabled = NO;
     BOOL stableHasMeasuredTickInterval = NO;
     BOOL stableSlowCadenceContinuationForTick = NO;
     CFTimeInterval stableSlowCadenceForTick = 0;
@@ -909,8 +969,14 @@ static void heavyProcessing(CGEventRef event,
         ///     was px-per-event. Feeding it real velocity would silently invalidate its tuning, and multiplying its
         ///     output by the unit count (what we did first) stacks a third multiplier on top of it and fastScroll —
         ///     measured at ~100k px/s on a fast spin. This model has one meaning for "speed" and one for "distance".
-        double pxPerUnit = _scrollConfig.pxAtRefSpeed * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma - 1.0);
+        double pxPerUnit = MFScrollPixelsPerUnit(
+            scrollSpeed,
+            _scrollConfig.pxAtRefSpeed,
+            _scrollConfig.refSpeed,
+            _scrollConfig.gamma,
+            _scrollConfig.velocityModelDistanceMultiplier);
         double pxForThisTickDouble = pxPerUnit * unitsForThisTick;
+        double fastScrollFactor = 1.0;
 
         ///
         /// Apply fast scroll to pxToScrollForThisTick
@@ -921,7 +987,7 @@ static void heavyProcessing(CGEventRef event,
             /// Evaluate fast scroll
             /// +1 cause consecutiveScrollSwipeCounter starts counting at 0, and fsThreshold at 1
             double consecutiveSwipes = scrollAnalysisResult.consecutiveScrollSwipeCounter;
-            double fastScrollFactor = [_scrollConfig.fastScrollCurve evaluateAt:consecutiveSwipes+1];
+            fastScrollFactor = [_scrollConfig.fastScrollCurve evaluateAt:consecutiveSwipes+1];
             
             /// LImit fastScroll
             /// - Limit it to 100,000, which is still super extreme, but it can grow far FAR larger. Especially with a free spinning wheel.
@@ -940,11 +1006,16 @@ static void heavyProcessing(CGEventRef event,
         /// TB800 enqueue 17k–24k px/s during a hard spin. Limit distance by the real time represented by this report
         /// instead. The first report has no interval, so retain the old bounded-start behavior for that one report.
         pxForThisTickBeforeRateLimit = pxForThisTickDouble;
-        stableOverloadControlEnabled = _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
+        stableAdaptiveControlEnabled =
+            _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
+        stableBoundsEnabled = !_scrollConfig.useAppleAcceleration;
 
-        double modeledOutputSpeed = _scrollConfig.pxAtRefSpeed
-            * _scrollConfig.refSpeed
-            * pow(scrollSpeed / _scrollConfig.refSpeed, _scrollConfig.gamma);
+        double modeledOutputSpeed = MFScrollModeledOutputSpeed(
+            scrollSpeed,
+            _scrollConfig.pxAtRefSpeed,
+            _scrollConfig.refSpeed,
+            _scrollConfig.gamma,
+            _scrollConfig.velocityModelDistanceMultiplier) * fastScrollFactor;
         stableOutputSpeedRatio = modeledOutputSpeed / _scrollConfig.stableMaximumOutputSpeed;
         stableAnimationCadenceIntervalForTick = scrollAnalysisResult.timeBetweenTicks;
 
@@ -953,7 +1024,7 @@ static void heavyProcessing(CGEventRef event,
         /// already recognized that acceleration on this report, so let a materially shorter raw interval drive only
         /// the directly-driven animation duration. Distance, analyzer history, adaptive smoothing, and deceleration
         /// remain unchanged.
-        if (stableOverloadControlEnabled && stableHasMeasuredTickInterval) {
+        if (stableAdaptiveControlEnabled && stableHasMeasuredTickInterval) {
             double rawCadenceInterval = MAX(
                 scrollAnalysisResult.DEBUG_timeBetweenTicksRaw,
                 _scrollConfig.consecutiveScrollTickIntervalMin);
@@ -966,7 +1037,7 @@ static void heavyProcessing(CGEventRef event,
                 && modeledOutputSpeed > _stablePreviousModeledOutputSpeed;
             if (cadenceAcceleratedMaterially && modeledSpeedAccelerated) {
                 stableAnimationCadenceIntervalForTick = rawCadenceInterval;
-                DDLogDebug("MFSCROLL_ADAPTIVE: cadence=measured rawMs=%.1f smoothedMs=%.1f modeledV=%.1f previousModeledV=%.1f action=use-raw-acceleration-cadence",
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured rawMs=%.1f smoothedMs=%.1f modeledV=%.1f previousModeledV=%.1f action=use-raw-acceleration-cadence",
                            rawCadenceInterval * 1000.0,
                            scrollAnalysisResult.timeBetweenTicks * 1000.0,
                            modeledOutputSpeed,
@@ -989,15 +1060,15 @@ static void heavyProcessing(CGEventRef event,
             && !scrollAnalysisResult.scrollDirectionDidChange
             && unitsForThisTick <= 2
             && modeledOutputSpeed < slowCadenceSpeedMax;
-        BOOL previousInputWasSlow = _stablePreviousModeledOutputSpeed > 0
-            && _stablePreviousModeledOutputSpeed < slowCadenceSpeedMax;
-        stableSlowCadenceContinuationForTick = stableOverloadControlEnabled
-            && firstConsecutive
-            && previousInputWasSlow
-            && unitsForThisTick <= 2
-            && (scrollAnalysisResult.scrollDirectionDidChange
-                || physicalInputGap > _scrollConfig.consecutiveScrollTickIntervalMax)
-            && physicalInputGap <= _scrollConfig.stableSlowCadenceMemoryMaxInterval;
+        stableSlowCadenceContinuationForTick = MFScrollShouldContinueSlowCadence(
+            stableAdaptiveControlEnabled,
+            firstConsecutive,
+            _stablePreviousReportCanSeedSlowCadence,
+            unitsForThisTick,
+            scrollAnalysisResult.scrollDirectionDidChange,
+            physicalInputGap,
+            _scrollConfig.consecutiveScrollTickIntervalMax,
+            _scrollConfig.stableSlowCadenceMemoryMaxInterval);
 
         if (stableSlowCadenceContinuationForTick) {
             /// Preserve cadence only in proportion to how recent the preceding report was. A one-unit input after
@@ -1055,7 +1126,7 @@ static void heavyProcessing(CGEventRef event,
                 MIN(cadenceKnownBeforeTick, stableSlowCadenceForTick),
                 _scrollConfig.consecutiveScrollTickIntervalMax);
             stableAdaptiveSlowSmoothingBlendForTick = stableSlowCadenceContinuationBlendForTick;
-            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=remembered gapMs=%.1f priorEstimateMs=%.1f estimateMs=%.1f durationRefMs=%.1f memoryBlend=%.2f reversalBlend=%.2f blend=%.2f reversal=%d action=%{public}@",
+            DDLogInfo("MFSCROLL_ADAPTIVE: cadence=remembered gapMs=%.1f priorEstimateMs=%.1f estimateMs=%.1f durationRefMs=%.1f memoryBlend=%.2f reversalBlend=%.2f blend=%.2f reversal=%d previousSeed=%d action=%{public}@",
                        physicalInputGap * 1000.0,
                        stableSlowCadenceEstimateBeforeTick * 1000.0,
                        stableSlowCadenceForTick * 1000.0,
@@ -1064,17 +1135,20 @@ static void heavyProcessing(CGEventRef event,
                        stableSlowCadenceReversalBlendForTick,
                        stableSlowCadenceContinuationBlendForTick,
                        scrollAnalysisResult.scrollDirectionDidChange,
+                       _stablePreviousReportCanSeedSlowCadence,
                        stableSlowCadenceReversalBlendForTick < 1.0
                            ? @"taper-reversal-cadence"
                            : stableSlowCadenceContinuationBlendForTick < 1.0
                            ? @"taper-stale-cadence"
                            : @"use-slow-smoothness");
-        } else if (stableOverloadControlEnabled && !stableHasMeasuredTickInterval) {
+        } else if (stableAdaptiveControlEnabled && !stableHasMeasuredTickInterval) {
             stableAdaptiveSlowSmoothingBlendForTick = 0.0;
-            DDLogDebug("MFSCROLL_ADAPTIVE: cadence=unknown action=use-normal-smoothness");
+            DDLogInfo("MFSCROLL_ADAPTIVE: cadence=unknown previousSeed=%d units=%lld action=use-normal-smoothness",
+                      _stablePreviousReportCanSeedSlowCadence,
+                      unitsForThisTick);
         }
 
-        if (stableOverloadControlEnabled
+        if (stableAdaptiveControlEnabled
             && stableHasMeasuredTickInterval
             && modeledOutputSpeed < slowCadenceSpeedMax
             && unitsForThisTick <= 2) {
@@ -1113,7 +1187,7 @@ static void heavyProcessing(CGEventRef event,
         /// deliberate resume looks the same. Reduce only the first response. A second report proves continued
         /// movement and therefore regains the speed-adaptive smoothness curve and full distance.
         double currentLegacyAnimationSpeed = magnitudeOfVector(_animator.getLastAnimationSpeed);
-        stableFastTailReport = stableOverloadControlEnabled
+        stableFastTailReport = stableAdaptiveControlEnabled
             && !firstConsecutive
             && !scrollAnalysisResult.scrollDirectionDidChange
             && _stableGestureReachedFastSpeed
@@ -1131,7 +1205,7 @@ static void heavyProcessing(CGEventRef event,
             double distanceScale = _scrollConfig.stableFastTailDistanceScale
                 + stableFastTailContinuity * (1.0 - _scrollConfig.stableFastTailDistanceScale);
             pxForThisTickDouble *= distanceScale;
-            DDLogDebug("MFSCROLL_TAIL: action=blend source=%{public}@ rawV=%.1f gapMs=%.1f currentV=%.1f continuity=%.2f distanceScale=%.2f fullPx=%.1f outputPx=%.1f",
+            DDLogInfo("MFSCROLL_TAIL: action=blend source=%{public}@ rawV=%.1f gapMs=%.1f currentV=%.1f continuity=%.2f distanceScale=%.2f fullPx=%.1f outputPx=%.1f",
                        stableSettlingTailSameDirectionCandidate ? @"settling-same" : @"ordinary",
                        scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
                        physicalInputGap * 1000.0,
@@ -1142,7 +1216,14 @@ static void heavyProcessing(CGEventRef event,
                        pxForThisTickDouble);
         }
 
-        if (stableOverloadControlEnabled
+        _stablePreviousReportCanSeedSlowCadence = MFScrollReportCanSeedSlowCadence(
+            unitsForThisTick,
+            modeledOutputSpeed,
+            slowCadenceSpeedMax,
+            stableFastTailReport,
+            stableSettlingTailSameDirectionCandidate);
+
+        if (stableAdaptiveControlEnabled
             && (stableHasMeasuredTickInterval || stableSlowCadenceContinuationForTick)) {
             stableAdaptiveSlowSmoothingBlendForTick = stableSlowCadenceContinuationForTick
                 ? stableSlowCadenceContinuationBlendForTick
@@ -1155,13 +1236,16 @@ static void heavyProcessing(CGEventRef event,
             }
         }
 
-        if (stableOverloadControlEnabled) {
+        if (stableBoundsEnabled) {
             double rateInterval = stableHasMeasuredTickInterval
                 ? MAX(scrollAnalysisResult.DEBUG_timeBetweenTicksRaw, _scrollConfig.velocityMeasurementIntervalMin)
                 : 0;
-            stableRateLimitPx = stableHasMeasuredTickInterval
-                ? _scrollConfig.stableMaximumOutputSpeed * rateInterval
-                : _scrollConfig.stableMaximumInitialDistance;
+            stableRateLimitPx = MFScrollOutputDistanceLimit(
+                stableHasMeasuredTickInterval,
+                rateInterval,
+                _scrollConfig.velocityMeasurementIntervalMin,
+                _scrollConfig.stableMaximumOutputSpeed,
+                _scrollConfig.stableMaximumInitialDistance);
 
             if (pxForThisTickDouble > stableRateLimitPx) {
                 DDLogDebug("Scroll.m: rate limiting px %.1f -> %.1f over %.2fms (modeled %.0f px/s, limit %.0f px/s)",
@@ -1173,15 +1257,11 @@ static void heavyProcessing(CGEventRef event,
                 pxForThisTickDouble = stableRateLimitPx;
                 stableRateLimited = YES;
             }
-        } else {
-            /// Keep the existing per-report cap for the non-Regular fallback curves and gesture effects.
-            stableRateLimitPx = _scrollConfig.pxAtRefSpeed * 12.0;
-            if (pxForThisTickDouble > stableRateLimitPx) {
-                pxForThisTickDouble = stableRateLimitPx;
-            }
         }
 
-        pxToScrollForThisTick = llround(pxForThisTickDouble);
+        /// Every accepted physical report remains visible, even at extreme expert
+        /// tuning values where the mathematical result falls below half a pixel.
+        pxToScrollForThisTick = MAX(1, llround(pxForThisTickDouble));
 
         /// Debug
         DDLogDebug("Scroll.m: tuning v=%.1f rawV=%.1f units/s (units: %lld, dt: %.3f) -> pxPerUnit=%.1f -> px=%lld [ref=%.0f pxAtRef=%.0f gamma=%.2f]",
@@ -1204,7 +1284,7 @@ static void heavyProcessing(CGEventRef event,
     /// acceleration branch left System/Apple acceleration able to append the reversed tick to the old gesture.
     /// Cancel the old session, then continue below so the physical reversal report is still delivered immediately.
     if (scrollAnalysisResult.scrollDirectionDidChange) {
-        DDLogDebug("MFSCROLL_DIRECTION: action=cancel-old-session appleAcceleration=%d keepCurrentTick=1",
+        DDLogInfo("MFSCROLL_DIRECTION: action=cancel-old-session appleAcceleration=%d keepCurrentTick=1",
                    _scrollConfig.useAppleAcceleration);
         [_animator cancel];
     }
@@ -1291,14 +1371,14 @@ static void heavyProcessing(CGEventRef event,
             /// Bound carry-over by time, not by an arbitrary pixel count. At normal speed the generous 200ms
             /// horizon is effectively inactive. As input reaches the rate ceiling it contracts to 85ms, preventing
             /// overload from becoming a long queue that continues drifting after the ring stops.
-            double stableFastness = stableOverloadControlEnabled
+            double stableFastness = stableBoundsEnabled
                 ? CLIP((stableOutputSpeedRatio - 0.5) / 0.5, 0.0, 1.0)
                 : 0.0;
             double slowToFastCarryRatio = 0.200 / 0.070;
-            double stableCarryLimitPx = _scrollConfig.stableMaximumCarryDistance
+            double stableCarryLimitPx = configCopyForBlock.stableMaximumCarryDistance
                 * (slowToFastCarryRatio + stableFastness * (1.0 - slowToFastCarryRatio));
             double stableDroppedCarryPx = 0;
-            if (stableOverloadControlEnabled && pxLeftToScroll > stableCarryLimitPx) {
+            if (stableBoundsEnabled && pxLeftToScroll > stableCarryLimitPx) {
                 stableDroppedCarryPx = pxLeftToScroll - stableCarryLimitPx;
                 pxLeftToScroll = stableCarryLimitPx;
             }
@@ -1307,12 +1387,12 @@ static void heavyProcessing(CGEventRef event,
             double delta = pxToScrollForThisTick + pxLeftToScroll;
             
             /// Get curve params
-            MFScrollAnimationCurveParameters *pCurve = _scrollConfig.animationCurveParams;
+            MFScrollAnimationCurveParameters *pCurve = configCopyForBlock.animationCurveParams;
             
             /// Get baseDuration
             
             double baseDuration;
-            double effectiveSmoothnessAmount = _scrollConfig.u_smoothnessAmount;
+            double effectiveSmoothnessAmount = configCopyForBlock.u_smoothnessAmount;
             
             if (pCurve.baseMsPerStep != -1) {
                 
@@ -1330,14 +1410,15 @@ static void heavyProcessing(CGEventRef event,
                 Curve *baseTimeCurve    = pCurve.baseMsPerStepCurve;
                 double baseTimeStart    = [baseTimeCurve evaluateAt:0.0]; /// The non-sped-up/maximum duration for the baseCurve
                 double baseTimeEnd      = [baseTimeCurve evaluateAt:1.0];
-                double tickStart        = _scrollConfig.animationTickStart;
+                double configuredTickStart = configCopyForBlock.animationTickStart;
+                double tickStart        = MIN(configuredTickStart, baseTimeStart);
                 /// ^ Fork: was `consecutiveScrollTickIntervalMax`. Those two were the same constant (160ms) but mean
                 ///     different things, and we've since raised the max to ~500ms so a slow ring counts as one
                 ///     continuous scroll. Left coupled, that would re-anchor this curve: a 260ms tick would sample
                 ///     mid-curve and get a *shorter* animation (~415ms -> ~172ms) exactly when it needs a longer one.
                 ///     `animationTickStart` keeps the duration mapping where upstream tuned it.
-                double tickEnd          = _scrollConfig.consecutiveScrollTickIntervalMin;
-                double tick             = stableOverloadControlEnabled
+                double tickEnd          = configCopyForBlock.consecutiveScrollTickIntervalMin;
+                double tick             = stableAdaptiveControlEnabled
                     ? stableAnimationCadenceIntervalForTick
                     : scrollAnalysisResult.timeBetweenTicks;
                 
@@ -1347,10 +1428,8 @@ static void heavyProcessing(CGEventRef event,
                 /// - Overall this is quite confusing and complex to understand. Maybe we should remove it.
                 /// - Update: This is also pretty much never used atm I think.
                 
-                if (tickStart > baseTimeStart) {
-                    
-                    tickStart = baseTimeStart;
-                    DDLogDebug("Scroll.m: animation init - baseMsPerStepCurve - adjusting tickStart below consecutiveScrollTickIntervalMax to baseTimeStart: %f", baseTimeStart);
+                if (configuredTickStart > baseTimeStart) {
+                    DDLogDebug("Scroll.m: animation init - baseMsPerStepCurve - adjusting tickStart from %f to baseTimeStart: %f", configuredTickStart, tickStart);
                     assert(false);
                 }
                 
@@ -1359,7 +1438,7 @@ static void heavyProcessing(CGEventRef event,
                 /// - Scroll analyzer sets tick to `DBL_MAX` to signify that there are no previous consecutive ticks. (Not sure if  that's a great idea) We have to set it to a sendible value here so the scaling Math doesn't break.
                 
                 if (tick == DBL_MAX) {
-                    tick = _scrollConfig.consecutiveScrollTickIntervalMax;
+                    tick = configCopyForBlock.consecutiveScrollTickIntervalMax;
                 }
                 
                 /// TESTING
@@ -1383,9 +1462,10 @@ static void heavyProcessing(CGEventRef event,
                 /// Also see:
                 /// - For further discussion, see the "Ensure that `tick <= max`" section inside `ScrollAnalyzer.m`
                 
-                if (tick > _scrollConfig.consecutiveScrollTickIntervalMax && tick != DBL_MAX) {
-                    DDLogError("Scroll.m: animation init - tickTime is over max. This is a bug but we can recover. tickTime: %f", tick);
-                    tick = _scrollConfig.consecutiveScrollTickIntervalMax;
+                if (tick > configCopyForBlock.consecutiveScrollTickIntervalMax && tick != DBL_MAX) {
+                    double invalidTick = tick;
+                    tick = configCopyForBlock.consecutiveScrollTickIntervalMax;
+                    DDLogError("Scroll.m: animation init - tickTime is over max. This is a bug but we can recover. tickTime: %f cappedTickTime: %f", invalidTick, tick);
                     assert(false);
                 };
                 
@@ -1401,26 +1481,26 @@ static void heavyProcessing(CGEventRef event,
                 baseDuration = (double)b/1000.0;
                 
                 /// Debug
-                DDLogDebug("Scroll.m: animation init - baseMsPerStepCurve - calculating animation baseDuration - baseTimeEnd: %.1f, baseBaseTimeStart: %.1f, tick: %.1f, tickEnd: %.1f, tickStart: %1.f, consecutiveScrollTickIntervalMax: %.1f, result: %.1f", baseTimeEnd, baseTimeStart, tick*1000, tickEnd*1000, tickStart*1000, _scrollConfig.consecutiveScrollTickIntervalMax*1000, baseDuration*1000);
+                DDLogDebug("Scroll.m: animation init - baseMsPerStepCurve - calculating animation baseDuration - baseTimeEnd: %.1f, baseBaseTimeStart: %.1f, tick: %.1f, tickEnd: %.1f, tickStart: %1.f, consecutiveScrollTickIntervalMax: %.1f, result: %.1f", baseTimeEnd, baseTimeStart, tick*1000, tickEnd*1000, tickStart*1000, configCopyForBlock.consecutiveScrollTickIntervalMax*1000, baseDuration*1000);
             }
 
             /// The first report has no reliable velocity and is normally only ~20px. A short directly-driven phase
             /// makes that small distance visible immediately instead of presenting several one-pixel frames that
             /// feel like an input delay. Later reports retain the user's full duration tuning.
-            if (stableOverloadControlEnabled
+            if (stableAdaptiveControlEnabled
                 && (firstConsecutive || stableRestartAfterExpiredFastTailForTick)) {
-                baseDuration = MIN(baseDuration, _scrollConfig.stableInitialResponseBaseDurationMax);
+                baseDuration = MIN(baseDuration, configCopyForBlock.stableInitialResponseBaseDurationMax);
             }
 
             /// Very slow TB800 movement produces sparse change reports, so the fixed slider value can expose each
             /// report as a separate short burst. Blend extra time in only at the bottom of the speed range. The
             /// animation parameters above already contain the slider's fixed duration factor, so apply only the
             /// ratio between the adaptive factor and that fixed factor here.
-            if (stableOverloadControlEnabled) {
-                double selectedSmoothness = _scrollConfig.u_smoothnessAmount;
-                double slowSmoothness = MAX(selectedSmoothness, _scrollConfig.u_slowSmoothnessAmount);
+            if (stableAdaptiveControlEnabled) {
+                double selectedSmoothness = configCopyForBlock.u_smoothnessAmount;
+                double slowSmoothness = MAX(selectedSmoothness, configCopyForBlock.u_slowSmoothnessAmount);
                 double transitionUnit = CLIP(stableOutputSpeedRatio
-                    / _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio, 0.0, 1.0);
+                    / configCopyForBlock.u_adaptiveSmoothnessEndSpeedRatio, 0.0, 1.0);
                 double smoothTransition = transitionUnit * transitionUnit * (3.0 - 2.0 * transitionUnit);
                 double speedAdaptiveSmoothness = slowSmoothness
                     + smoothTransition * (selectedSmoothness - slowSmoothness);
@@ -1439,23 +1519,23 @@ static void heavyProcessing(CGEventRef event,
                 /// memory so a resumed first report cannot look stuck; a faster report still replans immediately.
                 double cadenceDuration = MIN(
                     stableSlowCadenceDurationReferenceForTick
-                        * _scrollConfig.stableSlowCadenceBaseDurationRatio,
-                    _scrollConfig.stableSlowCadenceBaseDurationMax);
+                        * configCopyForBlock.stableSlowCadenceBaseDurationRatio,
+                    configCopyForBlock.stableSlowCadenceBaseDurationMax);
                 double taperedCadenceDuration = baseDuration
                     + stableSlowCadenceContinuationBlendForTick
                     * (cadenceDuration - baseDuration);
                 baseDuration = MAX(baseDuration, taperedCadenceDuration);
             }
             if (stableFastTailReport) {
-                double durationScale = _scrollConfig.stableFastTailDurationScale
-                    + stableFastTailContinuity * (1.0 - _scrollConfig.stableFastTailDurationScale);
+                double durationScale = configCopyForBlock.stableFastTailDurationScale
+                    + stableFastTailContinuity * (1.0 - configCopyForBlock.stableFastTailDurationScale);
                 baseDuration *= durationScale;
             }
             if (stableRestartAfterExpiredFastTailForTick) {
-                DDLogDebug("MFSCROLL_TAIL: action=restart-after-expired-tail gapMs=%.1f smoothness=%.2f openingCapMs=%.1f baseMs=%.1f",
+                DDLogInfo("MFSCROLL_TAIL: action=restart-after-expired-tail gapMs=%.1f smoothness=%.2f openingCapMs=%.1f baseMs=%.1f",
                            physicalInputGap * 1000.0,
                            effectiveSmoothnessAmount,
-                           _scrollConfig.stableInitialResponseBaseDurationMax * 1000.0,
+                           configCopyForBlock.stableInitialResponseBaseDurationMax * 1000.0,
                            baseDuration * 1000.0);
             }
 
@@ -1489,7 +1569,7 @@ static void heavyProcessing(CGEventRef event,
                 /// new curve's average speed. Build a short cubic transition whose initial slope exactly matches the
                 /// current output speed and whose exit slope reaches the new distance/duration target. New input
                 /// therefore begins accelerating on this report while velocity remains continuous across the frame.
-                if (stableOverloadControlEnabled
+                if (stableAdaptiveControlEnabled
                     && isRunning
                     && baseCurve != nil
                     && retargetStartSpeed > 0.0
@@ -1537,9 +1617,9 @@ static void heavyProcessing(CGEventRef event,
                 /// Increase release friction only near the overload ceiling. This leaves reading-speed Glide
                 /// untouched while preventing a hard spin from inheriting the same long exponential tail.
                 double effectiveDragCoefficient = pCurve.dragCoefficient;
-                if (stableOverloadControlEnabled && pCurve.dragCoefficient < _scrollConfig.stableFastDragCoefficient) {
+                if (stableBoundsEnabled && pCurve.dragCoefficient < configCopyForBlock.stableFastDragCoefficient) {
                     effectiveDragCoefficient += stableFastness
-                        * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
+                        * (configCopyForBlock.stableFastDragCoefficient - pCurve.dragCoefficient);
                 }
                 HybridCurve *hc = [[BezierHybridCurve alloc]
                      initWithBaseCurve:baseCurve
@@ -1572,13 +1652,15 @@ static void heavyProcessing(CGEventRef event,
             /// Stable-engine tuning trace. One line per physical report is low-volume on the TB800 and exposes
             /// whether perceived drift comes from retained distance, the base curve, or the drag tail.
             double effectiveDragCoefficientForLog = pCurve.dragCoefficient;
-            if (stableOverloadControlEnabled && pCurve.dragCoefficient < _scrollConfig.stableFastDragCoefficient) {
+            if (stableBoundsEnabled && pCurve.dragCoefficient < configCopyForBlock.stableFastDragCoefficient) {
                 effectiveDragCoefficientForLog += stableFastness
-                    * (_scrollConfig.stableFastDragCoefficient - pCurve.dragCoefficient);
+                    * (configCopyForBlock.stableFastDragCoefficient - pCurve.dragCoefficient);
             }
-            DDLogDebug("MFSCROLL_LEGACY: rawV=%.1f filteredV=%.1f rawPx=%.1f tickPx=%lld rateCapPx=%.1f limited=%d retainedPx=%.1f carryCapPx=%.1f droppedPx=%.1f totalPx=%.1f currentV=%.1f smoothness=%.2f adaptiveBlend=%.2f cadenceKnown=%d slowCadence=%d cadenceTargetMs=%.1f cadenceDurationRefMs=%.1f retarget=%d targetV=%.1f blendMs=%.1f baseMs=%.1f durationMs=%.1f glideCoeff=%.2f cadenceMs=%.2f baseCadenceMs=%.2f direction=%ld",
+            DDLogInfo("MFSCROLL_LEGACY: rawV=%.1f filteredV=%.1f modelScale=%.2f bounds=%d rawPx=%.1f tickPx=%lld rateCapPx=%.1f limited=%d retainedPx=%.1f carryCapPx=%.1f droppedPx=%.1f totalPx=%.1f currentV=%.1f smoothness=%.2f adaptiveBlend=%.2f cadenceKnown=%d slowCadence=%d cadenceTargetMs=%.1f cadenceDurationRefMs=%.1f retarget=%d targetV=%.1f blendMs=%.1f baseMs=%.1f durationMs=%.1f glideCoeff=%.2f cadenceMs=%.2f baseCadenceMs=%.2f direction=%ld",
                        scrollAnalysisResult.DEBUG_velocityInUnitsPerSecondRaw,
                        scrollAnalysisResult.velocityInUnitsPerSecond,
+                       configCopyForBlock.velocityModelDistanceMultiplier,
+                       stableBoundsEnabled,
                        pxForThisTickBeforeRateLimit,
                        pxToScrollForThisTick,
                        stableRateLimitPx,
@@ -1652,7 +1734,7 @@ static void heavyProcessing(CGEventRef event,
             
             /// Send scroll
             if (animationPhase == kMFAnimationCallbackPhaseStart) {
-                DDLogDebug("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f",
+                DDLogInfo("MFSCROLL_LATENCY: inputToFirstOutputMs=%.2f inputQueueMs=%.2f",
                            MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0),
                            inputQueueDelayMs);
             }
@@ -1903,6 +1985,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         /// Do not attach ScrollPhase to this wheel-style output. GestureScrollSimulator is the separate output path
         /// for events which intentionally emulate a trackpad gesture and provides the matching gesture event stream.
         CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitPixel, 2, 0, 0);
+        MFScrollMarkSyntheticEvent(event);
         CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
         CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, eventPhase);
         CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, continuousMomentumPhase);
@@ -1971,6 +2054,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         
         /// Create a real line-based scroll event.
         CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitLine, 2, 0, 0);
+        MFScrollMarkSyntheticEvent(event);
         CGEventSetTimestamp(event, (CGEventTimestamp)(CACurrentMediaTime() * NSEC_PER_SEC));
         
         /// Get line deltas

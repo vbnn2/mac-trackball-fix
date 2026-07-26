@@ -146,9 +146,16 @@ import CoreGraphics
 
         setPrimaryClickExitTapEnabled(mode != .off)
 
+        /// End any in-flight scroll/effect immediately. This runs before SwitchMaster
+        /// toggles the tap, so leaving Zoom cannot strand a terminal phase waiting for
+        /// a wheel event that will never arrive.
+        let activeModifiers = Modifiers.modifiers(with: nil)
+        let scrollModifications = ScrollModifiers.currentModifications(activeModifiers: activeModifiers)
+        Scroll.modifierStateDidChange(scrollModifications)
+
         /// The scroll tap has to be on while a mode is active, so the ring can be turned into zoom even with no
         /// modifiers held. SwitchMaster decides tap state, so tell it something changed.
-        SwitchMaster.shared.helperStateChanged()
+        SwitchMaster.shared.trackballModeChanged()
     }
 
     /// Left/right click exit tap.

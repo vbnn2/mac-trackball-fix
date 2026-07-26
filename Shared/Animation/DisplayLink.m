@@ -25,6 +25,8 @@
 #import "NSScreen+Additions.h"
 #import "SharedUtility.h"
 #import "IOUtility.h"
+#import "DisplayLinkLifecyclePolicy.h"
+#import <stdatomic.h>
 
 #import "Logging.h"
 
@@ -53,11 +55,15 @@ typedef enum {
     /// Guard that short handoff so queue work never touches a CVDisplayLink that main is replacing.
     BOOL _displayLinkRefreshInFlight;
     BOOL _startRequestedWhileRefreshInFlight;
+    uint64_t _lifecycleGeneration;
+    uint64_t _deferredStartGeneration;
     dispatch_queue_t _displayLinkQueue;
     MFDisplayLinkRequestedState _requestedState;
     MFDisplayLinkWorkType _optimizedWorkType;
     CFTimeInterval _lastCallbackTime;
     CFTimeInterval _requestedStartTime;
+    CFTimeInterval _lastBacklogLogTime;
+    atomic_bool _callbackDeliveryQueued;
 }
 
 @synthesize dispatchQueue=_displayLinkQueue;
@@ -151,6 +157,9 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         _displayLinkIsOutdated = NO;
         _displayLinkRefreshInFlight = NO;
         _startRequestedWhileRefreshInFlight = NO;
+        _lifecycleGeneration = 0;
+        _deferredStartGeneration = 0;
+        atomic_init(&_callbackDeliveryQueued, false);
         
         /// Init `_requestedState`
         _requestedState = kMFDisplayLinkRequestedStateStopped;
@@ -248,16 +257,20 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
 
     /// Store callback
     self.callback = callback;
+    _lifecycleGeneration = MFDisplayLinkNextGeneration(_lifecycleGeneration);
+    uint64_t startGeneration = _lifecycleGeneration;
 
     /// A watchdog can request another cold start while main is still recreating the prior CVDisplayLink. Record one
     /// coalesced request and let the refresh completion enqueue it; reading or starting the pointer here would race
     /// its replacement. Requested state remains truthful so the watchdog can continue supervising this attempt.
     if (_displayLinkRefreshInFlight) {
         _startRequestedWhileRefreshInFlight = YES;
+        _deferredStartGeneration = startGeneration;
         _lastCallbackTime = 0;
         _requestedStartTime = CACurrentMediaTime();
         _requestedState = kMFDisplayLinkRequestedStateRunning;
-        DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred refreshInFlight=1");
+        DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred refreshInFlight=1 generation=%llu",
+                  startGeneration);
         return;
     }
 
@@ -296,7 +309,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
             refreshResult = refreshDisplayID != 0
                 ? CVDisplayLinkSetCurrentCGDisplay(self->_displayLink, refreshDisplayID)
                 : kCVReturnSuccess;
-            DDLogDebug("MFSCROLL_DISPLAY: action=refresh-before-start link=%{public}@ display=%u result=%d",
+            DDLogInfo("MFSCROLL_DISPLAY: action=refresh-before-start link=%{public}@ display=%u result=%d",
                        [self identifier],
                        refreshDisplayID,
                        refreshResult);
@@ -315,7 +328,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         while (true) {
             CVReturn rt = CVDisplayLinkStart(self->_displayLink); /// This locks until the displayLinkCallback is done
             if (rt == kCVReturnSuccess) {
-                DDLogDebug("MFSCROLL_DISPLAY: action=start link=%{public}@ display=%u attempts=%lld result=%d",
+                DDLogInfo("MFSCROLL_DISPLAY: action=start link=%{public}@ display=%u attempts=%lld result=%d",
                            [self identifier],
                            self->_previousDisplayUnderMousePointer,
                            failedAttempts + 1,
@@ -345,18 +358,32 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
                 self->_displayLinkIsOutdated = YES;
             }
             if (refreshBeforeStart || startFailed) {
-                DDLogDebug("MFSCROLL_DISPLAY: action=start-complete display=%u refreshed=%d refreshResult=%d startFailed=%d refreshPending=%d",
+                DDLogInfo("MFSCROLL_DISPLAY: action=start-complete display=%u refreshed=%d refreshResult=%d startFailed=%d refreshPending=%d",
                            refreshDisplayID,
                            refreshBeforeStart,
                            refreshResult,
                            startFailed,
                            self->_displayLinkIsOutdated);
             }
-            if (self->_startRequestedWhileRefreshInFlight) {
-                self->_startRequestedWhileRefreshInFlight = NO;
+            BOOL shouldResumeDeferredStart = MFDisplayLinkShouldResumeDeferredStart(
+                self->_startRequestedWhileRefreshInFlight,
+                self->_requestedState == kMFDisplayLinkRequestedStateRunning,
+                self->_lifecycleGeneration,
+                self->_deferredStartGeneration);
+            if (shouldResumeDeferredStart) {
                 DisplayLinkCallback pendingCallback = self.callback;
-                DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred-resume");
+                DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred-resume generation=%llu",
+                          self->_deferredStartGeneration);
+                self->_startRequestedWhileRefreshInFlight = NO;
+                self->_deferredStartGeneration = 0;
                 [self start_UnsafeWithCallback:pendingCallback];
+            } else if (self->_startRequestedWhileRefreshInFlight) {
+                DDLogInfo("MFSCROLL_DISPLAY: action=start-deferred-drop deferredGeneration=%llu currentGeneration=%llu requestedRunning=%d",
+                          self->_deferredStartGeneration,
+                          self->_lifecycleGeneration,
+                          self->_requestedState == kMFDisplayLinkRequestedStateRunning);
+                self->_startRequestedWhileRefreshInFlight = NO;
+                self->_deferredStartGeneration = 0;
             }
         });
     };
@@ -399,9 +426,17 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
 
 - (void)stop_Unsafe {
     /// Debug
-    DDLogDebug("DisplayLink.m: (%@) stopping", [self identifier]);
-    
-    if ([self isRunning_Unsafe]) {
+    NSString *linkIdentifier = _displayLinkRefreshInFlight ? @"refresh-in-flight" : [self identifier];
+    DDLogDebug("DisplayLink.m: (%@) stopping", linkIdentifier);
+
+    BOOL wasRequestedRunning = [self isRunning_Unsafe];
+    _lifecycleGeneration = MFDisplayLinkNextGeneration(_lifecycleGeneration);
+    _startRequestedWhileRefreshInFlight = NO;
+    _deferredStartGeneration = 0;
+    _requestedState = kMFDisplayLinkRequestedStateStopped;
+    _requestedStartTime = 0;
+
+    if (wasRequestedRunning) {
         
         /// CVDisplayLink should be stopped from the main thread
         ///     According to https://cpp.hotexamples.com/examples/-/-/CVDisplayLinkStop/cpp-cvdisplaylinkstop-function-examples.html
@@ -440,12 +475,6 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
         ///         -> Think this makes sense. Try this if 1. doesn't work.
         ///
         ///     Edit: 1. Still doesn't work. -> Introducing `_requestedState` variable
-        
-        /// Set requestedState
-        ///     before async dispatching to main -> so that isRunning() works properly
-        
-        _requestedState = kMFDisplayLinkRequestedStateStopped;
-        _requestedStartTime = 0;
         
         if ((NO)) {
             
@@ -523,6 +552,9 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     _requestedState = kMFDisplayLinkRequestedStateStopped;
     _lastCallbackTime = 0;
     _requestedStartTime = 0;
+    _lifecycleGeneration = MFDisplayLinkNextGeneration(_lifecycleGeneration);
+    _startRequestedWhileRefreshInFlight = NO;
+    _deferredStartGeneration = 0;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         CVReturn stopResult = CVDisplayLinkStop(self->_displayLink);
@@ -590,62 +622,53 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
     [self setDisplay:NSScreen.mainScreen.displayID];
 }
 
+- (void)linkToDisplay:(CGDirectDisplayID)displayID {
+    dispatch_async(_displayLinkQueue, ^{
+        if (displayID == self->_previousDisplayUnderMousePointer
+            && !self->_displayLinkIsOutdated) {
+            NSString *linkIdentifier = self->_displayLinkRefreshInFlight
+                ? @"refresh-in-flight"
+                : [self identifier];
+            DDLogInfo("MFSCROLL_DISPLAY: action=keep link=%{public}@ display=%u requestedRunning=%d",
+                       linkIdentifier,
+                       displayID,
+                       self->_requestedState);
+            return;
+        }
+
+        self->_previousDisplayUnderMousePointer = displayID;
+        CVReturn result = [self setDisplay:displayID];
+        NSString *linkIdentifier = self->_displayLinkRefreshInFlight
+            ? @"refresh-in-flight"
+            : [self identifier];
+        DDLogInfo("MFSCROLL_DISPLAY: action=switch link=%{public}@ display=%u result=%d requestedRunning=%d",
+                   linkIdentifier,
+                   displayID,
+                   result,
+                   self->_requestedState);
+    });
+}
+
 - (void)linkToDisplayUnderMousePointerWithEvent:(CGEventRef _Nullable)event {
-    
+
     /// Notes:
     /// - This is unused (as of 17.09.2024, MMF 3.0.3)
     ///     -> Which leads to the scroll-scheduling updating to a new screen, only once the key window is on that screen (since we use linkToMainScreen() instead of this.)
     ///     - TODO: actually use this instead of `linkToMainScreen` and test if this new version works.
     /// - I think this would be appropriate to use for event sending, not for animation, since it's based on a CGEvent) - For animation we need another approach.
     ///     - (But I think if we move over from the deprecated CVDisplayLink to the new CADisplayLink, we'll have to use a different approach anyways.)
-    
+
 #if IS_HELPER
-    
-    __block CVReturn result;
-    
-    dispatch_async(_displayLinkQueue, ^{
-        /// Init shared return
-        CVReturn rt;
-        
-        /// Get display under mouse pointer
-        CGDirectDisplayID dsp;
-        rt = [HelperUtility displayUnderMousePointer:&dsp withEvent:event];
-        
-        /// Premature return
-        if (rt == kCVReturnError) {
-            DDLogDebug("MFSCROLL_DISPLAY: action=resolve-failed link=%{public}@ result=%d",
-                       [self identifier],
-                       rt);
-            result = kCVReturnError; return; /// Coudln't get display under pointer
-        }
-        if (dsp == self->_previousDisplayUnderMousePointer && !self->_displayLinkIsOutdated) {
-            /// Do not call any CVDisplayLink getter here. The CoreVideo callback can hold its internal mutex while
-            /// synchronously waiting for this queue; a getter would then wait for that mutex and deadlock scrolling.
-            NSString *linkIdentifier = self->_displayLinkRefreshInFlight
-                ? @"refresh-in-flight"
-                : [self identifier];
-            DDLogDebug("MFSCROLL_DISPLAY: action=keep link=%{public}@ display=%u requestedRunning=%d",
-                       linkIdentifier,
-                       dsp,
-                       self->_requestedState);
-            result = kCVReturnSuccess; return; /// Display under pointer already linked to
-        }
-        
-        /// Store dsp in cache
-        self->_previousDisplayUnderMousePointer = dsp;
-        
-        /// Set new display
-        result = [self setDisplay:dsp];
-        NSString *linkIdentifier = self->_displayLinkRefreshInFlight
-            ? @"refresh-in-flight"
-            : [self identifier];
-        DDLogDebug("MFSCROLL_DISPLAY: action=switch link=%{public}@ display=%u result=%d requestedRunning=%d",
-                   linkIdentifier,
-                   dsp,
-                   result,
-                   self->_requestedState);
+
+    /// Resolve while the borrowed event is still valid. Only the display ID crosses
+    /// the asynchronous queue boundary.
+    CGDirectDisplayID displayID = kCGNullDirectDisplay;
+    CVReturn result = [HelperUtility displayUnderMousePointer:&displayID withEvent:event];
+    if (result != kCVReturnSuccess || displayID == kCGNullDirectDisplay) {
+        DDLogInfo("MFSCROLL_DISPLAY: action=resolve-failed result=%d", result);
         return;
-    });
+    }
+    [self linkToDisplay:displayID];
     
 #else
     assert(false);
@@ -701,7 +724,7 @@ NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags fla
             /// the next cold start rather than touching the CVDisplayLink currently being recreated.
             _displayLinkIsOutdated = YES;
         }
-        DDLogDebug("MFSCROLL_DISPLAY: action=refresh-pending display=%u requestedRunning=%d refreshInFlight=%d",
+        DDLogInfo("MFSCROLL_DISPLAY: action=refresh-pending display=%u requestedRunning=%d refreshInFlight=%d",
                    displayID,
                    _requestedState,
                    _displayLinkRefreshInFlight);
@@ -761,7 +784,7 @@ void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSu
         });
     }
     else {
-        DDLogDebug("MFSCROLL_DISPLAY: action=reconfiguration-ignored display=%u flags=%{public}@",
+        DDLogInfo("MFSCROLL_DISPLAY: action=reconfiguration-ignored display=%u flags=%{public}@",
                    display,
                    MFCGDisplayChangeSummaryFlags_ToString(flags));
     }
@@ -780,15 +803,66 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
     ///         I think the deadlock has been here since commit `2bd62d5` when we started using `dispatch_sync()` here
     ///     - [Aug 2025] Eventually, we may want to move to CADisplayLink and async-dispatch to the "IOThread" we're planning. This would resolve the deadlock, too (See `Old MFDisplayLinkWorkType stuff.md`)
     
-    DisplayLink *self = (__bridge DisplayLink *)displayLinkContext; /// [Aug 2025] Why are we getting this outside `dispatch_sync()`? Spending time outside `dispatch_sync()` increases chances of deadlock.
-    
-    dispatch_sync(self.dispatchQueue, ^{ /// [Aug 2025] Recovered notes from 3.0.0: Use sync so this is actually executed on the high-priority display-linked thread // Why are we using self.dispatchQueue instead of `self->_displayLinkQueue`? I think self.dispatchQueue might cause some weird timing stuff since objc props are often atomic and stuff..
+    DisplayLink *self = (__bridge DisplayLink *)displayLinkContext;
+
+    /// Never make CoreVideo wait on a queue that can call CVDisplayLinkStop,
+    /// CVDisplayLinkStart, or a CoreVideo getter. The prior synchronous handoff
+    /// formed a lock inversion. This queue is already user-interactive and serial,
+    /// so async preserves ordering without adding a timer or report gate.
+    ///
+    /// Permit at most one queued callback in addition to the callback currently
+    /// executing. Otherwise a temporarily busy queue can accumulate display-rate
+    /// blocks faster than it drains them, and dropping stale blocks only after they
+    /// reach the queue prolongs the apparent stall.
+    if (!MFDisplayLinkTryQueueCallback(&self->_callbackDeliveryQueued)) {
+        return kCVReturnSuccess;
+    }
+    DisplayLinkCallbackTimeInfo timeInfo = parseTimeStamps(inNow, inOutputTime);
+    CVDisplayLinkRef sourceDisplayLink = displayLink;
+
+    dispatch_async(self->_displayLinkQueue, ^{
+        /// Clear at the queue boundary so one next frame may wait behind the frame
+        /// currently being delivered while additional callbacks coalesce.
+        MFDisplayLinkDidBeginQueuedCallback(&self->_callbackDeliveryQueued);
+
+        if (self->_displayLinkRefreshInFlight) {
+            return;
+        }
+        if (sourceDisplayLink != self->_displayLink) {
+            DDLogInfo("MFSCROLL_DISPLAY: action=callback-drop reason=stale-link");
+            return;
+        }
+        if (self->_requestedState == kMFDisplayLinkRequestedStateStopped) {
+            DDLogDebug("DisplayLink.m: (%@) callback called after requested stop. Returning", [self identifier]);
+            return;
+        }
+        if (self->_requestedStartTime > 0
+            && timeInfo.cvCallbackTime < self->_requestedStartTime) {
+            DDLogInfo("MFSCROLL_DISPLAY: action=callback-drop reason=stale-generation");
+            return;
+        }
+
+        CFTimeInterval deliveryDelay = MAX(
+            0.0,
+            CACurrentMediaTime() - timeInfo.cvCallbackTime);
+        CFTimeInterval staleFrameThreshold = MAX(
+            0.050,
+            timeInfo.nominalTimeBetweenFrames * 3.0);
+        if (deliveryDelay > staleFrameThreshold) {
+            CFTimeInterval now = CACurrentMediaTime();
+            if (now - self->_lastBacklogLogTime >= 0.5) {
+                self->_lastBacklogLogTime = now;
+                DDLogInfo("MFSCROLL_DISPLAY: action=callback-drop reason=queue-backlog delayMs=%.2f",
+                          deliveryDelay * 1000.0);
+            }
+            return;
+        }
 
         CFTimeInterval callbackTime = CACurrentMediaTime();
         if (self->_lastCallbackTime > 0
             && self->_requestedState == kMFDisplayLinkRequestedStateRunning
             && callbackTime - self->_lastCallbackTime > 0.100) {
-            DDLogDebug("MFSCROLL_DISPLAY: action=callback-resumed link=%{public}@ display=%u gapMs=%.2f",
+            DDLogInfo("MFSCROLL_DISPLAY: action=callback-resumed link=%{public}@ display=%u gapMs=%.2f",
                        [self identifier],
                        self->_previousDisplayUnderMousePointer,
                        (callbackTime - self->_lastCallbackTime) * 1000.0);
@@ -797,13 +871,6 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
             
         DDLogDebug("DisplayLink.m: (%@) Callback", [self identifier]);
          
-        DisplayLinkCallbackTimeInfo timeInfo = parseTimeStamps(inNow, inOutputTime);
-         
-        if (self->_requestedState == kMFDisplayLinkRequestedStateStopped) {
-            DDLogDebug("DisplayLink.m: (%@) callback called after requested stop. Returning", [self identifier]);
-            return;
-        }
-        
         self.callback(timeInfo);
     });
     

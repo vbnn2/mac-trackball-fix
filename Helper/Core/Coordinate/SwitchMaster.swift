@@ -231,6 +231,14 @@ import ReactiveSwift
                 """)
         }
     }
+
+    /// Trackball mode changes do not change `userIsActive`, so routing them through
+    /// `helperStateChanged()` was a no-op. Re-evaluate the scroll tap explicitly:
+    /// Zoom modes need the tap even when ordinary scrolling uses untouched system
+    /// behavior, and leaving the mode may allow the tap to turn off again.
+    @objc func trackballModeChanged() {
+        toggleScrollTap()
+    }
     
     //
     // MARK: Kill switches
@@ -315,6 +323,13 @@ import ReactiveSwift
     
     private var latestRemaps = NSDictionary()
     @objc func remapsChanged(remaps: NSDictionary) {
+
+        /// A remap reload can change the effective scroll modifier while the
+        /// physical keys/buttons stay held. Publish that transition explicitly;
+        /// otherwise Command-Tab or zoom may survive until another wheel report.
+        let activeModifiers = Modifiers.modifiers(with: nil)
+        let scrollModifications = ScrollModifiers.currentModifications(activeModifiers: activeModifiers)
+        Scroll.modifierStateDidChange(scrollModifications)
         
         /// Update state
         let result = self.modifierUsage_Point_Scroll(remaps)
@@ -394,13 +409,19 @@ import ReactiveSwift
     
     private var latestModifiers = NSDictionary()
     @objc func modifiersChanged(modifiers: NSDictionary) {
-        
+
+        /// Preserve an immutable value snapshot for callbacks and later combined
+        /// state updates.
+        let modifierSnapshot = modifiers.copy() as! NSDictionary
+        let scrollModifications = ScrollModifiers.currentModifications(activeModifiers: modifierSnapshot)
+        Scroll.modifierStateDidChange(scrollModifications)
+
         /// Call combined state updaters
-        remapsOrModifiersChanged(remaps: latestRemaps, modifiers: modifiers)
-        remapsOrModifiersOrAttachedDevicesChanged(remaps: latestRemaps, modifiers: modifiers, attachedDevices: latestDevices)
+        remapsOrModifiersChanged(remaps: latestRemaps, modifiers: modifierSnapshot)
+        remapsOrModifiersOrAttachedDevicesChanged(remaps: latestRemaps, modifiers: modifierSnapshot, attachedDevices: latestDevices)
         
         /// Store latest
-        latestModifiers = modifiers
+        latestModifiers = modifierSnapshot
         
         /// Call togglers
         ///     Note: [Mar 2025] Why we aren't toggling btn/kbd mods here? -> I think because if we listened to mods conditionally based on presence of other mods, then only a specific order of activating the mods would work.
@@ -532,7 +553,10 @@ import ReactiveSwift
             return
         }
         
-        if someDeviceHasScroll && (defaultModifiesScroll || currentModificationModifiesScroll) {
+        if someDeviceHasScroll
+            && (HelperState.shared.trackballModeIsActive
+                || defaultModifiesScroll
+                || currentModificationModifiesScroll) {
             Scroll.startReceiving()
         } else {
             Scroll.stopReceiving()

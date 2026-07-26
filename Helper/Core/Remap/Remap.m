@@ -21,6 +21,7 @@
 #import "MFMessagePort.h"
 #import "Mac_Mouse_Fix_Helper-Swift.h"
 #import "RemapSwizzler.h"
+#import <os/lock.h>
 
 @implementation Remap
 
@@ -33,73 +34,109 @@
 
 #pragma mark - Swizzled
 
+static os_unfair_lock _remapStateLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary *_swizzleCache = nil;
+static NSDictionary *_remaps;
+static uint64_t _remapGeneration = 0;
+static BOOL _addModeIsEnabled = NO;
+
++ (void)setRemaps:(NSDictionary *)remapsDict
+    addModeEnabled:(NSNumber * _Nullable)addModeEnabled {
+
+    NSDictionary *immutableRemaps = [remapsDict copy];
+
+    os_unfair_lock_lock(&_remapStateLock);
+    BOOL nextAddModeIsEnabled =
+        addModeEnabled != nil ? addModeEnabled.boolValue : _addModeIsEnabled;
+    BOOL remapsAreEqual = [_remaps isEqualToDictionary:immutableRemaps];
+    BOOL addModeIsEqual = _addModeIsEnabled == nextAddModeIsEnabled;
+
+    if (remapsAreEqual && addModeIsEqual) {
+        os_unfair_lock_unlock(&_remapStateLock);
+        DDLogDebug("Remaps were set to the same value");
+        return;
+    }
+
+    /// Publish the mode and its matching table as one generation. Readers may
+    /// calculate outside the lock, but generation validation prevents a mixed
+    /// add-mode/ordinary result from entering the cache.
+    _remaps = immutableRemaps;
+    _addModeIsEnabled = nextAddModeIsEnabled;
+    _remapGeneration += 1;
+    [_swizzleCache removeAllObjects];
+    NSDictionary *publishedRemaps = _remaps;
+    os_unfair_lock_unlock(&_remapStateLock);
+
+    /// Notify outside the state lock: SwitchMaster and RemapsAnalyzer call back
+    /// into Remap while deriving their state.
+    [SwitchMaster.shared remapsChangedWithRemaps:publishedRemaps];
+    [RemapsAnalyzer reload];
+    DDLogDebug("Set remaps to: %@", publishedRemaps);
+}
 
 + (NSDictionary * _Nullable)modificationsWithModifiers:(NSDictionary *)modifiers {
-    
-    /// Cache is reset whenever remaps change
-    
-    if (_swizzleCache == nil) {
-        _swizzleCache = [NSMutableDictionary dictionary];
-    }
-    
-    NSDictionary *cached = _swizzleCache[modifiers];
-    
-    if (cached) {
-        return cached;
-    } else {
-        
+
+    /// Build outside the lock, then publish only if the remap generation is
+    /// unchanged. This keeps the scroll path responsive without permitting an
+    /// NSMutableDictionary read/write race or returning a stale swizzle.
+    while (true) {
+        os_unfair_lock_lock(&_remapStateLock);
+        if (_swizzleCache == nil) {
+            _swizzleCache = [NSMutableDictionary dictionary];
+        }
+        NSDictionary *cached = _swizzleCache[modifiers];
+        NSDictionary *remapsSnapshot = _remaps ?: @{};
+        uint64_t generation = _remapGeneration;
+        os_unfair_lock_unlock(&_remapStateLock);
+
+        if (cached) {
+            return cached;
+        }
+
         DDLogDebug("Recalculating modifications for modifiers: %@", modifiers);
-        
-        NSDictionary *new = [RemapSwizzler swizzleRemaps:_remaps activeModifiers:modifiers];
-        _swizzleCache[modifiers] = new;
-        return new;
+        NSDictionary *newModifications =
+            [[RemapSwizzler swizzleRemaps:remapsSnapshot activeModifiers:modifiers] copy];
+
+        os_unfair_lock_lock(&_remapStateLock);
+        if (generation != _remapGeneration) {
+            os_unfair_lock_unlock(&_remapStateLock);
+            continue;
+        }
+        NSDictionary *concurrentlyCached = _swizzleCache[modifiers];
+        if (concurrentlyCached == nil && newModifications != nil) {
+            _swizzleCache[modifiers] = newModifications;
+            concurrentlyCached = newModifications;
+        }
+        os_unfair_lock_unlock(&_remapStateLock);
+        return concurrentlyCached;
     }
 }
 
 #pragma mark - Storage
 
 #define USE_TEST_REMAPS NO
-static NSDictionary *_remaps;
 
 + (NSDictionary *)remaps {
-    return _remaps;
+    os_unfair_lock_lock(&_remapStateLock);
+    NSDictionary *result = _remaps ?: @{};
+    os_unfair_lock_unlock(&_remapStateLock);
+    return result;
 }
 
 + (void)setRemaps:(NSDictionary *)remapsDict {
     
     /// This method is private. It's used by `reload` and `enableAddMode`.
-    
-    /// Compare
-    BOOL isEqual = [_remaps isEqualToDictionary:remapsDict];
-    
-    if (isEqual) {
-        
-        /// Log
-        DDLogDebug("Remaps were set to the same value");
-        
-    } else {
-        
-        /// Set
-        _remaps = remapsDict;
-        
-        /// Reset cache
-        [_swizzleCache removeAllObjects];
-        
-        /// Notify
-//        [ReactiveRemaps.shared handleRemapsDidChange];
-        [SwitchMaster.shared remapsChangedWithRemaps:_remaps];
-        [RemapsAnalyzer reload];
-//        [NSNotificationCenter.defaultCenter postNotificationName:kMFNotifCenterNotificationNameRemapsChanged object:self];
-        
-        /// Log
-        DDLogDebug("Set remaps to: %@", _remaps);
-    }
+
+    [self setRemaps:remapsDict addModeEnabled:nil];
 }
 
 #pragma mark - Reload
 
 + (void)reload {
+    [self reloadEndingAddMode:NO];
+}
+
++ (void)reloadEndingAddMode:(BOOL)endingAddMode {
 
     /// The main app uses an array of dicts (aka a table) to represent the remaps in a way that is easy to present in a table view.
     /// The remaps are also stored to file in this format and therefore what `Config.config` contains.
@@ -119,10 +156,9 @@ static NSDictionary *_remaps;
     /// press to record is never even received. That's the intermittent "recording does nothing".
     ///
     /// So while addMode is enabled we DEFER the reload: keep the capture table live and the tap on. The reload
-    /// isn't lost — `disableAddMode` runs `reload` when recording concludes (mouseExit / after a capture), so
-    /// the latest config is picked up then. `disableAddMode` clears `_addModeIsEnabled` before calling us, so
-    /// that concluding reload passes this guard.
-    if (_addModeIsEnabled) {
+    /// isn't lost — `disableAddMode` invokes this builder with `endingAddMode`
+    /// so the ordinary table and the disabled state are published atomically.
+    if (self.addModeIsEnabled && !endingAddMode) {
         return;
     }
 
@@ -132,7 +168,8 @@ static NSDictionary *_remaps;
     
     if (USE_TEST_REMAPS) {
         
-        [self setRemaps:self.testRemaps];
+        [self setRemaps:self.testRemaps
+         addModeEnabled:endingAddMode ? @NO : nil];
         
     } else {
         
@@ -254,15 +291,18 @@ static NSDictionary *_remaps;
         
 //        }
         
-        [self setRemaps:remapsDict];
+        [self setRemaps:remapsDict
+         addModeEnabled:endingAddMode ? @NO : nil];
     }
 }
 
 #pragma mark - AddMode
 
-BOOL _addModeIsEnabled = NO;
 + (BOOL)addModeIsEnabled {
-    return _addModeIsEnabled;
+    os_unfair_lock_lock(&_remapStateLock);
+    BOOL result = _addModeIsEnabled;
+    os_unfair_lock_unlock(&_remapStateLock);
+    return result;
 }
 
 + (BOOL)enableAddMode {
@@ -327,10 +367,6 @@ BOOL _addModeIsEnabled = NO;
         }
     }
     
-    /// Update state and notifiy
-    ///     Need to set `_addModeIsEnabled` true before calling `setRemaps:` so that the keyboard mods event tap in `Modifiers` is toggled properly
-    _addModeIsEnabled = YES;
-    
     /// Send feedback
 //    [MFMessagePort sendMessage:@"addModeEnabled" withPayload:nil expectingReply:NO];
     
@@ -339,7 +375,7 @@ BOOL _addModeIsEnabled = NO;
 
     [self setRemaps:@{
         @{}: triggerToEffectDict
-    }];
+    } addModeEnabled:@YES];
     
     /// Return success
     return YES;
@@ -348,12 +384,10 @@ BOOL _addModeIsEnabled = NO;
 + (BOOL)disableAddMode {
 
     /// Reload
-    if (_addModeIsEnabled) {
-        /// Clear the flag *before* reloading: `reload` now defers while addMode is enabled (so config changes
-        /// during recording don't cancel the capture), so we must turn addMode off here for the concluding
-        /// reload to actually rebuild `_remaps` from config.
-        _addModeIsEnabled = NO;
-        [self reload];
+    if (self.addModeIsEnabled) {
+        /// Keep the currently published add-mode flag/table pair intact while the
+        /// ordinary table is built, then swap both in one generation.
+        [self reloadEndingAddMode:YES];
     }
 
     /// Return success

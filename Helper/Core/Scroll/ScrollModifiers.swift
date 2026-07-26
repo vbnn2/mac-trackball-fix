@@ -26,60 +26,38 @@ extension MFScrollModificationResult: Hashable {
 
 @objc class ScrollModifiers: NSObject {
 
-    static var activeModifications = NSDictionary()
-    
-    @objc public static func currentModifications(event: CGEvent) -> MFScrollModificationResult {
-        
-        /// Debug
-        
-//        DDLogDebug("ScrollMods being evaluated...")
-        
-        /// Declare and init result
-        
+    private struct Resolution {
+        let result: MFScrollModificationResult
+        let modifiedScrollDictionary: NSDictionary?
+    }
+
+    private static func resolve(activeModifiers: NSDictionary) -> Resolution {
         let emptyResult = MFScrollModificationResult.init(inputMod: kMFScrollInputModificationNone,
                                                           effectMod: kMFScrollEffectModificationNone)
         var result = emptyResult
-        
-        /// Get currently active scroll remaps
-        
-//        let modifyingDevice: Device = HelperState.shared.activeDevice!;
-        let activeModifiers = Modifiers.modifiers(with: event)
-//        let baseRemaps = Remap.remaps;
-        
-        /// Debug
-//        DDLogDebug("activeFlags in ScrollModifers: \(SharedUtility.binaryRepresentation((activeModifiers[kMFModificationPreconditionKeyKeyboard] as? NSNumber)?.uint32Value ?? 0))") /// This is unbelievably slow for some reason
-        
-        self.activeModifications = Remap.modifications(withModifiers: activeModifiers) ?? NSDictionary()
-        
+
+        let activeModifications = Remap.modifications(withModifiers: activeModifiers) ?? NSDictionary()
         guard let modifiedScrollDict = activeModifications[kMFTriggerScroll] else {
-            return result; /// There are no active scroll modifications
+            return Resolution(result: result, modifiedScrollDictionary: nil)
         }
         guard let modifiedScrollDict = modifiedScrollDict as? NSDictionary else {
-            assert(false) /// Invalid state
-            return result;
+            assertionFailure("Invalid scroll modification dictionary")
+            return Resolution(result: result, modifiedScrollDictionary: nil)
         }
-        
-        /// Input modification
-        
+
         if let inputModification = modifiedScrollDict[kMFModifiedScrollDictKeyInputModificationType] as? String {
-                
             switch inputModification {
-                
             case kMFModifiedScrollInputModificationTypePrecisionScroll:
                 result.inputMod = kMFScrollInputModificationPrecise
             case kMFModifiedScrollInputModificationTypeQuickScroll:
                 result.inputMod = kMFScrollInputModificationQuick
             default:
-                fatalError("Unknown modifiedSrollDict type found in remaps")
+                assertionFailure("Unknown modified scroll input type")
             }
         }
-        
-        /// Effect modification
-        
+
         if let effectModification = modifiedScrollDict[kMFModifiedScrollDictKeyEffectModificationType] as? String {
-            
             switch effectModification {
-                
             case kMFModifiedScrollEffectModificationTypeZoom:
                 result.effectMod = kMFScrollEffectModificationZoom
             case kMFModifiedScrollEffectModificationTypeHorizontalScroll:
@@ -95,53 +73,45 @@ extension MFScrollModificationResult: Hashable {
             case kMFModifiedScrollEffectModificationTypeAddModeFeedback:
                 result.effectMod = kMFScrollEffectModificationAddModeFeedback
             default:
-                fatalError("Unknown modifiedSrollDict type found in remaps")
+                assertionFailure("Unknown modified scroll effect type")
             }
         }
-        
-        /// Feedback
-        let resultIsEmpty = result.inputMod == emptyResult.inputMod && result.effectMod == emptyResult.effectMod
-        if !resultIsEmpty {
-            
-            /// Notify modifiers
-            Modifiers.handleModificationHasBeenUsed()
-            
-            /// Send addMode feedback
-            if result.effectMod == kMFScrollEffectModificationAddModeFeedback {
-                let payload = modifiedScrollDict.mutableCopy() as! NSMutableDictionary /// I think a shallow mutableCopy is enough
-                payload.removeObject(forKey: kMFModifiedScrollDictKeyEffectModificationType)
-                Remap.sendAddModeFeedback(payload)
-            }
-        }
-        
-        /// Debiug
-        
-//        DDLogDebug("ScrollMods: \(result.input), \(result.effect)")
-        
-        ///  Return
-        
-        return result
-    
+
+        return Resolution(result: result, modifiedScrollDictionary: modifiedScrollDict)
     }
-    
-//    @objc public static func reactToModiferChange(activeModifications: NSDictionary) {
-//        /// This is called on every button press. Might be good to optimize this if it has any noticable performance impact.
-//        
-//        /// Deactivate app switcher - if appropriate
-//        
-//        let effectModKeyPath = "\(kMFTriggerScroll).\(kMFModifiedScrollDictKeyEffectModificationType)"
-//        
-//        let switcherActiveLastScroll = (self.activeModifications as NSDictionary).value(forKeyPath: effectModKeyPath) as? String == kMFModifiedScrollEffectModificationTypeCommandTab
-//        let switcherActiveNow = activeModifications.value(forKeyPath: effectModKeyPath) as? String == kMFModifiedScrollEffectModificationTypeCommandTab
-//        
-//        if (switcherActiveLastScroll && !switcherActiveNow) {
-//            /// AppSwitcher has been deactivated - notify Scroll.m
-//            
-//            Scroll.appSwitcherModificationHasBeenDeactivated();
-//            self.activeModifications = activeModifications;
-//        }
-//    }
-    
+
+    /// Pure resolution for the event path. Usage feedback is intentionally separate so
+    /// sampling every physical report cannot zombify buttons or emit Add Mode feedback
+    /// repeatedly.
+    @objc public static func currentModifications(event: CGEvent) -> MFScrollModificationResult {
+        let activeModifiers = Modifiers.modifiers(with: event)
+        return resolve(activeModifiers: activeModifiers).result
+    }
+
+    /// Pure resolution for modifier-change callbacks, where no wheel event exists.
+    @objc(currentModificationsWithActiveModifiers:)
+    public static func currentModifications(activeModifiers: NSDictionary) -> MFScrollModificationResult {
+        return resolve(activeModifiers: activeModifiers).result
+    }
+
+    /// Run the one-shot side effects for an effective scroll-modifier activation.
+    @objc public static func handleCurrentModificationHasBeenUsed(event: CGEvent) {
+        let activeModifiers = Modifiers.modifiers(with: event)
+        let resolution = resolve(activeModifiers: activeModifiers)
+        let resultIsEmpty = resolution.result.inputMod == kMFScrollInputModificationNone
+            && resolution.result.effectMod == kMFScrollEffectModificationNone
+        guard !resultIsEmpty else { return }
+
+        Modifiers.handleModificationHasBeenUsed(withModifiers: activeModifiers)
+
+        if resolution.result.effectMod == kMFScrollEffectModificationAddModeFeedback,
+           let modifiedScrollDict = resolution.modifiedScrollDictionary {
+            let payload = modifiedScrollDict.mutableCopy() as! NSMutableDictionary
+            payload.removeObject(forKey: kMFModifiedScrollDictKeyEffectModificationType)
+            Remap.sendAddModeFeedback(payload)
+        }
+    }
+
     /// Utility
     @objc static func scrollModsAreEqual(_ mods1: MFScrollModificationResult, other mods2: MFScrollModificationResult) -> Bool {
         return mods1.effectMod == mods2.effectMod && mods1.inputMod == mods2.inputMod

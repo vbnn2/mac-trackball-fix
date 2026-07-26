@@ -181,9 +181,14 @@ import Cocoa
                 Actions.executeActionArray(actionArray, phase: kMFActionPhaseCombined)
             } else if startOrEnd == kMFActionPhaseStart {
                 Actions.executeActionArray(actionArray, phase: kMFActionPhaseStart)
-                onRelease.append {
-                    DDLogDebug("triggerCallback - unconditionalRelease button \(button)")
-                    Actions.executeActionArray(actionArray, phase: kMFActionPhaseEnd)
+                /// Hold-bound Smart Zoom is momentary: its matching end phase toggles
+                /// Smart Zoom back out when the physical button is released. Click
+                /// bindings keep their existing one-shot behavior.
+                if duration == kMFButtonTriggerDurationHold {
+                    onRelease.append {
+                        DDLogDebug("triggerCallback - unconditionalHoldRelease button \(button)")
+                        Actions.executeActionArray(actionArray, phase: kMFActionPhaseEnd)
+                    }
                 }
             }
             

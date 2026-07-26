@@ -17,6 +17,7 @@
 #import "SharedUtility.h"
 #import "ModificationUtility.h"
 #import <os/signpost.h>
+#import <os/lock.h>
 #import "Mac_Mouse_Fix_Helper-Swift.h"
 
 @implementation Modifiers
@@ -46,7 +47,26 @@
 
 #pragma mark - Storage
 
-static NSMutableDictionary *_modifiers;
+static os_unfair_lock _modifierStateLock = OS_UNFAIR_LOCK_INIT;
+static NSDictionary *_modifiers;
+static NSUInteger flagsFromEvent(CGEventRef _Nullable event);
+
+static BOOL setKeyboardFlags_Unsafe(NSUInteger flags) {
+    NSNumber *newFlags = @(flags);
+    NSNumber *oldFlags = _modifiers[kMFModificationPreconditionKeyKeyboard];
+    if ((flags == 0 && oldFlags == nil) || [oldFlags isEqualToNumber:newFlags]) {
+        return NO;
+    }
+
+    NSMutableDictionary *next = [_modifiers mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (flags == 0) {
+        [next removeObjectForKey:kMFModificationPreconditionKeyKeyboard];
+    } else {
+        next[kMFModificationPreconditionKeyKeyboard] = newFlags;
+    }
+    _modifiers = [next copy];
+    return YES;
+}
 
 #pragma mark - Load
 
@@ -58,7 +78,9 @@ static NSMutableDictionary *_modifiers;
     if (self == [Modifiers class]) {
         
         /// Init `_modifiers`
-        _modifiers = [NSMutableDictionary dictionary];
+        os_unfair_lock_lock(&_modifierStateLock);
+        _modifiers = @{};
+        os_unfair_lock_unlock(&_modifierStateLock);
         
         /// Create keyboard modifier event tap
         CGEventMask mask = CGEventMaskBit(kCGEventFlagsChanged);
@@ -187,8 +209,10 @@ static CFMachPortRef _kbModEventTap;
     ///
     /// TODO: @crash Implement Solution Idea 2.
     
+    os_unfair_lock_lock(&_modifierStateLock);
     _kbModPriority = priority;
-    CGEventTapEnable(_kbModEventTap, _kbModPriority == kMFModifierPriorityActiveListen);
+    os_unfair_lock_unlock(&_modifierStateLock);
+    CGEventTapEnable(_kbModEventTap, priority == kMFModifierPriorityActiveListen);
 }
 
 + (void)setButtonModifierPriority:(MFModifierPriority)priority {
@@ -196,19 +220,27 @@ static CFMachPortRef _kbModEventTap;
     /// We can't passively retrieve the button mods, so we always need to actively listen to the buttons, even if the modifierPriority is `passive`.
     /// Also we don't only listen to buttons to use them as modifiers but also to use them as triggers.
     /// As a consequence of this, we only toggle off some of the button modifier processing here if the button mods are completely unused and we don't toggle off the button input receiving entirely here at all. That is done by SwitchMaster when there are no effects for the buttons either as modifiers or as triggers.
+    os_unfair_lock_lock(&_modifierStateLock);
     _btnModPriority = priority;
-    Buttons.useButtonModifiers = _btnModPriority != kMFModifierPriorityUnused;
+    os_unfair_lock_unlock(&_modifierStateLock);
+    Buttons.useButtonModifiers = priority != kMFModifierPriorityUnused;
 }
 
 #pragma mark Inspect State
 /// At the time of writing we just need this for debugging
 
 + (MFModifierPriority)kbModPriority {
-    return _kbModPriority;
+    os_unfair_lock_lock(&_modifierStateLock);
+    MFModifierPriority result = _kbModPriority;
+    os_unfair_lock_unlock(&_modifierStateLock);
+    return result;
 }
 
 + (MFModifierPriority)btnModPriority {
-    return _btnModPriority;
+    os_unfair_lock_lock(&_modifierStateLock);
+    MFModifierPriority result = _btnModPriority;
+    os_unfair_lock_unlock(&_modifierStateLock);
+    return result;
 }
 
 #pragma mark Handle modifier change
@@ -237,23 +269,15 @@ CGEventRef _Nullable kbModsChanged(CGEventTapProxy proxy, CGEventType type, CGEv
     
     NSUInteger newFlags = flagsFromEvent(event);
     
-    /// Check Change
-    NSNumber *newFlagsNS = @(newFlags);
-    NSNumber *oldFlags = _modifiers[kMFModificationPreconditionKeyKeyboard];
-    BOOL didChange = ![oldFlags isEqualToNumber:newFlagsNS];
-    
+    os_unfair_lock_lock(&_modifierStateLock);
+    BOOL didChange = setKeyboardFlags_Unsafe(newFlags);
+    NSDictionary *modifierSnapshot = _modifiers;
+    os_unfair_lock_unlock(&_modifierStateLock);
+
     if (didChange) {
-        
-        /// Store result
-        if (newFlags == 0) {
-            [_modifiers removeObjectForKey:kMFModificationPreconditionKeyKeyboard];
-        } else {
-            _modifiers[kMFModificationPreconditionKeyKeyboard] = newFlagsNS;
-        }
-        
         /// Notify
-//        [ReactiveModifiers.shared handleModifiersDidChangeTo:_modifiers];
-        [SwitchMaster.shared modifiersChangedWithModifiers:_modifiers];
+//        [ReactiveModifiers.shared handleModifiersDidChangeTo:modifierSnapshot];
+        [SwitchMaster.shared modifiersChangedWithModifiers:modifierSnapshot];
     }
     
     /// Return
@@ -265,45 +289,40 @@ CGEventRef _Nullable kbModsChanged(CGEventTapProxy proxy, CGEventType type, CGEv
     /// Debug
     DDLogDebug("buttonMods changed to: %@", newModifiers);
     
-    /// Assert change
+    os_unfair_lock_lock(&_modifierStateLock);
+    BOOL shouldRefreshKeyboard = _kbModPriority == kMFModifierPriorityPassiveUse;
+    os_unfair_lock_unlock(&_modifierStateLock);
+    NSUInteger keyboardFlags = shouldRefreshKeyboard ? flagsFromEvent(nil) : 0;
+
+    os_unfair_lock_lock(&_modifierStateLock);
+
     if (runningPreRelease()) {
         NSArray *oldModifiers = _modifiers[kMFModificationPreconditionKeyButtons];
         assert(![newModifiers isEqualToArray:oldModifiers]);
     }
-    
-    /// Store
+
+    NSMutableDictionary *next = [_modifiers mutableCopy] ?: [NSMutableDictionary dictionary];
     if (newModifiers.count == 0) {
-        [_modifiers removeObjectForKey:kMFModificationPreconditionKeyButtons];
+        [next removeObjectForKey:kMFModificationPreconditionKeyButtons];
     } else {
-        _modifiers[kMFModificationPreconditionKeyButtons] = [newModifiers copy]; /// I think we only copy here so the newModifers != oldModifiers assert works
+        next[kMFModificationPreconditionKeyButtons] = [newModifiers copy];
     }
-    
-    if (_btnModPriority == kMFModifierPriorityActiveListen) {
-        
-        /// Also update kbMods before notifying
-        if (_kbModPriority == kMFModifierPriorityPassiveUse) {
-            updateKBMods(nil);
-        }
-        
+    _modifiers = [next copy];
+    if (shouldRefreshKeyboard && _kbModPriority == kMFModifierPriorityPassiveUse) {
+        setKeyboardFlags_Unsafe(keyboardFlags);
+    }
+    BOOL shouldNotify = _btnModPriority == kMFModifierPriorityActiveListen;
+    NSDictionary *modifierSnapshot = _modifiers;
+    os_unfair_lock_unlock(&_modifierStateLock);
+
+    if (shouldNotify) {
         /// Notify
-//        [ReactiveModifiers.shared handleModifiersDidChangeTo:_modifiers];
-        [SwitchMaster.shared modifiersChangedWithModifiers:_modifiers];
+//        [ReactiveModifiers.shared handleModifiersDidChangeTo:modifierSnapshot];
+        [SwitchMaster.shared modifiersChangedWithModifiers:modifierSnapshot];
     }
 }
 
 /// Helper for modifier change handling
-
-static void updateKBMods(CGEventRef  _Nullable event) {
-    
-    assert(_kbModPriority == kMFModifierPriorityPassiveUse);
-    
-    NSUInteger flags = flagsFromEvent(event);
-    if (flags == 0) {
-        [_modifiers removeObjectForKey:kMFModificationPreconditionKeyKeyboard];
-    } else {
-        _modifiers[kMFModificationPreconditionKeyKeyboard] = @(flags);
-    }
-}
 
 static NSUInteger flagsFromEvent(CGEventRef _Nullable event) {
     
@@ -341,22 +360,35 @@ static NSUInteger flagsFromEvent(CGEventRef _Nullable event) {
 #pragma mark Main Interface
 
 + (NSDictionary *)modifiersWithEvent:(CGEventRef _Nullable)event {
-    
-    if (_kbModPriority == kMFModifierPriorityPassiveUse) {
-        
-        /// If we don't actively listen to kbMods, get the kbMods on the fly
-        updateKBMods(event);
+
+    os_unfair_lock_lock(&_modifierStateLock);
+    BOOL shouldRefreshKeyboard = _kbModPriority == kMFModifierPriorityPassiveUse;
+    os_unfair_lock_unlock(&_modifierStateLock);
+
+    NSUInteger keyboardFlags = shouldRefreshKeyboard ? flagsFromEvent(event) : 0;
+
+    os_unfair_lock_lock(&_modifierStateLock);
+    if (shouldRefreshKeyboard && _kbModPriority == kMFModifierPriorityPassiveUse) {
+        setKeyboardFlags_Unsafe(keyboardFlags);
     }
-    
-    return _modifiers;
+    NSDictionary *result = _modifiers ?: @{};
+    os_unfair_lock_unlock(&_modifierStateLock);
+    return result;
 }
 
 #pragma mark Handle mod usage
 
 + (void)handleModificationHasBeenUsed {
-    
+    os_unfair_lock_lock(&_modifierStateLock);
+    NSDictionary *modifierSnapshot = _modifiers ?: @{};
+    os_unfair_lock_unlock(&_modifierStateLock);
+    [self handleModificationHasBeenUsedWithModifiers:modifierSnapshot];
+}
+
++ (void)handleModificationHasBeenUsedWithModifiers:(NSDictionary *)modifiers {
+
     /// Notify active *modifiers* that they have had an effect
-    for (NSDictionary *buttonMods in _modifiers[kMFModificationPreconditionKeyButtons]) {
+    for (NSDictionary *buttonMods in modifiers[kMFModificationPreconditionKeyButtons]) {
         NSNumber *buttonNumber = buttonMods[kMFButtonModificationPreconditionKeyButtonNumber];
         [Buttons handleButtonHasHadEffectAsModifierWithButton:buttonNumber];
         /// ^ I think we might only have to notify the last button in the sequence (instead of all of them), because all previous buttons should already have been zombified or sth due to consecutive button presses

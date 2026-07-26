@@ -9,13 +9,14 @@
 
 import Cocoa
 
-@objc class ScrollConfig: NSObject, NSCopying /*, NSCoding*/ {
+@objc class ScrollConfig: NSObject /*, NSCoding*/ {
     
     /// This class has almost all instance properties
     /// You can request the config once, then store it.
     /// You'll receive an independent instance that you can override with custom values. This should be useful for implementing Modifications in Scroll.m
     ///     Everything in ScrollConfigResult is lazy so that you only pay for what you actually use
-    /// Edit: Since we're always copying the scrollConfig before returning to apply some overrides, all this lazyness is sort of useless I think. Because during copy, all the lazy computed properties will be calculated from what I've seen. But this will only happen during the first copy, so it's whatever.
+    /// Derived instances are constructed from the same immutable raw snapshot and
+    /// then receive their overrides, so lazy values remain isolated per instance.
     ///
     /// Ideas for improving Smoothness: Regular [Apr 2025]
     ///         (Not sure this belongs here – do we have notes on this somewhere else?)
@@ -31,21 +32,61 @@ import Cocoa
     // MARK: Convenience functions
     ///     For accessing top level dict and different sub-dicts
     
-    private static var _scrollConfigRaw: NSDictionary? = nil /// This needs to be static, not an instance var. Otherwise there are weird crashes in Scroll.m. Not sure why.
+    /// Each instance owns the immutable raw snapshot from which its lazy values are
+    /// derived. Reading a process-global raw dictionary made an old animation's config
+    /// silently begin resolving values from a newer reload.
+    private let scrollConfigRaw: NSDictionary
+
+    private init(raw: NSDictionary) {
+        self.scrollConfigRaw = raw
+        super.init()
+    }
+
     private func c(_ keyPath: String) -> NSObject? {
-        return ScrollConfig._scrollConfigRaw?.object(forCoolKeyPath: keyPath) /// Not sure whether to use coolKeyPath here?
+        return scrollConfigRaw.object(forCoolKeyPath: keyPath)
     }
     
     // MARK: Static functions
     
-    @objc private(set) static var shared = ScrollConfig() /// Singleton instance
+    private static let stateLock = NSLock()
+    private static var _scrollConfigRaw = NSDictionary()
+    private static var _shared = ScrollConfig(raw: _scrollConfigRaw)
+    private static var cache = [_HT<MFScrollModificationResult, MFAxis, CGDirectDisplayID>: ScrollConfig]()
+    private static var stateGeneration: UInt64 = 0
+
+    @objc static var shared: ScrollConfig {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _shared
+    }
     
     @objc static func reload() {
         
         /// Guard not equal
         
-        let newConfigRaw = config("Scroll") as! NSDictionary?
-        guard !(_scrollConfigRaw?.isEqual(newConfigRaw) ?? false) else {
+        guard let rawConfig = config("Scroll") as? NSDictionary else {
+            DDLogError("MFSCROLL_CONFIG: action=reload-rejected reason=missing-scroll-dictionary")
+            return
+        }
+        let newConfigRaw: NSDictionary
+        if let encoded = try? PropertyListSerialization.data(
+            fromPropertyList: rawConfig,
+            format: .binary,
+            options: 0),
+           let decodedObject = try? PropertyListSerialization.propertyList(
+            from: encoded,
+            options: [],
+            format: nil),
+           let decoded = decodedObject as? NSDictionary {
+            newConfigRaw = decoded
+        } else {
+            DDLogError("MFSCROLL_CONFIG: action=reload-deep-copy-failed fallback=shallow-copy")
+            newConfigRaw = rawConfig.copy() as! NSDictionary
+        }
+
+        stateLock.lock()
+        guard !_scrollConfigRaw.isEqual(newConfigRaw) else {
+            stateLock.unlock()
             return
         }
         
@@ -53,44 +94,51 @@ import Cocoa
         /// - This should be called when the underlying config (which mirrors the config file) changes
         /// - All the property values are cached in `currentConfig`, because the properties are lazy. Replacing with a fresh object deletes this implicit cache.
         /// - TODO: Make a copy before storing in `_scrollConfigRaw` just to be sure the equality checks always work
-        shared = ScrollConfig()
         _scrollConfigRaw = newConfigRaw
-        cache = nil
+        _shared = ScrollConfig(raw: newConfigRaw)
+        cache.removeAll(keepingCapacity: false)
+        stateGeneration &+= 1
+        let newShared = _shared
+        stateLock.unlock()
 //        ReactiveScrollConfig.shared.handleScrollConfigChanged(newValue: shared)
-        SwitchMaster.shared.scrollConfigChanged(scrollConfig: shared)
+        SwitchMaster.shared.scrollConfigChanged(scrollConfig: newShared)
         /// Cached config instances are intentionally immutable snapshots. End any animation that still owns the
         /// previous snapshot so the next physical report opens with the new direction, curve, and modifier policy.
-        DDLogDebug("MFSCROLL_CONFIG: action=reload-reset")
+        DDLogInfo("MFSCROLL_CONFIG: action=reload-reset")
         Scroll.resetState()
     }
     @objc static func devToggles_deleteCache() { /// [May 2025] Added this function as a hack for DevToggles.m
-        shared = ScrollConfig()
-        cache = nil
-        DDLogDebug("MFSCROLL_CONFIG: action=dev-cache-reset")
+        stateLock.lock()
+        _shared = ScrollConfig(raw: _scrollConfigRaw)
+        cache.removeAll(keepingCapacity: false)
+        stateGeneration &+= 1
+        stateLock.unlock()
+        DDLogInfo("MFSCROLL_CONFIG: action=dev-cache-reset")
         Scroll.resetState()
     }
-    private static var cache: [_HT<MFScrollModificationResult, MFAxis, CGDirectDisplayID>: ScrollConfig]? = nil
     
     // MARK: Overrides
     
     @objc static func scrollConfig(modifiers: MFScrollModificationResult, inputAxis: MFAxis, display: CGDirectDisplayID) -> ScrollConfig {
         
-        /// Try to get result from cache
-        
-        if cache == nil {
-            cache = .init()
-        }
         let key = _HT(a: modifiers, b: inputAxis, c: display)
-        
-        if let fromCache = cache![key] {
-            return fromCache
 
-        } else {
+        stateLock.lock()
+        if let fromCache = cache[key] {
+            stateLock.unlock()
+            return fromCache
+        }
+        let baseConfig = _shared
+        let generation = stateGeneration
+        stateLock.unlock()
             
             /// Cache retrieval failed -> Recalculate result
             
             /// Copy og settings
-            let new = shared.copy() as! ScrollConfig
+            /// Construct from the same immutable raw snapshot. The old generic
+            /// runtime shallow-copy helper instantiates with `init()` and skips
+            /// read-only properties, so it cannot preserve `scrollConfigRaw`.
+            let new = ScrollConfig(raw: baseConfig.scrollConfigRaw)
             
             /// Declare overridables
             var u_speed = new.u_speed
@@ -219,18 +267,66 @@ import Cocoa
                 new.animationCurve = ovr
             }
             
-            /// Get accelerationCurve
-            if u_speed == kMFScrollSpeedSystem && !usePreciseMod && !useQuickMod {
-                new.accelerationCurve = nil
+            /// Preserve the old speed and modifier meanings inside the true-velocity
+            /// model. Do not revive the rejected events/second acceleration curve.
+            new.useAppleAcceleration =
+                u_speed == kMFScrollSpeedSystem && !usePreciseMod && !useQuickMod
+
+            let speedMultiplier: Double
+            switch u_speed {
+            case kMFScrollSpeedLow:
+                speedMultiplier = 0.65
+            case kMFScrollSpeedMedium, kMFScrollSpeedSystem:
+                speedMultiplier = 1.0
+            case kMFScrollSpeedHigh:
+                speedMultiplier = 1.5
+            default:
+                assertionFailure("Unknown scroll speed")
+                speedMultiplier = 1.0
+            }
+
+            if useQuickMod {
+                let outputIsHorizontal = inputAxis == kMFAxisHorizontal
+                    || modifiers.effectMod == kMFScrollEffectModificationHorizontalScroll
+                let displayPixels = outputIsHorizontal
+                    ? Double(CGDisplayPixelsWide(display))
+                    : Double(CGDisplayPixelsHigh(display))
+                new.velocityModelDistanceMultiplier =
+                    max(1.0, displayPixels * 0.5 / max(new.pxAtRefSpeed, 1.0))
+            } else if usePreciseMod {
+                new.velocityModelDistanceMultiplier = 0.15
             } else {
-                new.accelerationCurve = getAccelerationCurve(forSpeed: u_speed, smoothness: new.u_smoothness, animationCurve: new.animationCurve, inputAxis: inputAxis, display: display, scaleToDisplay: scaleToDisplay, modifiers: modifiers, useQuickModSpeed: useQuickMod, usePreciseModSpeed: usePreciseMod, consecutiveScrollTickIntervalMax: new.consecutiveScrollTickIntervalMax, consecutiveScrollTickInterval_AccelerationEnd: new.consecutiveScrollTickInterval_AccelerationEnd)
+                var displayMultiplier = 1.0
+                if scaleToDisplay {
+                    let outputIsHorizontal = inputAxis == kMFAxisHorizontal
+                        || modifiers.effectMod == kMFScrollEffectModificationHorizontalScroll
+                    let displayPixels = outputIsHorizontal
+                        ? Double(CGDisplayPixelsWide(display))
+                        : Double(CGDisplayPixelsHigh(display))
+                    let referencePixels = outputIsHorizontal ? 1920.0 : 1080.0
+                    displayMultiplier = SharedUtilitySwift.clip(
+                        0.9 + 0.1 * (displayPixels / referencePixels),
+                        betweenLow: 0.75,
+                        high: 1.5)
+                }
+                new.velocityModelDistanceMultiplier = speedMultiplier * displayMultiplier
             }
             
             /// Cache & return
-            cache![key] = new
+            stateLock.lock()
+            if generation != stateGeneration {
+                /// A reload won while this snapshot was being derived. Retry against
+                /// the new generation so an obsolete instance is never published.
+                stateLock.unlock()
+                return scrollConfig(modifiers: modifiers, inputAxis: inputAxis, display: display)
+            }
+            if let concurrentlyBuilt = cache[key] {
+                stateLock.unlock()
+                return concurrentlyBuilt
+            }
+            cache[key] = new
+            stateLock.unlock()
             return new
-            
-        }
     }
     
     // MARK: ???
@@ -255,9 +351,7 @@ import Cocoa
         /// Does this really have to exist?
         return _animationCurveName != kMFScrollAnimationCurveNameNone
     }
-    @objc var useAppleAcceleration: Bool {
-        return accelerationCurve == nil
-    }
+    @objc var useAppleAcceleration: Bool = false
     // MARK: Invert Direction
     
     @objc lazy var u_invertDirection: MFScrollInversion = {
@@ -345,6 +439,9 @@ import Cocoa
 
     @objc lazy var pxAtRefSpeed: Double = { 10.0 + (u_sensitivity * 140.0) }()   /// 10...1410
     @objc lazy var gamma: Double = { 0.4 + (u_acceleration * 0.8) }()            /// 0.4...4.4
+    /// Explicit scale for the retained Low/Medium/High, Precise, Quick, and
+    /// display-size semantics. Applied once, after the true-velocity curve.
+    @objc var velocityModelDistanceMultiplier: Double = 1.0
 
     /// Stable-engine overload control.
     ///
@@ -819,23 +916,11 @@ import Cocoa
         default: fatalError()
         }
     }()
-    /// Stored property
-    ///     This is used by Scroll.m to determine how to accelerate
-    
-    @objc lazy var accelerationCurve: Curve? = nil /// Initial value is unused I think. Will always be overriden before it's used anywhere. Edit: No, this stays nil, if we useAppleAcceleration
-    
     // MARK: Keyboard modifiers
     
     /// Event flag masks
     @objc lazy var horizontalModifiers = CGEventFlags(rawValue: c("modifiers.horizontal") as! UInt64)
     @objc lazy var zoomModifiers = CGEventFlags(rawValue: c("modifiers.zoom") as! UInt64)
-    
-    @objc func copy(with zone: NSZone? = nil) -> Any {
-        
-        /// TODO: Think about whether this could have todo with the weird scrolling crashes for MMF 3.0.2. Any race conditions or sth?
-        
-        return SharedUtilitySwift.shallowCopy(ofObject: self)
-    }
     
 }
 
@@ -1196,7 +1281,10 @@ fileprivate func animationCurveParamsMap(name: MFScrollAnimationCurveName) -> MF
     }
 }
 
-/// Define function that maps userSettings -> accelerationCurve
+/// Retained only as historical tuning documentation. The event-rate input domain
+/// was rejected for the true-velocity engine; make accidental restoration a
+/// compile-time error unless the model is deliberately redesigned and revalidated.
+@available(*, unavailable, message: "Use the true-velocity output model")
 fileprivate func getAccelerationCurve(forSpeed speedArg: MFScrollSpeed, smoothness: MFScrollSmoothness, animationCurve: MFScrollAnimationCurveName, inputAxis: MFAxis, display: CGDirectDisplayID, scaleToDisplay: Bool, modifiers: MFScrollModificationResult, useQuickModSpeed: Bool, usePreciseModSpeed: Bool, consecutiveScrollTickIntervalMax: Double, consecutiveScrollTickInterval_AccelerationEnd: Double) -> Curve {
     
     /// Notes:

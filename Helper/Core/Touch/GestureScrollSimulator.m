@@ -8,6 +8,7 @@
 //
 
 #import "GestureScrollSimulator.h"
+#import "../Scroll/ScrollSyntheticEvent.h"
 #import <QuartzCore/QuartzCore.h>
 #import <Cocoa/Cocoa.h>
 #import "TouchSimulator.h"
@@ -567,6 +568,7 @@ static void getDeltaVectors(Vector point, VectorSubPixelator *subPixelator, Vect
     ///
     
     CGEventRef e22 = CGEventCreate(NULL);
+    MFScrollMarkSyntheticEvent(e22);
     
     /// Set static fields
     

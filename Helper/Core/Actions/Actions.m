@@ -32,7 +32,16 @@
     DDLogDebug("Executing action array: %@, phase: %@", actionArray, @(phase));
     
     if (phase == kMFActionPhaseEnd) {
-        return; /// TODO: Actually implement actions with different phases
+        /// Smart Zoom is a toggle event. Buttons.swift only sends an end phase for
+        /// hold bindings, so posting it again here makes hold-to-Smart-Zoom
+        /// momentary while click and multi-click bindings remain one-shot.
+        for (NSDictionary *actionDict in actionArray) {
+            MFStringConstant actionType = actionDict[kMFActionDictKeyType];
+            if ([actionType isEqualToString:kMFActionDictTypeSmartZoom]) {
+                [TouchSimulator postSmartZoomEvent];
+            }
+        }
+        return;
     }
                
     for (NSDictionary *actionDict in actionArray) {

@@ -66,6 +66,7 @@ typedef void(^DisplayLinkCallback)(DisplayLinkCallbackTimeInfo timeInfo);
 
 - (void)linkToMainScreen;
 - (void)linkToMainScreen_Unsafe;
+- (void)linkToDisplay:(CGDirectDisplayID)displayID;
 - (void)linkToDisplayUnderMousePointerWithEvent:(CGEventRef _Nullable)event;
 
 @property(atomic, readonly, strong) dispatch_queue_t dispatchQueue;

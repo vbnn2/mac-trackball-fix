@@ -45,7 +45,7 @@ Important records:
 | Record | Meaning |
 |---|---|
 | `MFSCROLL_INPUT cont=0` | Physical wheel report entering the engine |
-| `MFSCROLL_INPUT cont=1` | Synthetic continuous pixel output seen again by the event tap |
+| `MFSCROLL_INPUT cont=1` | Unmarked continuous input; MMF's own marked output now bypasses tap decoding/telemetry |
 | `MFSCROLL_LATENCY` | Physical input to first animated output and time queued before processing |
 | `MFSCROLL_LEGACY` | Input speed, mapped distance, retained distance, target velocity, duration, and adaptive state |
 | `MFSCROLL_OUTPUT` | Aggregated nonzero output cadence; its window can span cancellation or idle time |
@@ -814,6 +814,106 @@ Remaining tradeoff: a cadence learned from several genuinely sparse reports can 
 is required for continuous extremely slow motion. The fix removes only self-lengthening by the current pause. After
 three completely callback-less display restarts, the undelivered request is dropped so future input can recover;
 silently retaining it would reintroduce both the zombie-session bug and a delayed snap.
+
+### 2026-07-26 — deep engine hardening: false sparse restart, lifecycle races, and hot-path overhead
+
+Symptom: after many earlier fixes, a fresh report following a fast spin could still move slightly and feel stuck
+before continuing. A code-wide review also found modifier/effect teardown, display-link lifecycle, configuration
+snapshot, remap cache, output-bound, and synthetic-event paths that could recreate a delay or stale session.
+
+Telemetry before attribution:
+
+- Helper PID `60239` at `22:29:28.007` received a first report after `681 ms`. Queue time was only about `0.58 ms`
+  and first output arrived in about `12.02 ms`, with no tap/display failure, but the response used the current
+  `681 ms` gap as remembered cadence (`priorEstimateMs=0`, `durationRefMs=500`) and stretched a roughly `20 px`
+  opening to `baseMs=329.4`, `durationMs=343.5`.
+- Nineteen captured starts otherwise reached output in `9.97–22.04 ms` (median about `13.97 ms`) with
+  `0.52–6.32 ms` queued (median about `0.67 ms`). The perceived pause was response shape, not evidence of a queue,
+  event-tap, or display-link delay.
+- The recorder saw `155` physical inputs but `1,521` self-generated continuous events. More than 90% of the old
+  input/logging path was therefore output feeding back through field decoding, target lookup, and debug telemetry.
+
+Confirmed root causes and changes:
+
+1. Sparse-cadence continuation checked only the previous modeled speed. A decelerated multi-unit report at the end
+   of a spin could therefore seed the next opening report. `ScrollCadencePolicy.h` now requires the immediately
+   preceding accepted report itself to be low-unit, low-speed motion, and excludes fast/settling-tail responses.
+   Every session reset and early bounded-tail return clears that eligibility. Genuine sparse motion may still use
+   cadence beginning with report two; no timer or report-count gate was added.
+2. Modifier resolution performed usage side effects while polling every wheel report, and modifier release could
+   disable the scroll tap before another report ended zoom or Command-Tab. Resolution is now pure, usage feedback is
+   one-shot per effective activation, and immutable modifier callbacks end/reconfigure the scroll session
+   immediately. Every reset releases a synthetic Command key. Remap reloads while a modifier is held publish the
+   new effective scroll mode, and trackball-mode changes now explicitly re-evaluate the tap instead of calling the
+   unrelated `userIsActive` callback.
+3. The CoreVideo callback synchronously waited on a queue which can call `CVDisplayLinkStop`, forming a lock
+   inversion. Delivery is now asynchronous on the existing user-interactive serial queue, with at most one
+   executing and one waiting callback; stale/backlogged frames are rejected. Lifecycle generations prevent a stop
+   from being undone by an older deferred start. Borrowed `CGEventRef` values no longer cross an async boundary:
+   display ID is resolved synchronously, validated, and passed by value. Reconfiguration and failed-start behavior
+   retain the existing cold-start/watchdog recovery contract.
+4. The custom speed path mixed true units/second with an old events/second acceleration curve, and overload bounds
+   were not universal across custom modes. The retained model now has explicit pixels/unit and pixels/second
+   semantics, explicit Low/Medium/High, Precise, Quick, and display scaling, and a time-based final rate limit after
+   all multipliers. Initial distance, carry, and fast-tail friction remain separate bounds for every custom mode.
+   The rejected event-rate curve is compile-time unavailable.
+5. `ScrollConfig` lazy values read a mutable global raw dictionary; cache reload and derived-cache publication were
+   unsynchronized; animator parameter blocks still read the global current config. Each config now owns a deep,
+   immutable raw snapshot, reload/cache state is generation-locked, and each queued animator block captures its
+   exact config. During verification, the first implementation exposed the old generic shallow-copy trap:
+   `Mac Mouse Fix Helper-2026-07-26-231716.ips` stopped in `ScrollConfig.init()` through
+   `SharedUtilitySwift.shallowCopy`. Derived configs now construct directly from their immutable raw snapshot;
+   the final live pass had no crash and was intentionally stopped only for the next deployment.
+6. `Modifiers` and `Remap` shared mutable dictionaries/cache were read and written across queues. Modifier state is
+   immutable copy-on-write; remap calculation occurs outside a short lock and publishes only if its generation
+   still matches. Add-mode state and its matching remap table now swap atomically, with notifications outside the
+   lock.
+7. MMF wheel output carries a 64-bit source marker and returns from the HID tap before decoding or target lookup.
+   `MFSCROLL_*` records needed by the rolling capture use info level, so recording no longer globally enables the
+   unrelated per-frame debug stream. `cont=1` now represents unmarked external continuous input, not normal MMF
+   output recursion.
+
+Preserved behavior:
+
+- A physical report is never held for a timer or confirmation count. First reports retain the bounded normal start,
+  report two can use measured slow cadence, and faster input invalidates remembered cadence on that same report.
+- Direction changes cancel the old session and deliver the requesting report for both custom and System/Apple
+  acceleration. Live retargets retain velocity; no second reservoir or delayed distance is introduced.
+- The one-shot `320 ms` settling protection, expired-tail opening cap, terminal gesture phases, target/window reset,
+  display watchdog, and sparse-reversal taper remain active. System speed remains the untouched Apple path unless a
+  Precise/Quick modification explicitly requests custom output.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes deterministic cadence-seed, display-generation/callback-admission, speed-order, and
+  cadence-independent rate-limit checks under `clang -Wall -Wextra -Werror`.
+- Repeated `./dev.sh build`, the final `./dev.sh run`, `bash -n dev.sh`, and `git diff --check` passed. Xcode static
+  analysis completed successfully; scroll lifecycle/cache files had no ownership or race finding. Existing analyzer
+  findings outside this change remain repository debt. The exact final analyzed build started as helper PID `99302`
+  with a clean config/tap initialization.
+- Live helper PID `96862` handled `128` physical reports: `126` modeled responses plus the intended two bounded
+  micro-reversals. All were accounted for. Eighteen cold/micro starts reached first output in
+  `6.87–16.86 ms`, with `0.53–4.99 ms` queued. Thirty-four active output windows ran at `108.4–120.4 Hz` with
+  `8.81–17.53 ms` maximum gaps. There was no display recovery/start/refresh failure, callback-backlog record,
+  rate-limited report, dropped carry, unexplained tap disable, or marked synthetic input in the physical trace.
+- The old false-seed shape was exercised directly: a seven-unit report at `23:19:57.112` was followed `612 ms`
+  later by a one-unit opening at `23:19:57.724`. It logged `cadence=unknown previousSeed=0`, used
+  `baseMs=80.0`, and produced output in `13.18 ms` with `1.40 ms` queued. A six-unit predecessor at
+  `23:19:42.869` likewise could not seed the next opening. Conversely, a genuine one-unit predecessor at
+  `23:19:44.004` remained eligible at `23:19:44.694`; the existing reversal taper reduced its blend to zero rather
+  than creating a dead zone.
+
+Remaining manual matrix: this physical pass covered the Regular custom vertical path in Kitty on display `4`,
+including both directions, slow/fast transitions, paused/active reversals, stopping, and settling tails. System
+acceleration, live modifier effects (horizontal, zoom, Command-Tab, Dock gestures), trackball-mode tap transitions,
+Safari/Chromium boundaries, Telegram, Finder, VS Code/Xcode, each attached display, display reconfiguration, and a
+genuinely parked display remain build/branch checked rather than physically forced.
+
+Remaining tradeoffs: callback coalescing intentionally discards redundant display timestamps only when the delivery
+queue is already occupied; the next available frame still advances the current animation. Explicit speed
+multipliers approximate the old setting ordering without restoring its invalid event-rate domain, and extreme Quick
+output may meet the universal safety cap. Genuine repeatedly sparse motion can still lengthen later reports by
+design, but a multi-unit/tail report cannot bootstrap that state.
 
 ## Required regression pass
 
