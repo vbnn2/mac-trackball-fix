@@ -13,9 +13,9 @@
 
 /// Some TB800 starts after a long wheel-idle interval arrive as a short ramp of
 /// one-unit reports before the hardware reaches the cadence implied by the physical
-/// spin. The first report already receives the bounded opening response. For later
-/// reports in that same ramp, continuously fade the opening-duration cap out instead
-/// of interpreting the early sparse cadence at full strength.
+/// spin. The first report already receives the bounded opening response. Keep that
+/// bound through the measured hardware-ramp interval, then continuously fade it out
+/// instead of interpreting silence before report two as completed wake progress.
 ///
 /// This is a response-shape decision on the current report. It never waits for,
 /// confirms, or replays input, and a substantial/fast report bypasses it immediately.
@@ -25,7 +25,8 @@ static inline double MFScrollIdleWakeOpeningCapBlend(
     double idleBeforeOpening,
     double elapsedSinceOpening,
     double idleThreshold,
-    double responseWindow,
+    double responseHoldDuration,
+    double responseFadeDuration,
     int64_t units,
     double modeledOutputSpeed,
     double slowCadenceSpeedMax
@@ -34,15 +35,23 @@ static inline double MFScrollIdleWakeOpeningCapBlend(
         || firstConsecutive
         || idleBeforeOpening < idleThreshold
         || elapsedSinceOpening <= 0.0
-        || elapsedSinceOpening >= responseWindow
-        || responseWindow <= 0.0
+        || responseHoldDuration < 0.0
+        || responseFadeDuration <= 0.0
         || units > 2
         || modeledOutputSpeed <= 0.0
         || modeledOutputSpeed >= slowCadenceSpeedMax) {
         return 0.0;
     }
 
-    return 1.0 - elapsedSinceOpening / responseWindow;
+    const double fadeElapsed = elapsedSinceOpening - responseHoldDuration;
+    if (fadeElapsed <= 0.0) {
+        return 1.0;
+    }
+    if (fadeElapsed >= responseFadeDuration) {
+        return 0.0;
+    }
+
+    return 1.0 - fadeElapsed / responseFadeDuration;
 }
 
 /// A report may seed sparse-cadence continuity only when the report itself looked like

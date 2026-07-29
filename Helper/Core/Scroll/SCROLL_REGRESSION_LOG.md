@@ -988,6 +988,68 @@ During the first `750 ms` after long idle, genuine careful one-unit input is int
 cadence. This bounded ambiguity is preferable to reproducing the confirmed slow opening, and full sparse smoothing
 returns continuously without waiting for another report.
 
+### 2026-07-30 — wake protection faded during hardware silence
+
+Symptom: the long-idle slow start remained perceptible after the first idle-wake mitigation.
+
+Current telemetry before attribution:
+
+- Final helper PID `86357` confirmed the same response-shaping failure in multiple physical long-idle starts. At
+  `00:32:09.673`, after `262.341 s` idle, the first report reached output in `10.69 ms` with `0.83 ms` queued.
+  The next one-unit report arrived `328 ms` later, when the cap had already faded to `wakeBlend=0.56`; it retained
+  `baseMs=193.0` from an uncapped `270.3 ms` response.
+- At `00:23:41.490`, after `207.105 s` idle, the first report reached output in `13.81 ms` with `0.68 ms` queued.
+  Its next one-unit report arrived `449 ms` later, after the cap had faded to `wakeBlend=0.40`, leaving
+  `baseMs=215.2` instead of the `132.9 ms` opening cap. The following low-unit report retained `188.3 ms`.
+- A healthier `46.193 s` idle start at `00:27:39.803` supplied follow-up reports after only `37 ms` and `89 ms`;
+  the still-strong cap reduced their bases to `130.1 ms` and `127.2 ms`. This timing contrast isolates why the
+  earlier fix helped fast wake ramps but not the reported late-second-report shape.
+- The capture contained no display recovery, display-start/refresh failure, or unexplained tap disable. The long
+  `MFSCROLL_OUTPUT.maxGapMs` records crossed silence between separate animations and are not evidence of a callback
+  stall.
+
+Confirmed root cause: the first mitigation linearly faded its opening cap from the time of report one. The captured
+TB800 can remain silent for `328–449 ms` before report two, so hardware silence consumed `44–60%` of the protection
+before the engine had observed any wake progression. This left the same maximum Slow Smoothness response partly
+restored on the report that made the opening feel weak.
+
+Fix (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/ScrollCadencePolicy.h`,
+`Helper/Core/Scroll/Scroll.m`):
+
+- Keep the opening-duration cap at full influence for the measured `750 ms` hardware-ramp interval after a
+  qualifying `>=20 s` idle opening.
+- Fade the cap continuously from full to zero over the following `750 ms`, expiring at `1.5 s`.
+- Preserve the measured smoothness ratio. A report above two units or outside the slow-speed range still bypasses
+  and ends wake shaping immediately on that report.
+- The policy remains a current-report duration bound. It adds no timer, confirmation count, delayed report, replay,
+  or distance reservoir.
+
+Preserved behavior:
+
+- The first report remains the existing normal-smoothness `80 ms` bounded start and emits on the first display
+  callback. Starts after less than `20 s` do not arm wake shaping.
+- Ordinary slow-cadence memory, reversal taper, raw-cadence acceleration, live velocity-preserving retargets,
+  settling/fast-tail protection, target resets, display recovery, and output bounds are unchanged.
+- A genuinely careful long-idle stream is fully bounded only during the observed wake interval, then transitions
+  continuously to its measured sparse cadence without an event-count switch.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes under `clang -Wall -Wextra -Werror`. Deterministic cases cover the exact
+  `328 ms`/`449 ms` late-second-report captures, full influence through `750 ms`, a `0.50` blend halfway through
+  the fade, zero influence at `1.5 s`, no policy after a `4.876 s` pause, first-report exclusion, and immediate
+  substantial/fast-input bypass. Existing display-lifecycle and output-policy suites also pass.
+- Captured-trace replay reduces the `00:32:10.003/.059/.107` bases from `193.0/184.4/172.4 ms` to their full
+  `132.8/129.2/116.6 ms` opening caps. It reduces the `00:23:41.939/.979` bases from `215.2/188.3 ms` to
+  `132.9/126.6 ms`.
+- `git diff --check` and `./dev.sh build` passed. `./dev.sh run` rebuilt and deployed the Debug app; final helper
+  PID `94387` logged `MFSCROLL_CONFIG action=reload-reset` and re-enabled its event tap.
+
+Remaining verification/tradeoff: the final deployed helper still needs a physical `>20 s` idle pass covering both
+a normal acceleration and deliberately extremely slow movement. Genuine careful one-unit input during the first
+`750 ms` after long idle is now fully capped rather than partially tapered; this is the explicit ambiguity chosen
+from the captured hardware ramp. Full sparse smoothing returns continuously over the next `750 ms`.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

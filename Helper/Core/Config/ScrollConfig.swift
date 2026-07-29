@@ -469,10 +469,13 @@ import Cocoa
     /// Current TB800 captures show a distinct response-shape regression after long wheel idle: the first output is
     /// delivered within one display frame, but the next few hardware reports can remain at one unit long enough for
     /// maximum Slow Smoothness to make the physical wake-up ramp feel stuck. Starts after 4–5 seconds do not show
-    /// the reported problem. Arm only after the observed 20-second boundary, then continuously fade the existing
-    /// opening-duration cap away over 750ms. No input is delayed, and larger/faster input exits on that report.
+    /// the reported problem. Arm only after the observed 20-second boundary. Hold the existing opening-duration cap
+    /// through the measured 750ms hardware-ramp interval, then continuously fade it away over the following 750ms.
+    /// Silence before report two must not consume most of the protection. No input is delayed, and larger/faster
+    /// input exits on that report.
     @objc let stableIdleWakeMinimumIdle: TimeInterval = 20.0
-    @objc let stableIdleWakeResponseWindow: TimeInterval = 750.0 / 1000.0
+    @objc let stableIdleWakeResponseHoldDuration: TimeInterval = 750.0 / 1000.0
+    @objc let stableIdleWakeResponseFadeDuration: TimeInterval = 750.0 / 1000.0
 
     /// Keep enough cadence history to recognize extremely slow same-direction trackball movement even when its
     /// reports cross the 500ms gesture-grouping timeout. Acceleration, clicks, and target changes clear this memory

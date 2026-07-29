@@ -84,8 +84,9 @@ static double _stablePreviousModeledOutputSpeed;
 /// a decelerated multi-unit report can be slow numerically while still ending a fast spin.
 static BOOL _stablePreviousReportCanSeedSlowCadence;
 /// The capture can begin with a short one-unit hardware ramp after at least 20 seconds without wheel input. Preserve
-/// the opening report's time and preceding idle gap so later reports in that same sub-second ramp can continuously
-/// fade out the ordinary opening-duration cap instead of jumping straight to maximum Slow Smoothness.
+/// the opening report's time and preceding idle gap so later reports in that same sub-second ramp retain the
+/// ordinary opening-duration cap. After that measured interval, fade the cap continuously instead of jumping
+/// straight to maximum Slow Smoothness.
 static CFTimeInterval _stableIdleWakeOpeningTime;
 static CFTimeInterval _stableIdleWakeOpeningGap;
 
@@ -1092,14 +1093,17 @@ static void heavyProcessing(CGEventRef event,
                 stableIdleWakeOpeningGapForTick,
                 stableIdleWakeElapsedForTick,
                 _scrollConfig.stableIdleWakeMinimumIdle,
-                _scrollConfig.stableIdleWakeResponseWindow,
+                _scrollConfig.stableIdleWakeResponseHoldDuration,
+                _scrollConfig.stableIdleWakeResponseFadeDuration,
                 unitsForThisTick,
                 modeledOutputSpeed,
                 slowCadenceSpeedMax);
 
-            /// A larger/faster report proves the wake ramp is over on that same report. Expiry is likewise observed
-            /// only when another physical report arrives; there is no scheduled gate or delayed input.
-            if (stableIdleWakeElapsedForTick >= _scrollConfig.stableIdleWakeResponseWindow
+            /// A larger/faster report proves the wake ramp is over on that same report. Time expiry is likewise
+            /// observed only when another physical report arrives; there is no scheduled gate or delayed input.
+            if (stableIdleWakeElapsedForTick
+                    >= _scrollConfig.stableIdleWakeResponseHoldDuration
+                        + _scrollConfig.stableIdleWakeResponseFadeDuration
                 || unitsForThisTick > 2
                 || modeledOutputSpeed >= slowCadenceSpeedMax) {
                 _stableIdleWakeOpeningTime = 0;
@@ -1585,8 +1589,9 @@ static void heavyProcessing(CGEventRef event,
             }
             if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
                 /// Preserve measured Slow Smoothness, but keep the early hardware ramp near the already accepted
-                /// opening response. The linear blend reaches zero continuously at the wake window boundary, so
-                /// ordinary extremely-slow cadence resumes without a report-count transition.
+                /// opening response. Silence before the second hardware report does not weaken the cap during the
+                /// measured wake-ramp interval. The later linear fade reaches zero continuously, so ordinary
+                /// extremely-slow cadence resumes without a report-count transition.
                 double uncappedIdleWakeBaseDuration = baseDuration;
                 double cappedIdleWakeBaseDuration = MIN(
                     uncappedIdleWakeBaseDuration,
