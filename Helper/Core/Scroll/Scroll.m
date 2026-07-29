@@ -68,6 +68,11 @@ static ScrollConfig *_scrollConfig;
 static MFScrollAnimationCurveParameters *_animationParams;
 static ScrollAnalysisResult _lastScrollAnalysisResult;
 static CFTimeInterval _lastScrollAnalysisResultTimeStamp;
+/// Physical wheel gaps normally use the preceding event. Before the first event, helper uptime is the only measured
+/// lower bound; recording it lets a real >20s first-use idle arm wake shaping without treating an unknown sentinel
+/// as infinite idle.
+static CFTimeInterval _scrollInputObservationStartTime;
+static CFTimeInterval _previousPhysicalScrollInputTime;
 
 /// Slow trackball motion can place more than the normal 500ms gesture timeout between reports. Keep cadence memory
 /// separate from ScrollAnalyzer's gesture grouping so those reports can still form one visually continuous motion.
@@ -78,6 +83,11 @@ static double _stablePreviousModeledOutputSpeed;
 /// was itself genuine low-unit, low-speed motion. Modeled speed alone is insufficient:
 /// a decelerated multi-unit report can be slow numerically while still ending a fast spin.
 static BOOL _stablePreviousReportCanSeedSlowCadence;
+/// The capture can begin with a short one-unit hardware ramp after at least 20 seconds without wheel input. Preserve
+/// the opening report's time and preceding idle gap so later reports in that same sub-second ramp can continuously
+/// fade out the ordinary opening-duration cap instead of jumping straight to maximum Slow Smoothness.
+static CFTimeInterval _stableIdleWakeOpeningTime;
+static CFTimeInterval _stableIdleWakeOpeningGap;
 
 /// A fast free-spin can be followed by one mechanical one-unit report after the intended motion has ended. Keep
 /// this guard outside ScrollAnalyzer so an unconfirmed rebound cannot change cadence or direction history.
@@ -220,6 +230,8 @@ static void startSettlingTailMicroGlide(int64_t distance,
     ///  For multithreading while still retaining control over execution order.
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, -1);
     _scrollQueue = dispatch_queue_create("com.nuebling.mac-mouse-fix.helper.scroll", attr);
+    _scrollInputObservationStartTime = CACurrentMediaTime();
+    _previousPhysicalScrollInputTime = 0;
     
     /// Create AXUIElement for getting app under mouse pointer
     _systemWideAXUIElement = AXUIElementCreateSystemWide();
@@ -279,6 +291,8 @@ void resetState_Unsafe(void) {
     _stableSlowCadenceEstimate = 0;
     _stablePreviousModeledOutputSpeed = 0;
     _stablePreviousReportCanSeedSlowCadence = NO;
+    _stableIdleWakeOpeningTime = 0;
+    _stableIdleWakeOpeningGap = 0;
     _stableSettlingTailGuardArmed = NO;
     _stableSettlingTailDirection = kMFDirectionNone;
     _stableSettlingTailLastFastInputTime = 0;
@@ -535,12 +549,15 @@ static void heavyProcessing(CGEventRef event,
     
     /// Declare stuff for later
     static DriverUnsuspender unsuspendDrivers = ^{}; /// This is old stuff that should be removed I think [Jun 2 2025]
-    static CFTimeInterval previousPhysicalScrollInputTime = 0;
     double inputQueueDelayMs = MAX(0.0, (CACurrentMediaTime() - tickTS) * 1000.0);
-    double physicalInputGap = previousPhysicalScrollInputTime > 0
-        ? tickTS - previousPhysicalScrollInputTime
-        : DBL_MAX;
-    previousPhysicalScrollInputTime = tickTS;
+    double physicalInputGap = DBL_MAX;
+    if (_previousPhysicalScrollInputTime > 0) {
+        physicalInputGap = tickTS - _previousPhysicalScrollInputTime;
+    } else if (_scrollInputObservationStartTime > 0
+               && tickTS >= _scrollInputObservationStartTime) {
+        physicalInputGap = tickTS - _scrollInputObservationStartTime;
+    }
+    _previousPhysicalScrollInputTime = tickTS;
     
     /// Get axis
     
@@ -723,6 +740,15 @@ static void heavyProcessing(CGEventRef event,
         _scrollConfig = [ScrollConfig scrollConfigWithModifiers:newMods inputAxis:inputAxis display:displayID];
         
     } /// End `if (firstConsecutive) {`
+
+    /// Long wheel idle can be followed by a short hardware ramp of one-unit reports. Arm from the physical gap,
+    /// after target/modifier resets have run, so the same opening report establishes the bounded response. No timer
+    /// drives this state: later physical reports consult their own timestamp and substantial input exits immediately.
+    if (physicalInputGap != DBL_MAX
+        && physicalInputGap >= _scrollConfig.stableIdleWakeMinimumIdle) {
+        _stableIdleWakeOpeningTime = tickTS;
+        _stableIdleWakeOpeningGap = physicalInputGap;
+    }
 
     /// Consume this one-report marker before processing the new input. A requested-running animator means the
     /// bounded tail is still visibly continuous, so ordinary measured slow smoothing remains appropriate. A stopped
@@ -913,6 +939,9 @@ static void heavyProcessing(CGEventRef event,
     double stableSlowCadenceContinuationBlendForTick = 0.0;
     double stableSlowCadenceReversalBlendForTick = 1.0;
     BOOL stableRestartAfterExpiredFastTailForTick = NO;
+    double stableIdleWakeOpeningCapBlendForTick = 0.0;
+    double stableIdleWakeOpeningGapForTick = 0.0;
+    double stableIdleWakeElapsedForTick = DBL_MAX;
     double stableAnimationCadenceIntervalForTick = DBL_MAX;
     /// A new gesture's first report has no cadence measurement. Do not classify that unknown report as "very slow"
     /// and apply the maximum adaptive duration: doing so delays every scroll start by hundreds of milliseconds.
@@ -1054,6 +1083,29 @@ static void heavyProcessing(CGEventRef event,
         double adaptiveSpeedEnd = _scrollConfig.stableMaximumOutputSpeed
             * _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio;
         double slowCadenceSpeedMax = MIN(adaptiveSpeedEnd, _scrollConfig.stableFastGestureSpeed);
+        if (_stableIdleWakeOpeningTime > 0) {
+            stableIdleWakeOpeningGapForTick = _stableIdleWakeOpeningGap;
+            stableIdleWakeElapsedForTick = MAX(0.0, tickTS - _stableIdleWakeOpeningTime);
+            stableIdleWakeOpeningCapBlendForTick = MFScrollIdleWakeOpeningCapBlend(
+                stableAdaptiveControlEnabled,
+                firstConsecutive,
+                stableIdleWakeOpeningGapForTick,
+                stableIdleWakeElapsedForTick,
+                _scrollConfig.stableIdleWakeMinimumIdle,
+                _scrollConfig.stableIdleWakeResponseWindow,
+                unitsForThisTick,
+                modeledOutputSpeed,
+                slowCadenceSpeedMax);
+
+            /// A larger/faster report proves the wake ramp is over on that same report. Expiry is likewise observed
+            /// only when another physical report arrives; there is no scheduled gate or delayed input.
+            if (stableIdleWakeElapsedForTick >= _scrollConfig.stableIdleWakeResponseWindow
+                || unitsForThisTick > 2
+                || modeledOutputSpeed >= slowCadenceSpeedMax) {
+                _stableIdleWakeOpeningTime = 0;
+                _stableIdleWakeOpeningGap = 0;
+            }
+        }
         stableRestartAfterExpiredFastTailForTick =
             stableFastTailResponseExpiredBeforeContinuation
             && !firstConsecutive
@@ -1496,6 +1548,8 @@ static void heavyProcessing(CGEventRef event,
             /// report as a separate short burst. Blend extra time in only at the bottom of the speed range. The
             /// animation parameters above already contain the slider's fixed duration factor, so apply only the
             /// ratio between the adaptive factor and that fixed factor here.
+            double effectiveOpeningDurationCap =
+                configCopyForBlock.stableInitialResponseBaseDurationMax;
             if (stableAdaptiveControlEnabled) {
                 double selectedSmoothness = configCopyForBlock.u_smoothnessAmount;
                 double slowSmoothness = MAX(selectedSmoothness, configCopyForBlock.u_slowSmoothnessAmount);
@@ -1510,7 +1564,10 @@ static void heavyProcessing(CGEventRef event,
 
                 double selectedDurationFactor = 0.4 + selectedSmoothness * 1.2;
                 double effectiveDurationFactor = 0.4 + effectiveSmoothnessAmount * 1.2;
-                baseDuration *= effectiveDurationFactor / selectedDurationFactor;
+                double adaptiveDurationRatio =
+                    effectiveDurationFactor / selectedDurationFactor;
+                baseDuration *= adaptiveDurationRatio;
+                effectiveOpeningDurationCap *= adaptiveDurationRatio;
             }
             if (stableSlowCadenceContinuationForTick) {
                 /// Aim the full hybrid response at the observed sparse cadence. TouchAnimator's biased subpixelator
@@ -1525,6 +1582,26 @@ static void heavyProcessing(CGEventRef event,
                     + stableSlowCadenceContinuationBlendForTick
                     * (cadenceDuration - baseDuration);
                 baseDuration = MAX(baseDuration, taperedCadenceDuration);
+            }
+            if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
+                /// Preserve measured Slow Smoothness, but keep the early hardware ramp near the already accepted
+                /// opening response. The linear blend reaches zero continuously at the wake window boundary, so
+                /// ordinary extremely-slow cadence resumes without a report-count transition.
+                double uncappedIdleWakeBaseDuration = baseDuration;
+                double cappedIdleWakeBaseDuration = MIN(
+                    uncappedIdleWakeBaseDuration,
+                    effectiveOpeningDurationCap);
+                baseDuration = uncappedIdleWakeBaseDuration
+                    + stableIdleWakeOpeningCapBlendForTick
+                    * (cappedIdleWakeBaseDuration - uncappedIdleWakeBaseDuration);
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured idleGapMs=%.1f idleElapsedMs=%.1f wakeBlend=%.2f smoothness=%.2f openingCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-idle-wake-ramp",
+                           stableIdleWakeOpeningGapForTick * 1000.0,
+                           stableIdleWakeElapsedForTick * 1000.0,
+                           stableIdleWakeOpeningCapBlendForTick,
+                           effectiveSmoothnessAmount,
+                           effectiveOpeningDurationCap * 1000.0,
+                           uncappedIdleWakeBaseDuration * 1000.0,
+                           baseDuration * 1000.0);
             }
             if (stableFastTailReport) {
                 double durationScale = configCopyForBlock.stableFastTailDurationScale

@@ -915,6 +915,79 @@ multipliers approximate the old setting ordering without restoring its invalid e
 output may meet the universal safety cap. Genuine repeatedly sparse motion can still lengthen later reports by
 design, but a multi-unit/tail report cannot bootstrap that state.
 
+### 2026-07-30 — long-idle hardware ramp selected maximum slow smoothing
+
+Symptom: scrolling had a definite slow start only after roughly 20 seconds or more without wheel input. Restarting
+after a 4–5 second pause felt normal.
+
+Current telemetry before attribution:
+
+- Helper PID `11537` ruled out queue, display-link, and tap delay. Starts after `24.376–108.520 s` idle produced
+  their first nonzero output in `7.22–14.18 ms`, with `0.48–2.95 ms` queued. The first report consistently used
+  `cadence=unknown`, normal `smoothness=0.42`, the bounded `80 ms` base, and a `198 ms` hybrid response. There was
+  no watchdog/recovery, display start/refresh failure, or unexplained tap disable.
+- Some long-idle starts then contained a short low-unit ramp before normal acceleration. At
+  `00:02:16.382–.734`, after `239.512 s` idle, three one-unit reports arrived `182 ms` and `170 ms` apart before
+  the next `32 ms` report. At `00:03:37.575–00:03:38.011`, after `66.371 s`, the early gaps were `121 ms` and
+  `315 ms`. At `00:06:23.263–.821`, after `108.520 s`, one-unit reports continued through elapsed times of
+  `64`, `134`, `294`, and `558 ms`.
+- Those measured reports immediately received the normal maximum Slow Smoothness path. Examples include
+  `baseMs=269.9` and `269.8` at `00:02:16.564/.734`, `265.9` and `270.3` at
+  `00:03:37.697/00:03:38.011`, and `245.5–270.2 ms` at `00:06:23.327–.821`. Later materially faster reports
+  correctly selected `action=use-raw-acceleration-cadence`, but the opening already felt weak.
+- Captures after `4.358–4.876 s` pauses retained the ordinary path and did not establish the reported threshold.
+  The low-unit report shape is captured; attributing that shape to a particular TB800 receiver/firmware power state
+  remains an inference because CGEvent telemetry begins only when hardware reports reach the tap.
+
+Confirmed root cause: after the timely bounded first response, the Regular engine treated every measured low-unit
+report as deliberate slow cadence at full strength. That is correct for established extremely slow motion, but it
+made the captured sub-second long-idle opening ramp use `246–270 ms` base durations before acceleration could
+retarget it.
+
+Fix (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/ScrollCadencePolicy.h`,
+`Helper/Core/Scroll/Scroll.m`):
+
+- After a measured physical-input gap of at least `20 s`, remember the opening time. Before the first wheel report,
+  helper observation uptime supplies the measured lower bound; an unknown `DBL_MAX` sentinel does not arm the policy.
+- The first report keeps its existing bounded normal response. On later small/slow reports within `750 ms`, blend
+  the same opening-duration cap into the measured response, fading continuously from full influence to zero.
+- Preserve the measured Slow Smoothness ratio; only bound the early directly-driven duration. A report with more
+  than two units or modeled speed outside the slow range exits the policy on that same report.
+- Add `MFSCROLL_ADAPTIVE action=cap-idle-wake-ramp` with idle gap, elapsed time, blend, uncapped base, and final
+  base. No report is delayed, counted, discarded, or replayed.
+
+Preserved behavior:
+
+- Starts after less than `20 s`, the first-report normal-smoothness invariant, ordinary sparse-cadence memory,
+  reversal taper, raw-cadence acceleration, velocity-preserving retargets, distance/rate/carry limits, fast-tail
+  protection, target resets, and display recovery are unchanged.
+- A deliberately extremely slow stream after long idle transitions continuously back to its full measured cadence
+  over `750 ms`; there is no event-three switch or timer-driven state change.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes new deterministic boundaries for a `108.520 s` idle start, continuous blend decay
+  at `182 ms` and `558 ms`, no policy after a `4.876 s` pause or at window expiry, and immediate bypass for
+  substantial/fast input. Existing cadence-seed, display lifecycle, and output-limit suites also pass under
+  `clang -Wall -Wextra -Werror`.
+- Captured-trace replay predicts the affected `00:02:16` bases falling from `269.9/269.8 ms` to approximately
+  `156.6/190.5 ms`; the `00:03:37` cases from `265.9/270.3 ms` to approximately `143.0/207.5 ms`; and the
+  `00:06:23` sequence from `245.5–270.2 ms` to approximately `128.4–231.8 ms` as the blend fades.
+- `git diff --check`, repeated `./dev.sh build`, and final `./dev.sh run` passed. The final Debug build was deployed.
+  An intermediate helper PID `85082` exercised the blend mechanics at `00:15:28.673/.712` and exited on the faster
+  report at `.750`; that pass also exposed that the first-process unknown-gap sentinel could arm the policy. The
+  sentinel was excluded and first-use gaps were tied to measured helper uptime before the final rebuild/deployment,
+  so that intermediate run is not claimed as a real `>20 s` test.
+- Final helper PID `86357` preserved the adjacent short-idle case: its first physical input arrived about `5 s`
+  after startup at `00:18:22.279`, did not emit `cap-idle-wake-ramp`, used the unchanged `80/198 ms` opening, and
+  reached output in `14.67 ms` with `0.52 ms` queued. The expected startup tap re-enable was the only tap marker.
+
+Remaining verification/tradeoff: a physical `>20 s` idle start on the final helper, plus a deliberately extremely
+slow start after the same idle, is still required for the feel check and final `cap-idle-wake-ramp` telemetry.
+During the first `750 ms` after long idle, genuine careful one-unit input is intentionally crisper than its settled
+cadence. This bounded ambiguity is preferable to reproducing the confirmed slow opening, and full sparse smoothing
+returns continuously without waiting for another report.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

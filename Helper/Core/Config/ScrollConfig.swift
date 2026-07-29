@@ -466,6 +466,14 @@ import Cocoa
     /// across the normal ~160ms base curve.
     @objc let stableInitialResponseBaseDurationMax: TimeInterval = 80.0 / 1000.0
 
+    /// Current TB800 captures show a distinct response-shape regression after long wheel idle: the first output is
+    /// delivered within one display frame, but the next few hardware reports can remain at one unit long enough for
+    /// maximum Slow Smoothness to make the physical wake-up ramp feel stuck. Starts after 4–5 seconds do not show
+    /// the reported problem. Arm only after the observed 20-second boundary, then continuously fade the existing
+    /// opening-duration cap away over 750ms. No input is delayed, and larger/faster input exits on that report.
+    @objc let stableIdleWakeMinimumIdle: TimeInterval = 20.0
+    @objc let stableIdleWakeResponseWindow: TimeInterval = 750.0 / 1000.0
+
     /// Keep enough cadence history to recognize extremely slow same-direction trackball movement even when its
     /// reports cross the 500ms gesture-grouping timeout. Acceleration, clicks, and target changes clear this memory
     /// immediately; a slow reversal can retain its scalar cadence only through the shorter reversal taper below.

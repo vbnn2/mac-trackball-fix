@@ -11,6 +11,40 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/// Some TB800 starts after a long wheel-idle interval arrive as a short ramp of
+/// one-unit reports before the hardware reaches the cadence implied by the physical
+/// spin. The first report already receives the bounded opening response. For later
+/// reports in that same ramp, continuously fade the opening-duration cap out instead
+/// of interpreting the early sparse cadence at full strength.
+///
+/// This is a response-shape decision on the current report. It never waits for,
+/// confirms, or replays input, and a substantial/fast report bypasses it immediately.
+static inline double MFScrollIdleWakeOpeningCapBlend(
+    bool overloadControlEnabled,
+    bool firstConsecutive,
+    double idleBeforeOpening,
+    double elapsedSinceOpening,
+    double idleThreshold,
+    double responseWindow,
+    int64_t units,
+    double modeledOutputSpeed,
+    double slowCadenceSpeedMax
+) {
+    if (!overloadControlEnabled
+        || firstConsecutive
+        || idleBeforeOpening < idleThreshold
+        || elapsedSinceOpening <= 0.0
+        || elapsedSinceOpening >= responseWindow
+        || responseWindow <= 0.0
+        || units > 2
+        || modeledOutputSpeed <= 0.0
+        || modeledOutputSpeed >= slowCadenceSpeedMax) {
+        return 0.0;
+    }
+
+    return 1.0 - elapsedSinceOpening / responseWindow;
+}
+
 /// A report may seed sparse-cadence continuity only when the report itself looked like
 /// deliberate careful motion. Mechanical-tail responses are deliberately excluded even
 /// when their unit count and modeled speed happen to be low.

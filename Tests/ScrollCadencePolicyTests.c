@@ -12,6 +12,57 @@
 
 #include "../Helper/Core/Scroll/ScrollCadencePolicy.h"
 
+static void testLongIdleWakeRampGetsContinuouslyTaperedOpeningCap(void) {
+    const double blend = MFScrollIdleWakeOpeningCapBlend(
+        true,
+        false,
+        108.520,
+        0.182,
+        20.0,
+        0.750,
+        1,
+        118.5,
+        500.0
+    );
+
+    assert(blend > 0.75 && blend < 0.76);
+
+    const double laterBlend = MFScrollIdleWakeOpeningCapBlend(
+        true,
+        false,
+        108.520,
+        0.558,
+        20.0,
+        0.750,
+        1,
+        134.7,
+        500.0
+    );
+    assert(laterBlend > 0.25 && laterBlend < 0.26);
+    assert(laterBlend < blend);
+}
+
+static void testRecentAndCompletedStartsDoNotGetWakeCompensation(void) {
+    assert(MFScrollIdleWakeOpeningCapBlend(
+        true, false, 4.876, 0.182, 20.0, 0.750, 1, 118.5, 500.0
+    ) == 0.0);
+    assert(MFScrollIdleWakeOpeningCapBlend(
+        true, false, 108.520, 0.750, 20.0, 0.750, 1, 118.5, 500.0
+    ) == 0.0);
+    assert(MFScrollIdleWakeOpeningCapBlend(
+        true, true, 108.520, 0.182, 20.0, 0.750, 1, 118.5, 500.0
+    ) == 0.0);
+}
+
+static void testFastOrSubstantialInputEndsWakeShapingImmediately(void) {
+    assert(MFScrollIdleWakeOpeningCapBlend(
+        true, false, 108.520, 0.182, 20.0, 0.750, 3, 118.5, 500.0
+    ) == 0.0);
+    assert(MFScrollIdleWakeOpeningCapBlend(
+        true, false, 108.520, 0.182, 20.0, 0.750, 1, 500.0, 500.0
+    ) == 0.0);
+}
+
 static void testPostFastMultiUnitReportCannotBootstrapAStickyRestart(void) {
     const double slowSpeedMax = 500.0;
     const bool previousWasEligible = MFScrollReportCanSeedSlowCadence(
@@ -91,6 +142,9 @@ static void testResetAndMemoryHorizonCannotReuseCadence(void) {
 }
 
 int main(void) {
+    testLongIdleWakeRampGetsContinuouslyTaperedOpeningCap();
+    testRecentAndCompletedStartsDoNotGetWakeCompensation();
+    testFastOrSubstantialInputEndsWakeShapingImmediately();
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();
     testTailAndAccelerationReportsNeverSeedCadence();
