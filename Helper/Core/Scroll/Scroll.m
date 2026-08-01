@@ -943,6 +943,9 @@ static void heavyProcessing(CGEventRef event,
     double stableIdleWakeOpeningCapBlendForTick = 0.0;
     double stableIdleWakeOpeningGapForTick = 0.0;
     double stableIdleWakeElapsedForTick = DBL_MAX;
+    double stableModeledOutputSpeedForTick = 0.0;
+    double stablePreviousModeledOutputSpeedForTick = 0.0;
+    double stableSlowCadenceSpeedMaxForTick = 0.0;
     double stableAnimationCadenceIntervalForTick = DBL_MAX;
     /// A new gesture's first report has no cadence measurement. Do not classify that unknown report as "very slow"
     /// and apply the maximum adaptive duration: doing so delays every scroll start by hundreds of milliseconds.
@@ -1084,6 +1087,9 @@ static void heavyProcessing(CGEventRef event,
         double adaptiveSpeedEnd = _scrollConfig.stableMaximumOutputSpeed
             * _scrollConfig.u_adaptiveSmoothnessEndSpeedRatio;
         double slowCadenceSpeedMax = MIN(adaptiveSpeedEnd, _scrollConfig.stableFastGestureSpeed);
+        stableModeledOutputSpeedForTick = modeledOutputSpeed;
+        stablePreviousModeledOutputSpeedForTick = _stablePreviousModeledOutputSpeed;
+        stableSlowCadenceSpeedMaxForTick = slowCadenceSpeedMax;
         if (_stableIdleWakeOpeningTime > 0) {
             stableIdleWakeOpeningGapForTick = _stableIdleWakeOpeningGap;
             stableIdleWakeElapsedForTick = MAX(0.0, tickTS - _stableIdleWakeOpeningTime);
@@ -1588,24 +1594,57 @@ static void heavyProcessing(CGEventRef event,
                 baseDuration = MAX(baseDuration, taperedCadenceDuration);
             }
             if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
-                /// Preserve measured Slow Smoothness, but keep the early hardware ramp near the already accepted
-                /// opening response. Silence before the second hardware report does not weaken the cap during the
-                /// measured wake-ramp interval. The later linear fade reaches zero continuously, so ordinary
-                /// extremely-slow cadence resumes without a report-count transition.
+                /// A live animation already provides continuity, so preserve its measured Slow Smoothness while
+                /// keeping the early hardware ramp near the accepted opening response. If the previous bounded
+                /// response stopped during hardware silence, this report is another visible opening and must use
+                /// report one's uninflated cap. Applying the adaptive duration ratio to that cold-restart cap made
+                /// each one-unit wake report start slower than the first. The later linear fade still reaches zero
+                /// continuously, so ordinary extremely-slow cadence resumes without a report-count transition.
                 double uncappedIdleWakeBaseDuration = baseDuration;
+                double selectedIdleWakeOpeningCap = MFScrollIdleWakeBaseDurationCap(
+                    isRunning,
+                    configCopyForBlock.stableInitialResponseBaseDurationMax,
+                    effectiveOpeningDurationCap);
                 double cappedIdleWakeBaseDuration = MIN(
                     uncappedIdleWakeBaseDuration,
-                    effectiveOpeningDurationCap);
+                    selectedIdleWakeOpeningCap);
                 baseDuration = uncappedIdleWakeBaseDuration
                     + stableIdleWakeOpeningCapBlendForTick
                     * (cappedIdleWakeBaseDuration - uncappedIdleWakeBaseDuration);
-                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured idleGapMs=%.1f idleElapsedMs=%.1f wakeBlend=%.2f smoothness=%.2f openingCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-idle-wake-ramp",
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured idleGapMs=%.1f idleElapsedMs=%.1f wakeBlend=%.2f smoothness=%.2f animatorRunning=%d openingCapMs=%.1f adaptiveCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-idle-wake-ramp",
                            stableIdleWakeOpeningGapForTick * 1000.0,
                            stableIdleWakeElapsedForTick * 1000.0,
                            stableIdleWakeOpeningCapBlendForTick,
                            effectiveSmoothnessAmount,
+                           isRunning,
+                           selectedIdleWakeOpeningCap * 1000.0,
                            effectiveOpeningDurationCap * 1000.0,
                            uncappedIdleWakeBaseDuration * 1000.0,
+                           baseDuration * 1000.0);
+            }
+            double acceleratingRampTargetSpeed = delta / baseDuration;
+            double acceleratingRampAnimatorSpeed = magnitudeOfVector(currentSpeed);
+            if (MFScrollShouldCapAcceleratingLowUnitRamp(
+                    stableAdaptiveControlEnabled,
+                    stableHasMeasuredTickInterval,
+                    unitsForThisTick,
+                    scrollDelta,
+                    stableModeledOutputSpeedForTick,
+                    stablePreviousModeledOutputSpeedForTick,
+                    stableSlowCadenceSpeedMaxForTick,
+                    acceleratingRampAnimatorSpeed,
+                    acceleratingRampTargetSpeed)) {
+                double uncappedAcceleratingRampBaseDuration = baseDuration;
+                baseDuration = MIN(baseDuration, effectiveOpeningDurationCap);
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured units=%lld pointPx=%lld modeledV=%.1f previousModeledV=%.1f currentV=%.1f oldTargetV=%.1f openingCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-accelerating-low-unit-ramp",
+                           unitsForThisTick,
+                           scrollDelta,
+                           stableModeledOutputSpeedForTick,
+                           stablePreviousModeledOutputSpeedForTick,
+                           acceleratingRampAnimatorSpeed,
+                           acceleratingRampTargetSpeed,
+                           effectiveOpeningDurationCap * 1000.0,
+                           uncappedAcceleratingRampBaseDuration * 1000.0,
                            baseDuration * 1000.0);
             }
             if (stableFastTailReport) {

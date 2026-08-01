@@ -1050,6 +1050,124 @@ a normal acceleration and deliberately extremely slow movement. Genuine careful 
 `750 ms` after long idle is now fully capped rather than partially tapered; this is the explicit ambiguity chosen
 from the captured hardware ramp. Full sparse smoothing returns continuously over the next `750 ms`.
 
+### 2026-08-02 — stopped wake-ramp reports restarted weaker than report one
+
+Symptom: slow starts remained frequent after the long-idle wake protection was deployed. The opening report moved
+on time, but a series of sparse one-unit wake reports still felt like repeated weak starts before normal acceleration.
+
+Current telemetry before attribution:
+
+- Across `23` retained starts on helper PID `866`, first nonzero output arrived in `6.02–14.23 ms` (average
+  `10.67 ms`) with `0.50–4.15 ms` queued (average `1.31 ms`). Display starts returned `result=0`; there was no
+  tap disable, stalled-link/watchdog recovery, callback backlog, or display start/refresh failure. This was not a
+  queue, display-link, or event-tap delay.
+- The clearest long-idle sequence began in Kitty at `00:10:42.851` after `179.367 s` without physical wheel input.
+  Report one used the intended `baseMs=80.0`, `targetV=400.0`, `durationMs=198.0` opening and reached output in
+  `5.61 ms` with `0.57 ms` queued.
+- Report two arrived `195 ms` later at `00:10:43.046`, after that response had stopped. Wake protection fired, but
+  its supposed opening cap was `132.7 ms` because maximum Slow Smoothness had inflated it. The stopped animator
+  cold-restarted at only `targetV=241.2` and `durationMs=218.4`. Report three arrived at `00:10:43.456` after
+  another `410 ms` of hardware silence and repeated the shape: `baseMs=132.9`, `targetV=218.3`, and
+  `durationMs=212.4`. The next `35 ms` accelerating report immediately selected raw cadence and retargeted normally.
+
+Confirmed root cause and fix (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`): the wake
+policy capped base duration to the `80 ms` opening value only before applying the measured Slow Smoothness duration
+ratio. It then called that inflated `125–133 ms` value the opening cap even when hardware silence had allowed the
+previous animation to end. A wake-ramp report with no running animator is another visible opening and now selects
+the original uninflated `80 ms` cap. A live animator still selects the adaptive cap, preserving smooth continuity
+while it retargets. Telemetry now records `animatorRunning`, the selected `openingCapMs`, and `adaptiveCapMs`.
+
+Preserved behavior:
+
+- No report is delayed, confirmed, discarded, or replayed. The existing `>=20 s` idle threshold, `750 ms` full-cap
+  interval, following `750 ms` continuous fade, and immediate larger/faster-input exit are unchanged.
+- Report one still uses unknown-cadence normal smoothness. Measured Slow Smoothness still begins on report two; only
+  a stopped response inside the already-qualified hardware-wake interval receives the uninflated base cap.
+- Live velocity-preserving retargets, ordinary extremely slow input outside wake shaping, sparse cadence/reversal
+  tapers, fast-tail settling protection, target resets, output/carry limits, and display recovery are unchanged.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes the new stopped-versus-live wake-cap policy case plus existing cadence seed,
+  display lifecycle, and output-bound suites under `clang -Wall -Wextra -Werror`.
+- Captured-trace replay changes the stopped `00:10:43.046` response from `132.7 ms` to the same `80 ms` base cap as
+  report one, raising its directly-driven target from `241.2` to `400 px/s`. The stopped `29 px` report at
+  `00:10:43.456` likewise uses `80 ms` and a `362.5 px/s` target. The live `00:10:43.491` retarget keeps its
+  adaptive cap and existing velocity continuity.
+- `git diff --check`, `./dev.sh build`, and `./dev.sh run` passed. The deployed Debug helper PID `22437` logged
+  `MFSCROLL_CONFIG action=reload-reset` and the expected startup `MFSCROLL_TAP action=re-enable`; the prior helper
+  exited during deployment rather than from a scroll failure.
+- Final helper PID `23775` later captured a real `59.970 s` idle opening at `00:19:29.110`. Report one reached
+  output in `13.38 ms` with `4.89 ms` queued; its `50 ms` live follow-up logged
+  `animatorRunning=1 openingCapMs=128.6 adaptiveCapMs=128.6` and raised target velocity from the live `287.7` to
+  `429.9 px/s`. This verifies the unchanged live-retarget side of the policy on a qualifying physical idle start.
+
+Remaining verification/tradeoff: the deployed helper still needs a physical `>20 s` idle reproduction that captures
+`animatorRunning=0 openingCapMs=80.0` on a late second wake report, plus a deliberate extremely slow long-idle start
+to judge the sharper stopped-response tradeoff. During the qualified wake interval, a genuinely careful report that
+arrives after the previous response ends now restarts as crisply as report one. Live careful motion and the later
+fade retain adaptive smoothing.
+
+### 2026-08-02 — amplified low-unit follow-ups decelerated ordinary openings
+
+Symptom: fresh post-deployment telemetry showed the slow-start notch outside the `>=20 s` idle-wake path as well.
+An ordinary opening moved immediately, but the first physically accelerating follow-up could request a lower velocity
+before a later report restored acceleration.
+
+Evidence from intermediate helper PID `22437`:
+
+- At `00:14:41.216`, a one-line/one-point opening reached output in `9.00 ms` with `0.67 ms` queued and started at
+  `targetV=400.0`. Its next report arrived after `43 ms`; the line delta remained one while the point delta grew to
+  eight, and modeled input speed rose. Maximum Slow Smoothness nevertheless selected `baseMs=225.1` and
+  `targetV=250.0`, below the live `287.7 px/s`. The following two-line report accelerated normally.
+- The independent start at `00:14:55.236` reached output in `5.99 ms` with `0.71 ms` queued. Its `25 ms` follow-up
+  grew from one point to ten points, but selected `baseMs=193.0` and `targetV=328.4`, below the live
+  `363.1 px/s`. Again, the next larger report restored acceleration.
+- Both sequences sustained approximately `120 Hz` active output and had no tap disable, display recovery/failure,
+  target churn, rate limit, or dropped carry. This was a duration-policy velocity notch, not delivery latency.
+
+Confirmed root cause and fix (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`): the engine
+correctly derives distance and modeled velocity from line units so it does not compound macOS acceleration. However,
+the much larger point delta is still reliable binary evidence that a low-line-unit report is already in a hardware
+acceleration ramp. The existing raw-cadence bypass cannot help the first measured follow-up because its raw interval
+and one-sample smoothed interval are equal. The duration policy now uses point amplification only as a binary guard:
+when a measured one- or two-unit report has more than twice as many points, modeled output speed rose but remains in
+the slow-smoothing band, and its requested target would decelerate a live animator, cap its directly-driven base to
+the existing adaptive opening cap. Telemetry records `action=cap-accelerating-low-unit-ramp` and both velocities.
+
+Preserved behavior:
+
+- Point delta does not scale modeled speed, output distance, or retained carry. The guard only prevents a confirmed
+  accelerating report from requesting less velocity than the visible opening.
+- A genuine one-point careful report does not match. Substantial input above two line units, input outside the slow
+  band, and a retarget that already requests acceleration keep the ordinary path. No report-count confirmation,
+  timer, delayed replay, or extra distance is introduced.
+- Measured Slow Smoothness still begins with report two. The selected cap includes its adaptive duration ratio;
+  unlike a stopped long-idle wake report, a live ordinary opening is not forced to raw normal smoothness.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes deterministic cases for the captured amplified-point velocity notch, a true
+  one-point slow report, an already-accelerating target, substantial input, and the slow-band boundary, along with
+  the existing cadence, display lifecycle, and output-bound suites under `clang -Wall -Wextra -Werror`.
+- Captured-trace replay caps the `00:14:41.259` base from `225.1 ms` to approximately `128 ms`, raising its target
+  from `250` to roughly `440 px/s`. It caps `00:14:55.261` from `193.0 ms` to approximately `120 ms`, raising its
+  target from `328` to roughly `527 px/s`. Their already-accelerating next reports do not match the new guard.
+- `git diff --check`, repeated `./dev.sh build`, and final `./dev.sh run` passed. Final helper PID `23775` logged
+  `MFSCROLL_CONFIG action=reload-reset` and the expected startup tap re-enable.
+- The final helper captured the new path on three independent ordinary starts at `00:19:29.746`, `00:19:31.445`,
+  and `00:19:32.767`. Their amplified one-unit follow-ups would have targeted only `273.1`, `265.5`, and
+  `267.3 px/s` against a live `323.2 px/s`; the cap selected `125.3–126.5 ms` bases and raised the actual targets
+  to `464.0–468.6 px/s` on those same reports. The starts reached first output in `8.44–14.92 ms` with
+  `0.63–0.90 ms` queued, subsequent reports accelerated normally, and active output returned to `120 Hz` with
+  approximately `9.3–9.4 ms` maximum gaps. No tap, display, rate-limit, or dropped-carry failure accompanied them.
+
+Remaining verification/tradeoff: the target accelerated path is physically verified. A deliberate opening whose
+measured follow-up remains one line/one point still needs a focused feel check to complement the deterministic
+non-match case. The point/line divergence is macOS-accelerated rather than raw HID data, so it is deliberately used
+only to prevent deceleration, not to amplify distance. Horizontal/effect paths and other attached displays remain
+outside this physical pass.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

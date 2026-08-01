@@ -54,6 +54,44 @@ static inline double MFScrollIdleWakeOpeningCapBlend(
     return 1.0 - fadeElapsed / responseFadeDuration;
 }
 
+/// A wake-ramp report that arrives after the preceding bounded response has
+/// stopped is another visible opening. Keep its base-duration cap identical to
+/// report one's responsive cap. A live animator already supplies continuity,
+/// so its retarget may preserve the adaptive slow-smoothness duration cap.
+static inline double MFScrollIdleWakeBaseDurationCap(
+    bool animatorRunning,
+    double responsiveOpeningCap,
+    double adaptiveOpeningCap
+) {
+    return animatorRunning ? adaptiveOpeningCap : responsiveOpeningCap;
+}
+
+/// macOS point deltas expose that a low-line-unit TB800 report is already in a
+/// hardware acceleration ramp. Use that only as a binary response-shape signal:
+/// never scale distance from it, and intervene only if rising modeled speed
+/// would otherwise retarget a live opening to a lower velocity.
+static inline bool MFScrollShouldCapAcceleratingLowUnitRamp(
+    bool overloadControlEnabled,
+    bool hasMeasuredInterval,
+    int64_t units,
+    int64_t pointDelta,
+    double modeledOutputSpeed,
+    double previousModeledOutputSpeed,
+    double slowCadenceSpeedMax,
+    double animatorSpeed,
+    double requestedTargetSpeed
+) {
+    return overloadControlEnabled
+        && hasMeasuredInterval
+        && units <= 2
+        && pointDelta > units * 2
+        && previousModeledOutputSpeed > 0.0
+        && modeledOutputSpeed > previousModeledOutputSpeed
+        && modeledOutputSpeed < slowCadenceSpeedMax
+        && animatorSpeed > 0.0
+        && requestedTargetSpeed < animatorSpeed;
+}
+
 /// A report may seed sparse-cadence continuity only when the report itself looked like
 /// deliberate careful motion. Mechanical-tail responses are deliberately excluded even
 /// when their unit count and modeled speed happen to be low.

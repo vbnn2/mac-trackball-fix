@@ -92,6 +92,40 @@ static void testFastOrSubstantialInputEndsWakeShapingImmediately(void) {
     ) == 0.0);
 }
 
+static void testStoppedWakeResponseRestartsWithResponsiveOpeningCap(void) {
+    const double responsiveOpeningCap = 0.080;
+    const double adaptiveOpeningCap = 0.1327;
+
+    assert(MFScrollIdleWakeBaseDurationCap(
+        false, responsiveOpeningCap, adaptiveOpeningCap
+    ) == responsiveOpeningCap);
+    assert(MFScrollIdleWakeBaseDurationCap(
+        true, responsiveOpeningCap, adaptiveOpeningCap
+    ) == adaptiveOpeningCap);
+}
+
+static void testAcceleratingLowUnitRampOnlyCapsVelocityNotch(void) {
+    assert(MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 8, 900.0, 160.0, 2250.0, 287.7, 250.0
+    ));
+
+    /// A genuine careful point report has no amplified point delta.
+    assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 1, 180.0, 160.0, 2250.0, 287.7, 250.0
+    ));
+    /// Do not make an already-accelerating retarget more aggressive.
+    assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 8, 900.0, 160.0, 2250.0, 287.7, 440.0
+    ));
+    /// Substantial or fast input keeps the ordinary bounded path.
+    assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 3, 32, 1800.0, 900.0, 2250.0, 287.7, 250.0
+    ));
+    assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 8, 2250.0, 160.0, 2250.0, 287.7, 250.0
+    ));
+}
+
 static void testPostFastMultiUnitReportCannotBootstrapAStickyRestart(void) {
     const double slowSpeedMax = 500.0;
     const bool previousWasEligible = MFScrollReportCanSeedSlowCadence(
@@ -176,6 +210,8 @@ int main(void) {
     testLateSecondWakeReportDoesNotConsumeProtectionDuringSilence();
     testRecentAndCompletedStartsDoNotGetWakeCompensation();
     testFastOrSubstantialInputEndsWakeShapingImmediately();
+    testStoppedWakeResponseRestartsWithResponsiveOpeningCap();
+    testAcceleratingLowUnitRampOnlyCapsVelocityNotch();
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();
     testTailAndAccelerationReportsNeverSeedCadence();
