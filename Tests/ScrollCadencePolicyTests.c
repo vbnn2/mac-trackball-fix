@@ -92,16 +92,13 @@ static void testFastOrSubstantialInputEndsWakeShapingImmediately(void) {
     ) == 0.0);
 }
 
-static void testStoppedWakeResponseRestartsWithResponsiveOpeningCap(void) {
+static void testWakeRampUsesResponsiveOpeningCap(void) {
     const double responsiveOpeningCap = 0.080;
     const double adaptiveOpeningCap = 0.1327;
 
     assert(MFScrollIdleWakeBaseDurationCap(
-        false, responsiveOpeningCap, adaptiveOpeningCap
+        responsiveOpeningCap, adaptiveOpeningCap
     ) == responsiveOpeningCap);
-    assert(MFScrollIdleWakeBaseDurationCap(
-        true, responsiveOpeningCap, adaptiveOpeningCap
-    ) == adaptiveOpeningCap);
 }
 
 static void testAcceleratingLowUnitRampOnlyCapsVelocityNotch(void) {
@@ -210,7 +207,7 @@ int main(void) {
     testLateSecondWakeReportDoesNotConsumeProtectionDuringSilence();
     testRecentAndCompletedStartsDoNotGetWakeCompensation();
     testFastOrSubstantialInputEndsWakeShapingImmediately();
-    testStoppedWakeResponseRestartsWithResponsiveOpeningCap();
+    testWakeRampUsesResponsiveOpeningCap();
     testAcceleratingLowUnitRampOnlyCapsVelocityNotch();
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();

@@ -54,16 +54,17 @@ static inline double MFScrollIdleWakeOpeningCapBlend(
     return 1.0 - fadeElapsed / responseFadeDuration;
 }
 
-/// A wake-ramp report that arrives after the preceding bounded response has
-/// stopped is another visible opening. Keep its base-duration cap identical to
-/// report one's responsive cap. A live animator already supplies continuity,
-/// so its retarget may preserve the adaptive slow-smoothness duration cap.
+/// Keep every early wake-ramp report inside report one's responsive envelope.
+/// Letting a live animator select the adaptive cap changed the response from
+/// 80ms on report one to roughly 130ms on report two, which made the same
+/// physical start feel inconsistent even though both outputs arrived on time.
 static inline double MFScrollIdleWakeBaseDurationCap(
-    bool animatorRunning,
     double responsiveOpeningCap,
     double adaptiveOpeningCap
 ) {
-    return animatorRunning ? adaptiveOpeningCap : responsiveOpeningCap;
+    return responsiveOpeningCap < adaptiveOpeningCap
+        ? responsiveOpeningCap
+        : adaptiveOpeningCap;
 }
 
 /// macOS point deltas expose that a low-line-unit TB800 report is already in a

@@ -157,8 +157,12 @@ import Cocoa
                 
             } else if modifiers.effectMod == kMFScrollEffectModificationZoom {
                 
-                /// Override animation curve
-                animationCurveOverride = kMFScrollAnimationCurveNameTouchDriver
+                /// Zoom uses a linear, display-paced effect curve. The old eased
+                /// TouchDriver start spread a small first zoom report over 250 ms,
+                /// which made the opening feel frozen even though the first callback
+                /// arrived on time. Linear output retains smooth per-frame updates
+                /// without withholding the beginning of the requested magnification.
+                animationCurveOverride = kMFScrollAnimationCurveNameTouchDriverLinear
                 
                 /// Adjust speed params
                 scaleToDisplay = false
@@ -470,9 +474,9 @@ import Cocoa
     /// delivered within one display frame, but the next few hardware reports can remain at one unit long enough for
     /// maximum Slow Smoothness to make the physical wake-up ramp feel stuck. Starts after 4–5 seconds do not show
     /// the reported problem. Arm only after the observed 20-second boundary. Hold the opening-duration cap through
-    /// the measured 750ms hardware-ramp interval, then continuously fade it away over the following 750ms. A report
-    /// whose preceding bounded response already stopped uses the same uninflated cap as report one; live retargets
-    /// preserve the adaptive slow-smoothness cap. Silence before report two must not consume most of the protection.
+    /// the measured 750ms hardware-ramp interval, then continuously fade it away over the following 750ms. Both a
+    /// stopped response and a live retarget use the same uninflated cap as report one, keeping the opening response
+    /// consistent across sparse hardware reports. Silence before report two must not consume most of the protection.
     /// No input is delayed, and larger/faster input exits on that report.
     @objc let stableIdleWakeMinimumIdle: TimeInterval = 20.0
     @objc let stableIdleWakeResponseHoldDuration: TimeInterval = 750.0 / 1000.0

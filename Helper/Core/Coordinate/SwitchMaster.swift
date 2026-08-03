@@ -408,6 +408,25 @@ import ReactiveSwift
     }
     
     private var latestModifiers = NSDictionary()
+
+    /// A Ctrl-wheel zoom session owns a synthetic magnification gesture until Control is
+    /// released. Default scrolling keeps keyboard modifiers passively sampled, so promote
+    /// the existing listener only while such a gesture needs the release callback.
+    private var zoomGestureNeedsKeyboardReleaseTracking = false
+
+    @objc func zoomGestureKeyboardReleaseTrackingChanged(_ active: Bool) {
+        guard zoomGestureNeedsKeyboardReleaseTracking != active else { return }
+        zoomGestureNeedsKeyboardReleaseTracking = active
+
+        if active {
+            Modifiers.setKeyboardModifierPriority(kMFModifierPriorityActiveListen)
+        } else {
+            /// Restore the configuration-derived priority (active, passive, or unused)
+            /// once the synthetic zoom session has received its terminal phase.
+            toggleKbModTap()
+        }
+    }
+
     @objc func modifiersChanged(modifiers: NSDictionary) {
 
         /// Preserve an immutable value snapshot for callbacks and later combined
@@ -503,7 +522,9 @@ import ReactiveSwift
         let someKbModReallyModifiesPointing = somekbModModifiesPointing           && someDeviceHasPointing        && true
         let someKbModReallyModifiesButtons  = somekbModModifiesButtonOnSomeDevice && someDeviceHasUsableButtons   && !buttonKillSwitch
         
-        if someKbModReallyModifiesScroll || someKbModReallyModifiesPointing || someKbModReallyModifiesButtons {
+        if zoomGestureNeedsKeyboardReleaseTracking {
+            priority = kMFModifierPriorityActiveListen
+        } else if someKbModReallyModifiesScroll || someKbModReallyModifiesPointing || someKbModReallyModifiesButtons {
             
             let someKbModsToggleScroll      = someKbModReallyModifiesScroll     && !defaultModifiesScroll               ;
             let someKbModsTogglePointing    = someKbModReallyModifiesPointing   && !defaultModifiesPointing             ;

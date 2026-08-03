@@ -1168,6 +1168,277 @@ non-match case. The point/line divergence is macOS-accelerated rather than raw H
 only to prevent deceleration, not to amplify distance. Horizontal/effect paths and other attached displays remain
 outside this physical pass.
 
+### 2026-08-03 — Chromium PDF/content zoom jumped after a smooth opening
+
+Symptom: wheel zoom with Control held or a latched Scroll & Zoom mode could begin smoothly on an ordinary page, but
+then jump by a large amount in a PDF or another embedded Chromium content view.
+
+Evidence/root cause: no rolling physical capture was active when the report arrived, so this is a code-confirmed
+output-path diagnosis pending a physical trace. `Scroll.m` routes every zoom effect through the TouchDriver curve and
+the synthetic magnification-event path, not the Regular pixel-scroll path. On its first output frame, the Chromium
+workaround posted the ordinary `Began` delta and then immediately posted a `Changed` delta enlarged by a fixed
+`+380/800` or `-250/800`. A normal frame delta is only `pixels/800`, so this injects a discrete 0.475 or 0.3125
+magnification step. PDFium/embedded viewers consume that injected second event as a large zoom step, explaining the
+smooth-then-jump sequence.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): remove the Chromium bundle-specific magnitude boost. The ordinary nonzero
+`Began` event and normal terminal phase are preserved; the next display-paced animator callback provides the first
+`Changed` delta at its real magnitude. `MFSCROLL_ZOOM action=begin ... chromiumBoost=0` records the new start path.
+No input is delayed, accumulated, amplified, replayed, or retimed.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` passed all cadence, display-link lifecycle, and output-policy
+  suites.
+- `./dev.sh build` passed (existing unrelated warnings only), and `./dev.sh run` rebuilt, launched the Debug app,
+  and restarted its embedded helper.
+- The recorder could not provide a physical before/after trace in this environment: its snapshot was empty and no
+  active launchd recorder was visible. A manual Chromium PDF/content-view pass is therefore still required.
+
+Preserved behavior/tradeoff: ordinary Chromium page zoom may begin on the following display callback if Chromium
+ignores the `Began` delta, rather than receiving a fabricated large first-frame delta. This is at most one display
+frame and avoids changing zoom scale by unrequested distance. Regular scrolling, its cadence policy, acceleration,
+settling protection, output bounds, target resets, and display-link recovery are unchanged.
+
+### 2026-08-03 — removing the PDF jump made slow Chromium page zoom appear inert
+
+Symptom: the prior removal of the first-frame magnification boost made canvas/PDF zoom smooth, but slow normal
+Chromium page zoom could appear to do nothing.
+
+Evidence/root cause: this is a user-confirmed follow-up to the preceding code-path diagnosis; a rolling physical
+capture remains unavailable in this environment. The prior version delivered its first nonzero Chromium delta with
+the `Began` phase. The existing workaround's own comment documented that Chromium may ignore that delta. The
+TouchDriver response can finish before a slowly turned wheel produces a second animator callback, leaving no
+accepted `Changed` delta and therefore no visible page zoom. Restoring the old magnitude boost would reintroduce
+the confirmed PDF/content-view jump.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): for the known Chromium bundle IDs only, a zoom start now posts a zero-value
+`Began` event and immediately follows it with the frame's real, unamplified delta as `Changed`. This preserves the
+event's phase ordering and sends exactly one frame of requested zoom distance. The start is recorded as
+`MFSCROLL_ZOOM action=prime-zero-begin ... chromiumBoost=0`. Other applications retain their normal nonzero
+`Began` event.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` passed all cadence, display-link lifecycle, and output-policy
+  suites.
+- `./dev.sh build` passed with existing unrelated warnings only. `./dev.sh run` rebuilt, launched the Debug app,
+  and restarted its embedded helper.
+- A focused manual pass remains required: slow single-step and continuous zoom on a Chromium page, a Chromium PDF
+  or embedded content view, Control-held zoom, and both latched trackball zoom modes. Confirm the new telemetry
+  start marker and absence of an added-distance jump.
+
+Preserved behavior/tradeoff: this adds a zero-valued phase primer only at Chromium zoom-session start; it adds no
+timer, input gate, distance reservoir, animation-duration change, or extra nonzero magnification event. Regular
+scrolling and all established scroll-session, cadence, acceleration, target, tail, and display-link invariants are
+unchanged.
+
+### 2026-08-03 — slow Chromium zoom needed one physical gesture, not one animator gesture
+
+Symptom: the phase-primer follow-up still did not make slow Chromium zoom reliable. The requested behavior is for
+the first physical Ctrl-wheel/latched-zoom input to send `Began`, every later zoom delta to send `Changed`, and the
+session to send `Ended` only when Control is released or the latched zoom mode exits.
+
+Evidence/root cause: this is a user-directed lifecycle correction; no rolling physical capture is available in this
+environment. The former implementation derived magnification phases from `TouchAnimator` callbacks. A TouchDriver
+response can end while the user holds Control between sparse wheel reports, so that one physical modifier session
+became several short `Began`/`Ended` gestures. Chromium can discard the opening delta of each such gesture. The
+previous fixed-distance boost and the zero-begin/changed-in-one-callback attempt both retained the wrong ownership:
+they still began only when the animator produced output rather than when the physical zoom interaction began.
+
+Fix (`Helper/Core/Scroll/Scroll.m`): zoom now has a generation-scoped, lock-serialized gesture session. The first
+physical zoom report posts a zero-value `Began` synchronously on the scroll queue, then every nonterminal animator
+or direct-output frame posts its unamplified delta as `Changed`. Animator end/cancel callbacks no longer emit zoom
+`Ended`. `resetState_Unsafe` emits exactly one terminal zero-value `Ended` before modifier release, trackball-mode
+exit, target/app changes, clicks, or other explicit session resets cancel output; a generation check rejects any
+late old-session callback. New telemetry records `MFSCROLL_ZOOM action=begin-on-input` and `action=end`.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` passed the cadence, display-link lifecycle, and output-policy
+  suites.
+- `./dev.sh build` and `./dev.sh run` passed; the Debug app and its embedded helper were rebuilt and restarted.
+- Manual validation remains required on the deployed helper: slow single Ctrl-wheel input, sparse held-Ctrl input,
+  Control release without a follow-up wheel report, Scroll & Zoom / Zoom mode exit without a follow-up wheel
+  report, PDF/content zoom, normal Chromium page zoom, a target switch, and a click during an active zoom session.
+  Correlate `begin-on-input`, `Changed` outputs, and one `end` per closed session.
+
+Preserved behavior/tradeoff: every real zoom distance still comes from the existing animator and is sent once; the
+new long-lived part is phase ownership only. No physical report is deferred, confirmed, dropped, amplified, or
+retained. Explicit non-modifier session resets also end zoom, preventing a synthetic touch gesture from leaking
+into a new target; ordinary scrolling, cadence policy, acceleration, tail protection, bounds, and display recovery
+are unchanged.
+
+### 2026-08-03 — Ctrl release left the synthetic zoom session open until the next wheel report
+
+Symptom: zoom still felt frozen at the start, and releasing Control before beginning ordinary scrolling caused a
+visible pause before the page scrolled.
+
+Current telemetry before attribution (helper PID `33491`):
+
+- The `22:32:18.017` Chromium zoom opening recorded `MFSCROLL_ZOOM action=begin-on-input generation=61`; its
+  physical input reached the first animator output in `10.31 ms` with `0.53 ms` queued. It nevertheless used the
+  zoom TouchDriver's eased `baseMs=250.0`, `durationMs=250.0`, and `targetV=120.0`, versus the ordinary opening's
+  `80 ms`/`400 px/s` response. The start feeling is response shape, not queue or display-link latency.
+- Control was released after that zoom gesture, but no modifier-callback/reset record occurred then. The next
+  ordinary physical wheel report at `22:32:22.444`—`4.427 s` after the zoom opening—was the event that logged the
+  zoom `end`, modifier change, and the new plain-scroll start together. Its own first output was healthy at
+  `8.41 ms` with `0.71 ms` queued. Thus the reported post-release pause was the target application receiving a
+  terminal pinch phase and a first ordinary scroll in the same report, not a scroll-queue delay.
+- The capture showed no tap disable, display recovery/failure, target reset, or output-rate failure around either
+  transition.
+
+Confirmed root causes:
+
+1. While ordinary scrolling is enabled, `SwitchMaster` keeps keyboard modifiers passively sampled. The existing
+   phase-lifecycle fix therefore learned Control was no longer held only when the next wheel report sampled its
+   flags; its terminal zoom event was deferred to that report.
+2. Zoom still selected the shared eased TouchDriver curve, which spreads a small first zoom distance over `250 ms`.
+   That intentionally smooth curve made its opening visually weak despite healthy one-frame delivery.
+
+Fix (`Helper/Core/Coordinate/SwitchMaster.swift`, `Helper/Core/Config/ScrollConfig.swift`,
+`Helper/Core/Scroll/Scroll.m`):
+
+- A Ctrl-owned active zoom gesture temporarily promotes the existing keyboard-modifier listener to active mode.
+  Control release now calls `Scroll.modifierStateDidChange` without requiring another wheel report, closes the zoom
+  phase immediately, and restores the normal configuration-derived listener priority. Latched trackball zoom modes
+  do not enable this keyboard-release tracking; their existing explicit mode exit remains the terminal event.
+- Zoom selects the existing linear TouchDriver effect curve, retaining display-paced smooth output while avoiding the
+  slow eased opening. Rotate and other effect paths retain their existing curves.
+- Existing lock/generation ownership still prevents an old animator callback from emitting `Changed` after the
+  release-generated terminal phase.
+
+Verification:
+
+- `./dev.sh logs-record-snapshot` captured and correlated physical input, modifier transition, zoom lifecycle,
+  latency, queue time, animator response, display, and output telemetry.
+- `git diff --check`, `./dev.sh scroll-tests`, `./dev.sh build`, and `./dev.sh run` passed. The app and embedded
+  Debug helper were rebuilt and restarted; the rolling recorder remains active for the follow-up pass.
+- Manual verification is still required on the new helper: slow Ctrl zoom, Control release while idle (verify `end`
+  before a wheel input), the next ordinary scroll, canvas/PDF zoom, normal Chromium zoom, and latched zoom mode
+  exit. Confirm no synthetic zoom phase leaks into the new scroll target.
+
+Preserved behavior/tradeoff: the keyboard listener is active only for a live Ctrl-owned zoom session and is restored
+immediately after its end. The linear zoom curve changes timing, not requested distance; no report is held, counted,
+amplified, or replayed. All ordinary-scroll cadence, acceleration, tail, target, output-bound, and display-recovery
+invariants remain unchanged.
+
+### 2026-08-03 — Slow normal Chromium page zoom remained below its visible response threshold
+
+Symptom: after the phase-lifecycle and linear-curve fixes, slowly scrolling with Control held still appeared to do
+nothing on a normal web page, even though canvas/content zoom had become smooth.
+
+Current telemetry before attribution (helper PID `37105`): the slow Ctrl-owned openings recorded physical ticks of
+about `30 px`, `modelScale=1.50`, and a linear zoom animator target of `166.7 px/s` with `baseMs=180.0`. Their first
+output arrived in roughly `7.6–12.5 ms`, with `0.4–0.9 ms` queued. In the same capture, Control release recorded the
+modifier callback and `MFSCROLL_ZOOM action=end` before the later ordinary wheel input. This rules out queue latency
+and a deferred terminal pinch phase as the cause of this remaining slow-start symptom.
+
+Root cause/inference: the existing zoom mapping, `(dx + dy) / 800`, converts a `30 px` slow report into only `0.0375`
+of total magnification, divided further across display-paced output frames. Given the timely observed outputs and the
+normal Chromium page's visible non-response, that continuous value is inferred to be below Chromium's practical page
+zoom threshold; the threshold itself is not instrumented by the helper.
+
+Change (`Helper/Core/Scroll/Scroll.m`): doubled the uniform magnification mapping to `(dx + dy) / 400`. This applies
+to both Ctrl-owned and latched zoom modes on every frame. It deliberately does not add a first-event impulse, extra
+phase, or fixed-distance boost, so PDF/content views retain continuous motion rather than receiving the previously
+rejected jump.
+
+Verification:
+
+- `git diff --check`, `./dev.sh scroll-tests`, `./dev.sh build`, and `./dev.sh run` were run after the mapping change.
+- Manual verification is required on the deployed helper: an extremely slow normal Chromium zoom must move on the
+  first input; repeated slow Ctrl zoom must remain continuous; canvas/PDF zoom must remain smooth; Ctrl release while
+  idle must emit `end` before the next ordinary scroll; and latched Scroll & Zoom / Zoom exit must close cleanly.
+
+Preserved behavior/tradeoff: zoom distance is now uniformly twice as sensitive in every target, including canvas and
+PDF/content views. No report is buffered, discarded, replayed, or specially amplified at session start; animation,
+phase ownership, ordinary scrolling, cadence, acceleration, target isolation, and display recovery are unchanged.
+
+### 2026-08-03 — Uniform 2× zoom still did not start normal Chromium page zoom
+
+Symptom: doubling every zoom delta did not make extremely slow normal Chromium page zoom visibly start. The user
+requested restoration of the Chromium opening impulse, while retaining the new physical-input-owned zoom lifecycle,
+and requested that no residual zoom animation carry into ordinary scrolling after zoom ends.
+
+Current telemetry before attribution (helper PID `38147`): repeated Ctrl zoom sessions recorded
+`MFSCROLL_ZOOM action=begin-on-input`, first-output latency of about `5.2–14.6 ms`, and queue time of about
+`0.39–1.97 ms`. Their Ctrl release records `MFSCROLL_CONFIG action=modifier-callback` and
+`MFSCROLL_ZOOM action=end` before the next ordinary-wheel output (for example, end at `22:39:35.383`, then an
+ordinary first output at `22:39:35.511`). The current capture therefore shows neither a blocked input queue nor a
+late Ctrl-release terminal phase. It does not expose Chromium's internal page-zoom quantization, so the need for its
+opening distance remains application-observed evidence.
+
+Root cause: the uniform mapping—including the temporary `(dx + dy) / 400` scale—still supplied only continuous small
+opening values. Chromium page zoom needs the existing target-specific opening distance. Applying that distance to
+all targets was previously rejected because PDF/content views visibly jumped. The old failure mode does not apply to
+this restoration because the impulse is now limited to Chromium targets and occurs only once as the first `Changed`
+frame of an already-open physical zoom gesture; it is not used as a nonzero `Began` phase or applied to content views.
+
+Change (`Helper/Core/Scroll/Scroll.m`): restored the original `/800` continuous mapping and Chromium bundle matching.
+For Chrome, Chromium, Arc, Opera, Edge, Vivaldi, and Brave, the first nonzero `Changed` frame receives the prior
+sign-aware fixed opening distance (`+380/800` or `-250/800`) once per physical zoom session. `Began` remains the
+zero-value event posted synchronously on first physical zoom input, and all subsequent frames remain `Changed`.
+Zoom teardown now invalidates the generation, posts `Ended`, and immediately cancels `TouchAnimator` inside the zoom
+end operation. A late display-link callback cannot post another zoom change, and the next ordinary scroll starts
+without a residual zoom animator tail.
+
+Verification:
+
+- `./dev.sh logs-record-snapshot` captured the current release/end and first-ordinary-output ordering before the
+  change.
+- `git diff --check`, `./dev.sh scroll-tests`, `./dev.sh build`, and `./dev.sh run` were run after the change.
+- Manual verification is required on the deployed helper: slow Chromium page zoom must move at its first real frame;
+  PDF/canvas zoom must remain continuous without the Chromium impulse; release Ctrl during active zoom and immediately
+  scroll normally to confirm no tail; and exit latched Scroll & Zoom / Zoom mode while output is active.
+
+Preserved behavior/tradeoff: Chromium gets one deliberate opening-distance impulse, so its first response is larger
+than later continuous frames. Non-Chromium zoom targets remain on the original continuous scale. No physical report
+is delayed, accumulated, or replayed; Ctrl-release tracking, phase ownership, ordinary scroll cadence,
+acceleration, target isolation, and display recovery remain unchanged.
+
+### 2026-08-03 — live long-idle wake retarget changed response after report one
+
+Symptom: ordinary scrolling still occasionally felt as if it started slowly and therefore felt inconsistent, most
+recently on a normal Arc page after a long idle.
+
+Current telemetry before attribution (helper PID `39643`): the candidate opening at `23:29:37.878` followed
+`101.160 s` without wheel input. Its one-line/one-point report used the accepted `baseMs=80.0`, `targetV=400.0`, and
+`durationMs=198.0`; the queue took `0.66 ms`, the first nonzero output arrived in `8.99 ms`, the display link started
+with `result=0`, and there was no tap disable or display recovery/failure. The second one-unit report arrived `79 ms`
+later while the animator was live. Idle-wake shaping then selected maximum Slow Smoothness and
+`openingCapMs=131.2`, producing `baseMs=131.2` and `targetV=351.1`. Further slow reports remained around
+`131.8–132.6 ms`. This was not delivery latency: the response envelope changed materially after the timely first
+report.
+
+Confirmed root cause: `MFScrollIdleWakeBaseDurationCap` deliberately selected the adaptive opening cap for live
+animator retargets, while stopped wake responses used the original `80 ms` cap. The distinction was introduced to
+preserve maximum Slow Smoothness during live careful movement, but the new physical capture and user report show its
+failure mode: one physical opening changes from the normal responsive envelope to a roughly 65% longer base on report
+two. That visible inconsistency outweighs the extra live-retarget smoothness during the already-qualified wake ramp.
+
+Fix (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Helper/Core/Config/ScrollConfig.swift`, `Tests/ScrollCadencePolicyTests.c`): wake-ramp reports now select the tighter
+of the responsive and adaptive caps, independent of whether `TouchAnimator` is live. With current configuration this
+keeps both report one and early small/slow follow-ups inside the same `80 ms` base-duration envelope. The existing
+`750 ms` full-influence interval, following `750 ms` continuous fade, and same-report bypass for input above two
+units or outside the slow-speed band remain unchanged.
+
+Verification:
+
+- The captured `23:29:37.957` live second report now selects `80 ms` instead of `131.2 ms`; its `36 px` directly
+  driven distance can no longer soften the accepted opening response merely because the first animation is live.
+- `git diff --check`, `./dev.sh scroll-tests`, `./dev.sh build`, and `./dev.sh run` were run after the change.
+- Manual verification is still required after a physical `>=20 s` idle: a deliberately slow start, a normal
+  acceleration, a fast start that exits wake shaping immediately, slow-to-fast and fast-to-slow transitions,
+  reversal, Chromium and Safari/content boundaries, and scrolling on each attached display.
+
+Preserved behavior/tradeoff: no report is delayed, confirmed, dropped, amplified, or replayed. Ordinary sparse
+cadence outside the qualified wake interval still receives full adaptive Slow Smoothness. Early genuine careful
+motion after a long idle is crisper for up to the measured wake interval, then transitions continuously back to its
+configured slow response. Acceleration, distance, carry/rate limits, tail/reversal protection, target isolation,
+zoom lifecycle, and display recovery are unchanged.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

@@ -31,6 +31,7 @@
 #import "ScrollOutputPolicy.h"
 #import "ScrollSyntheticEvent.h"
 #import <stdatomic.h>
+#import <os/lock.h>
 
 @import IOKit;
 #import "MFHIDEventImports.h"
@@ -105,6 +106,15 @@ static BOOL _stableFastTailReportHandled;
 /// long slow response from motion that is no longer visible.
 static BOOL _stableFastTailContinuationPending;
 
+/// Zoom is one physical-input-owned magnification gesture, rather than one gesture per
+/// animator curve. Keep its phase transitions serialized because physical input/reset runs
+/// on `_scrollQueue` while animator output runs on the display-link queue.
+static os_unfair_lock _zoomGestureLock = OS_UNFAIR_LOCK_INIT;
+static BOOL _zoomGestureActive;
+static uint64_t _zoomGestureGeneration;
+static BOOL _zoomGestureNeedsKeyboardReleaseTracking;
+static BOOL _zoomGestureNeedsChromiumOpeningImpulse;
+
 //static BOOL _isSuspended = NO; TODO: Remove suspension stuff (already commented out)
 
 /// Aggregate the events that actually reach applications. The animator can be display-synchronized while integer
@@ -167,7 +177,90 @@ static void legacyRecordOutput(int64_t px, MFDirection direction) {
     }
 }
 
-static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications);
+static BOOL currentZoomTargetNeedsOpeningImpulse(void) {
+    NSString *bundleID = [HelperUtility appUnderMousePointerWithEvent:NULL].bundleIdentifier;
+    return bundleID != nil
+        && ([bundleID containsString:@"com.google.Chrome"]
+            || [bundleID containsString:@"org.chromium.Chromium"]
+            || [bundleID containsString:@"company.thebrowser.Browser"] /// Arc
+            || [bundleID containsString:@"com.operasoftware.Opera"]
+            || [bundleID containsString:@"com.microsoft.edgemac"]
+            || [bundleID containsString:@"com.vivaldi.Vivaldi"]
+            || [bundleID containsString:@"com.brave.Browser"]);
+}
+
+static uint64_t beginZoomGesture_Unsafe(BOOL needsKeyboardReleaseTracking,
+                                        BOOL needsChromiumOpeningImpulse) {
+    BOOL shouldEnableKeyboardReleaseTracking = NO;
+    os_unfair_lock_lock(&_zoomGestureLock);
+    if (!_zoomGestureActive) {
+        _zoomGestureGeneration += 1;
+        _zoomGestureActive = YES;
+        _zoomGestureNeedsKeyboardReleaseTracking = needsKeyboardReleaseTracking;
+        _zoomGestureNeedsChromiumOpeningImpulse = needsChromiumOpeningImpulse;
+        shouldEnableKeyboardReleaseTracking = needsKeyboardReleaseTracking;
+        [TouchSimulator postMagnificationEventWithMagnification:0.0
+                                                            phase:kIOHIDEventPhaseBegan];
+        DDLogInfo("MFSCROLL_ZOOM: action=begin-on-input generation=%llu",
+                  _zoomGestureGeneration);
+    }
+    uint64_t generation = _zoomGestureGeneration;
+    os_unfair_lock_unlock(&_zoomGestureLock);
+    if (shouldEnableKeyboardReleaseTracking) {
+        [SwitchMaster.shared zoomGestureKeyboardReleaseTrackingChanged:YES];
+    }
+    return generation;
+}
+
+static BOOL endZoomGesture_Unsafe(NSString *reason) {
+    BOOL shouldDisableKeyboardReleaseTracking = NO;
+    BOOL didEnd = NO;
+    os_unfair_lock_lock(&_zoomGestureLock);
+    if (_zoomGestureActive) {
+        [TouchSimulator postMagnificationEventWithMagnification:0.0
+                                                            phase:kIOHIDEventPhaseEnded];
+        _zoomGestureActive = NO;
+        _zoomGestureGeneration += 1;
+        shouldDisableKeyboardReleaseTracking = _zoomGestureNeedsKeyboardReleaseTracking;
+        _zoomGestureNeedsKeyboardReleaseTracking = NO;
+        _zoomGestureNeedsChromiumOpeningImpulse = NO;
+        didEnd = YES;
+        DDLogInfo("MFSCROLL_ZOOM: action=end reason=%{public}@ generation=%llu cancel-animator=1",
+                  reason,
+                  _zoomGestureGeneration);
+    }
+    os_unfair_lock_unlock(&_zoomGestureLock);
+    if (shouldDisableKeyboardReleaseTracking) {
+        [SwitchMaster.shared zoomGestureKeyboardReleaseTrackingChanged:NO];
+    }
+    /// Invalidate the generation and post End before cancellation. A queued display-link
+    /// callback then cannot send another Changed frame, and no zoom tail can become the
+    /// initial motion of the next ordinary scroll session.
+    if (didEnd) {
+        [_animator cancel];
+    }
+    return didEnd;
+}
+
+static void sendZoomChangeIfActive(double magnification, uint64_t generation) {
+    os_unfair_lock_lock(&_zoomGestureLock);
+    if (_zoomGestureActive && _zoomGestureGeneration == generation) {
+        /// Chromium's ordinary page zoom ignores a very small opening pinch distance.
+        /// Restore its old one-time distance impulse, but keep the new physical-input
+        /// lifecycle: Began was already sent at wheel input, and this remains Changed.
+        if (_zoomGestureNeedsChromiumOpeningImpulse && magnification != 0.0) {
+            _zoomGestureNeedsChromiumOpeningImpulse = NO;
+            magnification += mfsign(magnification) > 0 ? 380.0 / 800.0 : -250.0 / 800.0;
+            DDLogInfo("MFSCROLL_ZOOM: action=chromium-opening-impulse generation=%llu",
+                      _zoomGestureGeneration);
+        }
+        [TouchSimulator postMagnificationEventWithMagnification:magnification
+                                                            phase:kIOHIDEventPhaseChanged];
+    }
+    os_unfair_lock_unlock(&_zoomGestureLock);
+}
+
+static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications, uint64_t zoomGestureGeneration);
 
 /// Give an ambiguous one-unit settling report a visible but tightly bounded response. This deliberately bypasses
 /// ScrollAnalyzer so a possible mechanical rebound cannot change cadence/direction history. The normal TouchAnimator
@@ -219,7 +312,8 @@ static void startSettlingTailMicroGlide(int64_t distance,
                    animationPhase,
                    momentumHint,
                    configForBlock,
-                   modificationsForBlock);
+                   modificationsForBlock,
+                   0);
     }];
 }
 
@@ -282,7 +376,12 @@ void resetState_Sync(void) {
 }
 void resetState_Unsafe(void) {
     DDLogDebug("Scroll.m: reset-animator");
-    [_animator cancel];
+    /// A zoom gesture is intentionally longer-lived than an individual animator response,
+    /// but any explicit session reset still needs a terminal phase before stale callbacks are
+    /// cancelled or a new target begins receiving input.
+    if (!endZoomGesture_Unsafe(@"session-reset")) {
+        [_animator cancel];
+    }
     [GestureScrollSimulator stopMomentumScroll]; /// Not sure if appropriate
     /// Command-Tab owns a synthetic Command key-down outside TouchAnimator. Every
     /// session reset must release it, including modifier release when the scroll tap
@@ -642,6 +741,15 @@ static void heavyProcessing(CGEventRef event,
     if (modificationsAreActive && !_modificationUsageNotified) {
         [ScrollModifiers handleCurrentModificationHasBeenUsedWithEvent:event];
         _modificationUsageNotified = YES;
+    }
+
+    /// Start the magnification gesture from the physical wheel report—not from the first
+    /// display callback. Slow Ctrl-wheel input can otherwise let Chromium discard a nonzero
+    /// `Began` delta and finish the animator before it ever sees `Changed`.
+    uint64_t zoomGestureGeneration = 0;
+    if (_modifications.effectMod == kMFScrollEffectModificationZoom) {
+        zoomGestureGeneration = beginZoomGesture_Unsafe(!HelperState.shared.trackballModeIsActive,
+                                                         currentZoomTargetNeedsOpeningImpulse());
     }
 
     /// Run preliminary scrollAnalysis
@@ -1362,7 +1470,7 @@ static void heavyProcessing(CGEventRef event,
     } else if (!_scrollConfig.smoothEnabled) {
         
         /// Send scroll event directly - without the animator. Will scroll all of pxToScrollForThisTick at once.
-        sendScroll(pxToScrollForThisTick, scrollDirection, NO, kMFAnimationCallbackPhaseNone, kMFMomentumHintNone, _scrollConfig, _modifications);
+        sendScroll(pxToScrollForThisTick, scrollDirection, NO, kMFAnimationCallbackPhaseNone, kMFMomentumHintNone, _scrollConfig, _modifications, zoomGestureGeneration);
         
     } else {
         
@@ -1594,15 +1702,12 @@ static void heavyProcessing(CGEventRef event,
                 baseDuration = MAX(baseDuration, taperedCadenceDuration);
             }
             if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
-                /// A live animation already provides continuity, so preserve its measured Slow Smoothness while
-                /// keeping the early hardware ramp near the accepted opening response. If the previous bounded
-                /// response stopped during hardware silence, this report is another visible opening and must use
-                /// report one's uninflated cap. Applying the adaptive duration ratio to that cold-restart cap made
-                /// each one-unit wake report start slower than the first. The later linear fade still reaches zero
-                /// continuously, so ordinary extremely-slow cadence resumes without a report-count transition.
+                /// Keep the whole early hardware ramp inside report one's responsive envelope. Selecting the
+                /// adaptive cap for a live retarget changed the same opening from 80ms on report one to roughly
+                /// 130ms on report two. The later linear fade still reaches zero continuously, so ordinary
+                /// extremely-slow cadence resumes without a report-count transition.
                 double uncappedIdleWakeBaseDuration = baseDuration;
                 double selectedIdleWakeOpeningCap = MFScrollIdleWakeBaseDurationCap(
-                    isRunning,
                     configCopyForBlock.stableInitialResponseBaseDurationMax,
                     effectiveOpeningDurationCap);
                 double cappedIdleWakeBaseDuration = MIN(
@@ -1860,7 +1965,7 @@ static void heavyProcessing(CGEventRef event,
                            inputQueueDelayMs);
             }
             legacyRecordOutput((int64_t)distanceDelta, scrollDirection);
-            sendScroll(distanceDelta, scrollDirection, YES, animationPhase, momentumHint, config, modificationsForBlock);
+            sendScroll(distanceDelta, scrollDirection, YES, animationPhase, momentumHint, config, modificationsForBlock, zoomGestureGeneration);
             
         }];
     }
@@ -1870,7 +1975,7 @@ static void heavyProcessing(CGEventRef event,
 
 #pragma mark - Send Scroll events
 
-static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications) {
+static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications, uint64_t zoomGestureGeneration) {
     
     /// Get x and y deltas
     
@@ -1919,7 +2024,7 @@ static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, M
     
     /// Send event
     
-    sendOutputEvents(dx, dy, outputType, animationPhase, momentumHint, config);
+    sendOutputEvents(dx, dy, outputType, animationPhase, momentumHint, config, zoomGestureGeneration);
 }
 
 /// Define output types
@@ -1937,7 +2042,7 @@ typedef enum {
 
 /// Output
 
-static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputType, MFAnimationCallbackPhase animatorPhase, MFMomentumHint momentumHint, ScrollConfig *config) {
+static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputType, MFAnimationCallbackPhase animatorPhase, MFMomentumHint momentumHint, ScrollConfig *config, uint64_t zoomGestureGeneration) {
     
     /// Init eventPhase
     IOHIDEventPhaseBits eventPhase = kIOHIDEventPhaseUndefined;
@@ -2217,53 +2322,25 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
     } else if (outputType == kMFScrollOutputTypeZoom) {
         
         /// --- Zoom ---
+
+        /// `Began` is emitted synchronously with the first physical zoom input and
+        /// `Ended` is emitted by the corresponding session reset (modifier release,
+        /// mode exit, target change, etc.). An animator response ending between slow
+        /// wheel reports must not split that one physical gesture into discarded
+        /// one-frame Chromium gestures.
+        if (animatorPhase == kMFAnimationCallbackPhaseEnd
+            || animatorPhase == kMFAnimationCallbackPhaseCanceled) {
+            return;
+        }
         
         double eventDelta = (dx + dy)/800.0; /// This works because, if dx != 0 -> dy == 0, and the other way around.
 
-        /// Invert zoom
-        ///     Must happen here — *before* the Chromium hack below. That hack adds asymmetric, sign-dependent
-        ///     offsets (+380/800 vs -250/800), so negating after it would apply the wrong branch's correction and
-        ///     make zooming lopsided in Chromium browsers.
+        /// Invert zoom before posting the gesture delta so both directions retain identical scaling.
         if (config.u_invertZoom) {
             eventDelta = -eventDelta;
         }
 
-        /// HACK:
-        ///     Chromium browsers need a ton of zooming deltas before they actually start zooming. So we send a bunch of deltas right away to make things more responsive.
-        ///     Another way to combat this would be to only send the `end` event when the user releases the modifier.
-        if (eventPhase == kIOHIDEventPhaseBegan) {
-            
-            NSString *bundleID = [HelperUtility appUnderMousePointerWithEvent:NULL].bundleIdentifier;
-            
-            if (bundleID != nil) {
-                if ([bundleID containsString:@"com.google.Chrome"]
-                    || [bundleID containsString:@"org.chromium.Chromium"]
-                    || [bundleID containsString:@"company.thebrowser.Browser"] /// Arc browser
-                    || [bundleID containsString:@"com.operasoftware.Opera"]
-                    || [bundleID containsString:@"com.microsoft.edgemac"]
-                    || [bundleID containsString:@"com.vivaldi.Vivaldi"]
-                    || [bundleID containsString:@"com.brave.Browser"]) {
-                    
-                    /// Using `containsString` to also catch other release channels like "com.google.Chrome.canary" . Could perhaps use -hasPrefix: instead.
-                    /// [Aug 2025] Also see the 'Universal Back and Forward' stuff in Actions.m
-                    /// TODO: Add other Chromium browsers with the same behaviour.
-                    /// Notes:
-                    /// - Blisk (org.blisk.Blisk) and Colibri (co.opqr.colibri) don't seem to support pinch to zoom.
-                    
-                    [TouchSimulator postMagnificationEventWithMagnification:eventDelta phase:kIOHIDEventPhaseBegan]; /// First delta seems to be ignored
-                    eventPhase = kIOHIDEventPhaseChanged;
-                    
-                    assert(eventDelta != 0);
-                    if (mfsign(eventDelta) > 0) {
-                        eventDelta += 380/800.0;
-                    } else {
-                        eventDelta -= 250/800.0;
-                    }
-                }
-            }
-        }
-        
-        [TouchSimulator postMagnificationEventWithMagnification:eventDelta phase:eventPhase];
+        sendZoomChangeIfActive(eventDelta, zoomGestureGeneration);
         
     } else if (outputType == kMFScrollOutputTypeRotation) {
         
