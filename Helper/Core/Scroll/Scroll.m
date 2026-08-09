@@ -105,6 +105,11 @@ static BOOL _stableFastTailReportHandled;
 /// a real continuation arrives, the continuation needs the bounded opening-duration cap instead of inheriting a
 /// long slow response from motion that is no longer visible.
 static BOOL _stableFastTailContinuationPending;
+/// A very close deliberate reversal keeps slow cadence on its opening report. If that
+/// response ends before the immediately following small continuation, cap that one
+/// stopped restart to the adaptive opening envelope so it cannot become weaker than
+/// the reversal that opened the new direction.
+static BOOL _stableCloseReversalContinuationPending;
 
 /// Zoom is one physical-input-owned magnification gesture, rather than one gesture per
 /// animator curve. Keep its phase transitions serialized because physical input/reset runs
@@ -399,6 +404,7 @@ void resetState_Unsafe(void) {
     _stableGestureReachedFastSpeed = NO;
     _stableFastTailReportHandled = NO;
     _stableFastTailContinuationPending = NO;
+    _stableCloseReversalContinuationPending = NO;
 }
 
 + (void)modifierStateDidChange:(MFScrollModificationResult)modifications {
@@ -866,6 +872,9 @@ static void heavyProcessing(CGEventRef event,
     BOOL stableFastTailResponseExpiredBeforeContinuation =
         _stableFastTailContinuationPending && !_animator.isRunning;
     _stableFastTailContinuationPending = NO;
+    BOOL stableCloseReversalResponseExpiredBeforeContinuation =
+        _stableCloseReversalContinuationPending && !_animator.isRunning;
+    _stableCloseReversalContinuationPending = NO;
     
     ///
     /// Get effective direction
@@ -1048,6 +1057,7 @@ static void heavyProcessing(CGEventRef event,
     double stableSlowCadenceContinuationBlendForTick = 0.0;
     double stableSlowCadenceReversalBlendForTick = 1.0;
     BOOL stableRestartAfterExpiredFastTailForTick = NO;
+    BOOL stableRestartAfterExpiredCloseReversalForTick = NO;
     double stableIdleWakeOpeningCapBlendForTick = 0.0;
     double stableIdleWakeOpeningGapForTick = 0.0;
     double stableIdleWakeElapsedForTick = DBL_MAX;
@@ -1287,14 +1297,17 @@ static void heavyProcessing(CGEventRef event,
             stableSlowCadenceForTick = _stableSlowCadenceEstimate;
             /// The current pause may update cadence memory for a later report, but it must not lengthen its own
             /// animation. Use only cadence known before this report, bounded by the current/reversal-clamped estimate
-            /// and the gesture boundary. Multiplying a newly growing gap estimate by a shrinking memory blend
-            /// produced a non-monotonic hump where 0.8-1.0s pauses restarted more slowly than 0.5s pauses.
-            CFTimeInterval cadenceKnownBeforeTick = stableSlowCadenceEstimateBeforeTick > 0
-                ? stableSlowCadenceEstimateBeforeTick
-                : physicalInputGap;
-            stableSlowCadenceDurationReferenceForTick = MIN(
-                MIN(cadenceKnownBeforeTick, stableSlowCadenceForTick),
-                _scrollConfig.consecutiveScrollTickIntervalMax);
+            /// and the gesture boundary. A close reversal retains its actual cross-direction gap; an unestablished
+            /// same-direction restart has no prior duration reference and therefore keeps only its measured slow-
+            /// smoothing response. Multiplying a newly growing gap estimate by a shrinking memory blend produced a
+            /// non-monotonic hump where 0.8-1.0s pauses restarted more slowly than 0.5s pauses.
+            stableSlowCadenceDurationReferenceForTick =
+                MFScrollSlowCadenceDurationReference(
+                    stableSlowCadenceEstimateBeforeTick,
+                    stableSlowCadenceForTick,
+                    physicalInputGap,
+                    scrollAnalysisResult.scrollDirectionDidChange,
+                    _scrollConfig.consecutiveScrollTickIntervalMax);
             stableAdaptiveSlowSmoothingBlendForTick = stableSlowCadenceContinuationBlendForTick;
             DDLogInfo("MFSCROLL_ADAPTIVE: cadence=remembered gapMs=%.1f priorEstimateMs=%.1f estimateMs=%.1f durationRefMs=%.1f memoryBlend=%.2f reversalBlend=%.2f blend=%.2f reversal=%d previousSeed=%d action=%{public}@",
                        physicalInputGap * 1000.0,
@@ -1308,6 +1321,9 @@ static void heavyProcessing(CGEventRef event,
                        _stablePreviousReportCanSeedSlowCadence,
                        stableSlowCadenceReversalBlendForTick < 1.0
                            ? @"taper-reversal-cadence"
+                           : stableSlowCadenceEstimateBeforeTick <= 0
+                               && !scrollAnalysisResult.scrollDirectionDidChange
+                           ? @"bound-unestablished-stale-cadence"
                            : stableSlowCadenceContinuationBlendForTick < 1.0
                            ? @"taper-stale-cadence"
                            : @"use-slow-smoothness");
@@ -1317,6 +1333,29 @@ static void heavyProcessing(CGEventRef event,
                       _stablePreviousReportCanSeedSlowCadence,
                       unitsForThisTick);
         }
+
+        stableRestartAfterExpiredCloseReversalForTick =
+            MFScrollShouldCapStoppedCloseReversalContinuation(
+                stableAdaptiveControlEnabled,
+                stableCloseReversalResponseExpiredBeforeContinuation,
+                firstConsecutive,
+                scrollAnalysisResult.scrollDirectionDidChange,
+                unitsForThisTick,
+                modeledOutputSpeed,
+                slowCadenceSpeedMax);
+
+        /// Arm for exactly the next physical report only when the current report is
+        /// the fully blended opening of a close, low-speed reversal. The next report
+        /// consumes the marker before classification; no confirmation gate or delayed
+        /// replay is introduced.
+        _stableCloseReversalContinuationPending =
+            stableAdaptiveControlEnabled
+            && scrollAnalysisResult.scrollDirectionDidChange
+            && stableSlowCadenceContinuationForTick
+            && stableSlowCadenceReversalBlendForTick >= 1.0
+            && unitsForThisTick <= 2
+            && modeledOutputSpeed > 0.0
+            && modeledOutputSpeed < slowCadenceSpeedMax;
 
         if (stableAdaptiveControlEnabled
             && stableHasMeasuredTickInterval
@@ -1692,14 +1731,12 @@ static void heavyProcessing(CGEventRef event,
                 /// still emits a pixel on the first display frame, while the remaining distance is distributed far
                 /// enough to overlap the likely next report. Fade that target out over the stale end of cadence
                 /// memory so a resumed first report cannot look stuck; a faster report still replans immediately.
-                double cadenceDuration = MIN(
-                    stableSlowCadenceDurationReferenceForTick
-                        * configCopyForBlock.stableSlowCadenceBaseDurationRatio,
-                    configCopyForBlock.stableSlowCadenceBaseDurationMax);
-                double taperedCadenceDuration = baseDuration
-                    + stableSlowCadenceContinuationBlendForTick
-                    * (cadenceDuration - baseDuration);
-                baseDuration = MAX(baseDuration, taperedCadenceDuration);
+                baseDuration = MFScrollSlowCadenceBaseDuration(
+                    baseDuration,
+                    stableSlowCadenceDurationReferenceForTick,
+                    configCopyForBlock.stableSlowCadenceBaseDurationRatio,
+                    configCopyForBlock.stableSlowCadenceBaseDurationMax,
+                    stableSlowCadenceContinuationBlendForTick);
             }
             if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
                 /// Keep the whole early hardware ramp inside report one's responsive envelope. Selecting the
@@ -1725,6 +1762,19 @@ static void heavyProcessing(CGEventRef event,
                            selectedIdleWakeOpeningCap * 1000.0,
                            effectiveOpeningDurationCap * 1000.0,
                            uncappedIdleWakeBaseDuration * 1000.0,
+                           baseDuration * 1000.0);
+            }
+            if (stableRestartAfterExpiredCloseReversalForTick) {
+                double uncappedCloseReversalRestartBaseDuration = baseDuration;
+                baseDuration = MFScrollStoppedCloseReversalBaseDurationCap(
+                    baseDuration,
+                    effectiveOpeningDurationCap);
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured gapMs=%.1f smoothness=%.2f animatorRunning=%d openingCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-stopped-close-reversal-continuation",
+                           physicalInputGap * 1000.0,
+                           effectiveSmoothnessAmount,
+                           isRunning,
+                           effectiveOpeningDurationCap * 1000.0,
+                           uncappedCloseReversalRestartBaseDuration * 1000.0,
                            baseDuration * 1000.0);
             }
             double acceleratingRampTargetSpeed = delta / baseDuration;

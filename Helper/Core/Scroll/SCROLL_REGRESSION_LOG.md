@@ -1439,6 +1439,131 @@ motion after a long idle is crisper for up to the measured wake interval, then t
 configured slow response. Acceleration, distance, carry/rate limits, tail/reversal protection, target isolation,
 zoom lifecycle, and display recovery are unchanged.
 
+### 2026-08-07 — stopped close reversal weakened its next continuation
+
+Symptom: a deliberate reversal could begin on time but still feel slow to start. The first opposite report moved,
+then the next sparse same-direction report restarted more weakly before later accelerated input restored normal
+motion.
+
+Current telemetry before attribution (helper PID `58940`):
+
+- At `20:26:19.320`, a Readdown-to-Kitty target change reset the old session. The first one-unit report used the
+  accepted `baseMs=80.0`, `targetV=400.0` opening and reached output in `10.14 ms` with `2.13 ms` queued.
+- At `20:26:19.546`, a one-unit reversal arrived `132 ms` after the preceding report. The close-reversal cadence
+  policy intentionally kept full slow continuity, cancelled the old direction, and delivered the report in
+  `7.11 ms` with `0.66 ms` queued. Its response used `baseMs=132.7` and `targetV=241.2`.
+- The next one-unit report arrived `216 ms` later at `20:26:19.762`, after that response had stopped. Maximum Slow
+  Smoothness restarted it with `baseMs=270.1`, `durationMs=314.5`, and only `targetV=118.5`—less than half the
+  opening reversal's target. The amplified follow-up at `20:26:19.801` and the three-unit report at `.831` then
+  raised the target to `309.7` and `1447.1 px/s`, respectively. The perceived hesitation was therefore the weak
+  stopped restart during the roughly `255 ms` before acceleration, not input delivery.
+- Active output around the sequence returned to `119.8–120.0 Hz`. There was no event-tap disable, display recovery
+  or start failure, target churn after the initial explicit reset, rate-limit involvement, or dropped distance on
+  the affected reports.
+
+Confirmed root cause and fix (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`): a close
+slow reversal correctly retained cadence on its first opposite report, but no state linked that opening response to
+the immediately following continuation. If the response expired during hardware silence, the next measured
+one-unit report could restart from rest with the full roughly `270 ms` maximum-slow base and visibly decelerate the
+new direction. A fully blended, low-speed close reversal now arms a one-physical-report session marker. The next
+report consumes it immediately; if the reversal response has stopped and that report remains in the same analyzer
+gesture, same direction, at most two units, and inside the slow band, its base is capped to the adaptive opening
+envelope. The captured `270.1 ms` response becomes approximately `132.7 ms`, raising its requested velocity from
+`118.5` to approximately `241 px/s` without changing its distance. Telemetry records
+`action=cap-stopped-close-reversal-continuation`.
+
+Preserved behavior:
+
+- The reversal report is still processed immediately, cancels old-direction motion, and retains full cadence
+  continuity through the existing `200 ms` close-reversal boundary.
+- A live reversal response keeps ordinary velocity-preserving retargeting. A new analyzer gesture, another direction
+  change, input above two units, or input outside the slow band bypasses the cap on that same report.
+- Ordinary established extremely slow movement, long-idle wake shaping, stale-reversal tapering, fast-tail settling,
+  acceleration cadence, distance/carry/rate limits, target resets, and display recovery are unchanged. The marker
+  is cleared by every session reset and is neither a confirmation gate nor a delayed replay.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes deterministic coverage of the captured stopped one-unit continuation, the exact
+  `270.1 -> 132.7 ms` duration cap, and non-matches for a live response, new gesture, another reversal, substantial
+  input, and input outside the slow band. Existing cadence, display lifecycle, and output-policy suites also pass
+  under `clang -Wall -Wextra -Werror`.
+- `git diff --check` and `./dev.sh build` passed. `./dev.sh run` rebuilt and deployed the Debug app; final helper
+  PID `68682` logged `MFSCROLL_CONFIG action=reload-reset` and the expected startup tap re-enable.
+
+Remaining verification/tradeoff: a physical reproduction must still capture the new action and confirm the feel,
+followed by close live reversal, stopped close reversal, deliberately sparse same-direction motion, slow-to-fast,
+fast stop/rebound, target switching, and the broader required matrix. The first stopped continuation after a close
+reversal is intentionally crisper than ordinary established sparse motion, but it remains at the adaptive opening
+envelope rather than the raw `80 ms` normal-smoothness cap.
+
+### 2026-08-09 — an unestablished stale restart used its own silence as cadence
+
+Symptom: ordinary scrolling again felt as if it had a slow start. The opening report moved, but a later sparse
+same-direction report could restart far more weakly before follow-up input accelerated it.
+
+Current telemetry before attribution (helper PID `68682`):
+
+- The capture ruled out input delivery and display-link delay. Across `106` starts, first nonzero output arrived in
+  `5.64–14.79 ms` with `0.36–3.17 ms` queued. `172` active output windows ran at `108.4–120.6 Hz` with at most a
+  `17.59 ms` active gap. There was no tap disable, callback recovery, watchdog restart, or display start/refresh
+  failure.
+- At `22:55:21.727`, a one-unit Discord opening used unknown-cadence normal smoothness, `baseMs=80.0`, and
+  `targetV=400.0`; first output arrived in `10.66 ms` with `0.92 ms` queued.
+- At `22:55:22.460`, the next same-direction one-unit report arrived after `732 ms`, when the animator had stopped.
+  The sparse policy recorded `priorEstimateMs=0.0`, but used the current report's silence as
+  `estimateMs=732.0` and `durationRefMs=500.0`. With `memoryBlend=0.77`, that expanded the response to
+  `baseMs=316.0`, `durationMs=352.3`, and only `targetV=101.3`. First output was still timely at `12.46 ms` with
+  `2.04 ms` queued, confirming that the perceived delay was the weak response envelope.
+
+Confirmed root cause and fix (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`): the stale
+cadence comment and earlier regression contract said the current pause may update memory only for a future report,
+but a zero-prior-estimate fallback still promoted `physicalInputGap` into the current duration reference. An
+unestablished same-direction restart now uses a zero cadence-duration reference on that report. It still selects
+measured Slow Smoothness immediately and publishes the `732 ms` estimate for later reports, but its own silence can
+no longer lengthen its response. Captured-parameter replay reduces the affected base from about `316 ms` to the
+adaptive opening envelope of about `120 ms`, raising its requested velocity from `101` to about `267 px/s` without
+changing distance. Telemetry identifies the path as `action=bound-unestablished-stale-cadence` with
+`durationRefMs=0.0`.
+
+Preserved behavior:
+
+- The first report remains the normal-smoothness `80 ms` opening. The second sparse report is processed immediately,
+  begins measured slow smoothing, and records its cadence without waiting for a third report.
+- A cadence estimate that existed before the current report still drives established extremely slow motion.
+  Close reversals retain their actual bounded cross-direction gap. Stale-memory and reversal blends still taper at
+  the same boundaries.
+- Slow-to-fast raw-cadence acceleration, live velocity-preserving retargets, fast-tail/rebound handling, direction
+  cancellation, output/carry bounds, target isolation, zoom/effect paths, and display recovery are unchanged. No
+  report is delayed, confirmed, discarded, or replayed, and no distance reservoir is introduced.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes the exact `732 ms` zero-prior reference and `316 -> 120 ms` base replay, an
+  established prior estimate, and a close reversal's actual-gap reference. Existing wake-ramp, low-unit
+  acceleration, close-reversal continuation, cadence seed, display lifecycle, and output-bound suites also pass
+  under `clang -Wall -Wextra -Werror`.
+- `git diff --check` and `./dev.sh build` passed. The current rolling capture supplied adjacent physical coverage
+  for fresh starts, repeated slow reports, slow-to-fast and fast-to-slow motion, active/paused reversals, settling
+  micro-glides, target resets, and display-paced output on display `1` before deployment; the changed decision is
+  additionally covered by deterministic replay.
+- Deployed helper PID `4391` physically reproduced the target path. Its opening at `23:03:12.347` retained
+  `baseMs=80.0`, `targetV=400.0`, and reached output in `11.96 ms` with `1.20 ms` queued. The next one-unit report
+  at `23:03:13.175` arrived after `825 ms` and logged `action=bound-unestablished-stale-cadence`,
+  `priorEstimateMs=0.0`, `durationRefMs=0.0`, `baseMs=115.6`, and `targetV=276.9`; it reached output in
+  `11.64 ms` with `5.01 ms` queued. Subsequent measured slow reports retargeted normally, active output returned to
+  `108.2–120.0 Hz`, and a `179 ms` close reversal retained `durationRefMs=179.0` before faster input accelerated.
+  No tap, display-start, recovery, rate-limit, or dropped-carry failure accompanied the pass. The final pure-helper
+  extraction rebuilt successfully and was deployed as PID `7006`, which logged the expected config reset and tap
+  re-enable.
+
+Remaining verification/tradeoff: the affected branch, subsequent established slow motion, acceleration, reversal,
+fast-tail settling, and display-paced output are physically covered. The complete cross-app/display/effect matrix
+remains manual. On the second same-direction report after a `500 ms–1.5 s` gap, a genuinely continuous sparse stream
+now receives measured adaptive smoothing but not a long cadence-derived duration until a cadence estimate existed
+before the report. That is intentionally crisper at the ambiguous opening while retaining later established sparse
+continuity.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

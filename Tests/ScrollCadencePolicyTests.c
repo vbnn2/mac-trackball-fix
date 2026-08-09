@@ -123,6 +123,39 @@ static void testAcceleratingLowUnitRampOnlyCapsVelocityNotch(void) {
     ));
 }
 
+static void testStoppedCloseReversalContinuationKeepsOpeningEnvelope(void) {
+    /// Captured 2026-08-07 path: the close reversal response had ended before a
+    /// one-unit, same-direction continuation arrived 216ms later. That report
+    /// must not restart from rest with the full maximum-slow duration.
+    assert(MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, true, false, false, 1, 146.7, 2250.0
+    ));
+    assert(MFScrollStoppedCloseReversalBaseDurationCap(
+        0.2701, 0.1327
+    ) == 0.1327);
+    assert(MFScrollStoppedCloseReversalBaseDurationCap(
+        0.1000, 0.1327
+    ) == 0.1000);
+
+    /// A live reversal response, a new analyzer gesture, another reversal,
+    /// substantial input, or input outside the slow band keeps its ordinary path.
+    assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, false, false, false, 1, 146.7, 2250.0
+    ));
+    assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, true, true, false, 1, 146.7, 2250.0
+    ));
+    assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, true, false, true, 1, 146.7, 2250.0
+    ));
+    assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, true, false, false, 3, 146.7, 2250.0
+    ));
+    assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
+        true, true, false, false, 1, 2250.0, 2250.0
+    ));
+}
+
 static void testPostFastMultiUnitReportCannotBootstrapAStickyRestart(void) {
     const double slowSpeedMax = 500.0;
     const bool previousWasEligible = MFScrollReportCanSeedSlowCadence(
@@ -167,6 +200,31 @@ static void testSecondGenuineSparseReportStillUsesMeasuredCadence(void) {
         0.500,
         1.500
     ));
+
+    /// Captured 2026-08-09 path: the second one-unit report arrived after
+    /// 732ms with no cadence estimate established before it. It still qualifies
+    /// as possible sparse motion, but its own silence cannot become a 500ms
+    /// duration reference and weaken this stopped restart to roughly 101px/s.
+    assert(MFScrollSlowCadenceDurationReference(
+        0.0, 0.732, 0.732, false, 0.500
+    ) == 0.0);
+    const double oldSelfLengthenedBase = MFScrollSlowCadenceBaseDuration(
+        0.120, 0.500, 0.750, 0.900, 0.768
+    );
+    const double boundedCurrentReportBase = MFScrollSlowCadenceBaseDuration(
+        0.120, 0.0, 0.750, 0.900, 0.768
+    );
+    assert(oldSelfLengthenedBase > 0.315 && oldSelfLengthenedBase < 0.317);
+    assert(boundedCurrentReportBase == 0.120);
+
+    /// The measured gap is available to a later report, while close reversal
+    /// keeps its existing actual cross-direction cadence reference.
+    assert(MFScrollSlowCadenceDurationReference(
+        0.145, 0.4385, 0.732, false, 0.500
+    ) == 0.145);
+    assert(MFScrollSlowCadenceDurationReference(
+        0.0, 0.061, 0.061, true, 0.500
+    ) == 0.061);
 }
 
 static void testTailAndAccelerationReportsNeverSeedCadence(void) {
@@ -209,6 +267,7 @@ int main(void) {
     testFastOrSubstantialInputEndsWakeShapingImmediately();
     testWakeRampUsesResponsiveOpeningCap();
     testAcceleratingLowUnitRampOnlyCapsVelocityNotch();
+    testStoppedCloseReversalContinuationKeepsOpeningEnvelope();
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();
     testTailAndAccelerationReportsNeverSeedCadence();

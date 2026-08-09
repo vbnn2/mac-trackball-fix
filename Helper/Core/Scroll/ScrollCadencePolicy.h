@@ -93,6 +93,40 @@ static inline bool MFScrollShouldCapAcceleratingLowUnitRamp(
         && requestedTargetSpeed < animatorSpeed;
 }
 
+/// A close slow reversal deliberately keeps cadence continuity on its first
+/// opposite-direction report. If that bounded response finishes before the
+/// immediately following small same-direction report arrives, allowing maximum
+/// slow smoothing to restart from rest can make the continuation markedly weaker
+/// than the reversal that opened it. Reuse the adaptive opening cap for that one
+/// stopped continuation only. Live retargets and established sparse motion keep
+/// their ordinary cadence response.
+static inline bool MFScrollShouldCapStoppedCloseReversalContinuation(
+    bool overloadControlEnabled,
+    bool previousCloseReversalResponseExpired,
+    bool firstConsecutive,
+    bool directionChanged,
+    int64_t units,
+    double modeledOutputSpeed,
+    double slowCadenceSpeedMax
+) {
+    return overloadControlEnabled
+        && previousCloseReversalResponseExpired
+        && !firstConsecutive
+        && !directionChanged
+        && units <= 2
+        && modeledOutputSpeed > 0.0
+        && modeledOutputSpeed < slowCadenceSpeedMax;
+}
+
+static inline double MFScrollStoppedCloseReversalBaseDurationCap(
+    double baseDuration,
+    double adaptiveOpeningCap
+) {
+    return baseDuration < adaptiveOpeningCap
+        ? baseDuration
+        : adaptiveOpeningCap;
+}
+
 /// A report may seed sparse-cadence continuity only when the report itself looked like
 /// deliberate careful motion. Mechanical-tail responses are deliberately excluded even
 /// when their unit count and modeled speed happen to be low.
@@ -132,6 +166,51 @@ static inline bool MFScrollShouldContinueSlowCadence(
         && units <= 2
         && (directionChanged || physicalInputGap > consecutiveIntervalMax)
         && physicalInputGap <= memoryMaxInterval;
+}
+
+/// A stale same-direction opening must not use its own preceding silence as an
+/// animation-duration target when no cadence estimate existed before that
+/// physical report. It may still select slow smoothing and publish the measured
+/// gap for a future report. A direction change is different: its actual cross-
+/// direction gap is the cadence signal used by the established close-reversal
+/// policy, so preserve that bounded reference.
+static inline double MFScrollSlowCadenceDurationReference(
+    double priorEstimate,
+    double updatedEstimate,
+    double physicalInputGap,
+    bool directionChanged,
+    double gestureBoundary
+) {
+    double cadenceKnownBeforeReport = priorEstimate;
+    if (cadenceKnownBeforeReport <= 0.0) {
+        if (!directionChanged) {
+            return 0.0;
+        }
+        cadenceKnownBeforeReport = physicalInputGap;
+    }
+
+    const double estimateBound = cadenceKnownBeforeReport < updatedEstimate
+        ? cadenceKnownBeforeReport
+        : updatedEstimate;
+    return estimateBound < gestureBoundary ? estimateBound : gestureBoundary;
+}
+
+static inline double MFScrollSlowCadenceBaseDuration(
+    double baseDuration,
+    double durationReference,
+    double durationRatio,
+    double durationMax,
+    double continuationBlend
+) {
+    const double scaledCadenceDuration = durationReference * durationRatio;
+    const double cadenceDuration = scaledCadenceDuration < durationMax
+        ? scaledCadenceDuration
+        : durationMax;
+    const double taperedCadenceDuration = baseDuration
+        + continuationBlend * (cadenceDuration - baseDuration);
+    return baseDuration > taperedCadenceDuration
+        ? baseDuration
+        : taperedCadenceDuration;
 }
 
 #endif /* ScrollCadencePolicy_h */
