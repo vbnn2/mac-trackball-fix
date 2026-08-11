@@ -498,6 +498,12 @@ import Cocoa
     /// interval only when it is materially shorter than the average; smaller timing jitter keeps the smoother.
     @objc let stableAccelerationCadenceRawIntervalRatioMax: Double = 0.75
 
+    /// An abrupt one- or two-unit deceleration edge is not trustworthy evidence that a later sparse report belongs
+    /// to deliberate extremely-slow motion. Captures of the reported weak starts dropped to 7–12% of the preceding
+    /// modeled speed; use a conservative 25% boundary so gradual careful deceleration continues to seed cadence.
+    /// If the animator has already stopped, cap that edge's response to the adaptive opening envelope as well.
+    @objc let stableSharpDecelerationCurrentSpeedRatioMax: Double = 0.25
+
     /// A very close slow reversal is usually part of careful continuous movement, so preserve its cadence in full.
     /// Past this point, fade cadence influence to zero at `consecutiveScrollTickIntervalMax`: a later reversal is a
     /// fresh deliberate input and must not turn its first ~20px into a long sparse-cadence glide. Same-direction

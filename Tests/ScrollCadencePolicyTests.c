@@ -163,6 +163,7 @@ static void testPostFastMultiUnitReportCannotBootstrapAStickyRestart(void) {
         329.4,
         slowSpeedMax,
         false,
+        false,
         false
     );
 
@@ -185,6 +186,7 @@ static void testSecondGenuineSparseReportStillUsesMeasuredCadence(void) {
         1,
         120.0,
         slowSpeedMax,
+        false,
         false,
         false
     );
@@ -230,10 +232,60 @@ static void testSecondGenuineSparseReportStillUsesMeasuredCadence(void) {
 static void testTailAndAccelerationReportsNeverSeedCadence(void) {
     const double slowSpeedMax = 500.0;
 
-    assert(!MFScrollReportCanSeedSlowCadence(1, 120.0, slowSpeedMax, true, false));
-    assert(!MFScrollReportCanSeedSlowCadence(1, 120.0, slowSpeedMax, false, true));
-    assert(!MFScrollReportCanSeedSlowCadence(3, 120.0, slowSpeedMax, false, false));
-    assert(!MFScrollReportCanSeedSlowCadence(1, 500.0, slowSpeedMax, false, false));
+    assert(!MFScrollReportCanSeedSlowCadence(1, 120.0, slowSpeedMax, true, false, false));
+    assert(!MFScrollReportCanSeedSlowCadence(1, 120.0, slowSpeedMax, false, true, false));
+    assert(!MFScrollReportCanSeedSlowCadence(1, 120.0, slowSpeedMax, false, false, true));
+    assert(!MFScrollReportCanSeedSlowCadence(3, 120.0, slowSpeedMax, false, false, false));
+    assert(!MFScrollReportCanSeedSlowCadence(1, 500.0, slowSpeedMax, false, false, false));
+}
+
+static void testSharpDecelerationTailCannotWeakenStoppedOrLaterRestart(void) {
+    const double slowSpeedMax = 2250.0;
+    const double sharpRatioMax = 0.25;
+
+    /// Captured 2026-08-11 paths dropped from roughly 1021 -> 70px/s and
+    /// 897 -> 111px/s. Both are deceleration edges, not established slow cadence.
+    const bool stoppedTail = MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 1, 69.8, 1021.0, slowSpeedMax, sharpRatioMax
+    );
+    const bool liveTail = MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+    );
+    assert(stoppedTail);
+    assert(liveTail);
+    assert(MFScrollShouldCapStoppedSharpDecelerationTail(stoppedTail, false));
+    assert(!MFScrollShouldCapStoppedSharpDecelerationTail(liveTail, true));
+    assert(MFScrollStoppedSharpDecelerationBaseDurationCap(
+        0.2704, 0.1329
+    ) == 0.1329);
+    assert(MFScrollStoppedSharpDecelerationBaseDurationCap(
+        0.1000, 0.1329
+    ) == 0.1000);
+    const bool liveTailCanSeedCadence = MFScrollReportCanSeedSlowCadence(
+        1, 110.5, slowSpeedMax, false, false, liveTail
+    );
+    assert(!liveTailCanSeedCadence);
+    assert(!MFScrollShouldContinueSlowCadence(
+        true, true, liveTailCanSeedCadence, 1, false, 0.7121, 0.500, 1.500
+    ));
+
+    /// Gradual careful deceleration, a reversal, substantial input, or an
+    /// unmeasured opening keeps the established policy.
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 1, 300.0, 900.0, slowSpeedMax, sharpRatioMax
+    ));
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, true, true, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+    ));
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 3, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+    ));
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, false, false, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+    ));
+    assert(MFScrollReportCanSeedSlowCadence(
+        1, 300.0, slowSpeedMax, false, false, false
+    ));
 }
 
 static void testResetAndMemoryHorizonCannotReuseCadence(void) {
@@ -271,6 +323,7 @@ int main(void) {
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();
     testTailAndAccelerationReportsNeverSeedCadence();
+    testSharpDecelerationTailCannotWeakenStoppedOrLaterRestart();
     testResetAndMemoryHorizonCannotReuseCadence();
 
     puts("ScrollCadencePolicyTests: PASS");

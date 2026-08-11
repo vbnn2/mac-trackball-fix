@@ -127,6 +127,49 @@ static inline double MFScrollStoppedCloseReversalBaseDurationCap(
         : adaptiveOpeningCap;
 }
 
+/// A one- or two-unit report can be the abrupt deceleration edge of faster motion rather
+/// than evidence of deliberate sparse scrolling. Identify only a same-direction, measured
+/// drop to at most the configured fraction of the immediately preceding modeled speed.
+/// The current report is always delivered; this classification controls only its response
+/// envelope when motion has stopped and whether it may seed a later sparse restart.
+static inline bool MFScrollIsSharpDecelerationTailReport(
+    bool overloadControlEnabled,
+    bool hasMeasuredInterval,
+    bool directionChanged,
+    int64_t units,
+    double modeledOutputSpeed,
+    double previousModeledOutputSpeed,
+    double slowCadenceSpeedMax,
+    double currentToPreviousSpeedRatioMax
+) {
+    return overloadControlEnabled
+        && hasMeasuredInterval
+        && !directionChanged
+        && units <= 2
+        && modeledOutputSpeed > 0.0
+        && modeledOutputSpeed < slowCadenceSpeedMax
+        && previousModeledOutputSpeed > 0.0
+        && currentToPreviousSpeedRatioMax > 0.0
+        && modeledOutputSpeed
+            <= previousModeledOutputSpeed * currentToPreviousSpeedRatioMax;
+}
+
+static inline bool MFScrollShouldCapStoppedSharpDecelerationTail(
+    bool isSharpDecelerationTailReport,
+    bool animatorRunning
+) {
+    return isSharpDecelerationTailReport && !animatorRunning;
+}
+
+static inline double MFScrollStoppedSharpDecelerationBaseDurationCap(
+    double baseDuration,
+    double adaptiveOpeningCap
+) {
+    return baseDuration < adaptiveOpeningCap
+        ? baseDuration
+        : adaptiveOpeningCap;
+}
+
 /// A report may seed sparse-cadence continuity only when the report itself looked like
 /// deliberate careful motion. Mechanical-tail responses are deliberately excluded even
 /// when their unit count and modeled speed happen to be low.
@@ -135,13 +178,15 @@ static inline bool MFScrollReportCanSeedSlowCadence(
     double modeledOutputSpeed,
     double slowCadenceSpeedMax,
     bool isFastTailResponse,
-    bool isSettlingTailResponse
+    bool isSettlingTailResponse,
+    bool isSharpDecelerationTailResponse
 ) {
     return units <= 2
         && modeledOutputSpeed > 0.0
         && modeledOutputSpeed < slowCadenceSpeedMax
         && !isFastTailResponse
-        && !isSettlingTailResponse;
+        && !isSettlingTailResponse
+        && !isSharpDecelerationTailResponse;
 }
 
 /// Decide whether a first analyzer report may reuse sparse cadence.

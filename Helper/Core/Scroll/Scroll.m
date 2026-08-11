@@ -1058,6 +1058,8 @@ static void heavyProcessing(CGEventRef event,
     double stableSlowCadenceReversalBlendForTick = 1.0;
     BOOL stableRestartAfterExpiredFastTailForTick = NO;
     BOOL stableRestartAfterExpiredCloseReversalForTick = NO;
+    BOOL stableSharpDecelerationTailForTick = NO;
+    BOOL stableStoppedSharpDecelerationTailForTick = NO;
     double stableIdleWakeOpeningCapBlendForTick = 0.0;
     double stableIdleWakeOpeningGapForTick = 0.0;
     double stableIdleWakeElapsedForTick = DBL_MAX;
@@ -1208,6 +1210,19 @@ static void heavyProcessing(CGEventRef event,
         stableModeledOutputSpeedForTick = modeledOutputSpeed;
         stablePreviousModeledOutputSpeedForTick = _stablePreviousModeledOutputSpeed;
         stableSlowCadenceSpeedMaxForTick = slowCadenceSpeedMax;
+        stableSharpDecelerationTailForTick = MFScrollIsSharpDecelerationTailReport(
+            stableAdaptiveControlEnabled,
+            stableHasMeasuredTickInterval,
+            scrollAnalysisResult.scrollDirectionDidChange,
+            unitsForThisTick,
+            modeledOutputSpeed,
+            _stablePreviousModeledOutputSpeed,
+            slowCadenceSpeedMax,
+            _scrollConfig.stableSharpDecelerationCurrentSpeedRatioMax);
+        stableStoppedSharpDecelerationTailForTick =
+            MFScrollShouldCapStoppedSharpDecelerationTail(
+                stableSharpDecelerationTailForTick,
+                _animator.isRunning);
         if (_stableIdleWakeOpeningTime > 0) {
             stableIdleWakeOpeningGapForTick = _stableIdleWakeOpeningGap;
             stableIdleWakeElapsedForTick = MAX(0.0, tickTS - _stableIdleWakeOpeningTime);
@@ -1430,7 +1445,8 @@ static void heavyProcessing(CGEventRef event,
             modeledOutputSpeed,
             slowCadenceSpeedMax,
             stableFastTailReport,
-            stableSettlingTailSameDirectionCandidate);
+            stableSettlingTailSameDirectionCandidate,
+            stableSharpDecelerationTailForTick);
 
         if (stableAdaptiveControlEnabled
             && (stableHasMeasuredTickInterval || stableSlowCadenceContinuationForTick)) {
@@ -1737,6 +1753,24 @@ static void heavyProcessing(CGEventRef event,
                     configCopyForBlock.stableSlowCadenceBaseDurationRatio,
                     configCopyForBlock.stableSlowCadenceBaseDurationMax,
                     stableSlowCadenceContinuationBlendForTick);
+            }
+            if (stableStoppedSharpDecelerationTailForTick) {
+                /// Captured weak restarts were abrupt low-unit deceleration edges whose preceding animation had
+                /// already ended. Keep the current report immediate and preserve its full distance, but do not
+                /// spread that small stopped response across the maximum slow-smoothing duration.
+                double uncappedSharpDecelerationBaseDuration = baseDuration;
+                baseDuration = MFScrollStoppedSharpDecelerationBaseDurationCap(
+                    baseDuration,
+                    effectiveOpeningDurationCap);
+                DDLogInfo("MFSCROLL_ADAPTIVE: cadence=measured units=%lld modeledV=%.1f previousModeledV=%.1f speedRatio=%.3f animatorRunning=0 openingCapMs=%.1f uncappedBaseMs=%.1f baseMs=%.1f action=cap-stopped-sharp-deceleration-tail",
+                           unitsForThisTick,
+                           stableModeledOutputSpeedForTick,
+                           stablePreviousModeledOutputSpeedForTick,
+                           stableModeledOutputSpeedForTick
+                               / stablePreviousModeledOutputSpeedForTick,
+                           effectiveOpeningDurationCap * 1000.0,
+                           uncappedSharpDecelerationBaseDuration * 1000.0,
+                           baseDuration * 1000.0);
             }
             if (stableIdleWakeOpeningCapBlendForTick > 0.0) {
                 /// Keep the whole early hardware ramp inside report one's responsive envelope. Selecting the

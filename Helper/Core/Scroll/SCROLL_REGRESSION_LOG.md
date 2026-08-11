@@ -1564,6 +1564,80 @@ now receives measured adaptive smoothing but not a long cadence-derived duration
 before the report. That is intentionally crisper at the ambiguous opening while retaining later established sparse
 continuity.
 
+### 2026-08-11 — abrupt deceleration tail weakened stopped and stale restarts
+
+Symptom: a start/stop scroll in Browser felt slow to begin even after the unestablished-cadence duration fix. The
+current rolling telemetry from helper PID `7006` shows that delivery was healthy but exposes two response-shape
+variants of the same missing tail classification:
+
+- At `22:49:13.998`, a same-direction one-unit/one-point report abruptly decelerated from approximately `897` to
+  `111 px/s`, or `12.3%` of the preceding modeled speed. The live animator retargeted normally, but the report was
+  recorded as eligible slow-cadence history. At `22:49:14.711`, after a `712.1 ms` pause and after animation had
+  stopped, the next one-unit report logged `previousSeed=1`, `priorEstimateMs=173.1`,
+  `action=taper-stale-cadence`, `baseMs=128.1`, and `targetV=249.9`. Its first output still arrived in `13.93 ms`
+  with only `0.65 ms` queued, and display-link start returned `result=0`; this was not an input queue, display link,
+  event tap, or target-app stall.
+- At `22:46:46.406`, a one-unit/one-point report arrived after the preceding response had stopped and abruptly
+  decelerated from approximately `1021` to `69 px/s`, or `6.8%`. It received maximum slow smoothing directly:
+  `baseMs=270.4` and `targetV=107.2`. Delivery was again healthy at `8.39 ms` input-to-first-output with `0.56 ms`
+  queued and display start `result=0`.
+
+Root cause: `MFScrollReportCanSeedSlowCadence` excluded known fast-tail and settling-tail paths but treated every
+other low-unit, low-modeled-speed report as deliberate sparse motion. A sharp deceleration edge following much
+faster multi-unit motion could therefore seed a stopped restart up to `1.5 s` later. When the sharp edge itself
+arrived after the animator stopped but stayed inside ScrollAnalyzer's gesture, it could also use the full measured
+slow-smoothing duration. The correspondence between the nearby capture and the subjective report is inferred; the
+two policy failures and their output shapes are directly confirmed by telemetry and code replay.
+
+Change:
+
+- `ScrollCadencePolicy.h` now classifies only measured, same-direction, one- or two-unit reports whose modeled speed
+  falls to at most `25%` of the immediately preceding modeled speed. The two captures are well inside that boundary;
+  gradual careful deceleration is outside it.
+- The report is still processed immediately. If animation is live, ordinary velocity-preserving retargeting remains
+  unchanged. If it has stopped, only the report's base duration is capped to the adaptive opening envelope; captured
+  replay reduces `270.4 ms` to about `132.9 ms` and raises requested speed from `107` to about `218 px/s` without
+  changing distance.
+- A classified sharp deceleration edge cannot seed later sparse-cadence continuity. Captured replay makes the
+  `712.1 ms` report an ordinary bounded opening (`80 ms`, approximately `400 px/s`) rather than reusing the tail's
+  stale `173.1 ms` estimate. The current edge may still update timing history for a later genuinely established
+  slow stream.
+- `ScrollConfig.swift`, `Scroll.m`, and `ScrollCadencePolicyTests.c` contain the threshold, integration, telemetry
+  (`action=cap-stopped-sharp-deceleration-tail`), and exact captured-policy regression cases.
+
+Preserved behavior: first-report delivery and distance are unchanged; no report is delayed, confirmed, discarded,
+or replayed. Established repeated sparse scrolling, gradual fast-to-slow motion, raw-cadence slow-to-fast response,
+live velocity-preserving retargets, close-reversal continuation, long-idle wake shaping, fast-tail/rebound handling,
+direction cancellation, output/carry bounds, target resets, effect paths, and display recovery retain their existing
+policies. A direction change is explicitly excluded from the new classification, and no event-count gate, timer, or
+distance reservoir was introduced.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` pass. Deterministic coverage replays both captured speed ratios,
+  stopped versus live animation, the `270.4 -> 132.9 ms` duration cap, cadence-seed rejection, and non-matches for
+  gradual deceleration, reversals, substantial input, and unmeasured openings. Existing cadence, wake-ramp,
+  low-unit acceleration, close-reversal, display-link lifecycle, and output-bound suites pass under
+  `clang -Wall -Wextra -Werror`.
+- `./dev.sh build` and `./dev.sh run` pass. The rebuilt app restarted through its normal lifecycle; helper PIDs
+  `55195` and then `55225` logged `action=reload-reset` and event-tap `action=re-enable` during deployment. On PID
+  `55225`, the fresh Browser opening at `22:55:55.260` kept `baseMs=80.0`, `targetV=400.0`, and reached output in
+  `8.75 ms` with `0.52 ms` queued. The stopped one-unit start at `22:55:58.330`, following a protected tail, logged
+  `previousSeed=0`, the same `80 ms`/`400 px/s` opening, and `13.93 ms` first-output latency with `0.50 ms` queued.
+  Adjacent starts measured `6.11–14.43 ms` with `0.53–0.61 ms` queued, active output measured `112–120 Hz`, and all
+  display starts returned `result=0`.
+- The pre-change rolling capture supplies adjacent physical coverage for fresh bounded starts, repeated slow input,
+  slow-to-fast and fast-to-slow motion, active and paused reversals, a Browser-to-Readdown target reset, display `1`
+  starts with `result=0`, and active output near `108–120 Hz`. No unexplained tap disable or display recovery appears
+  around the affected reports.
+
+Remaining verification/tradeoff: bounded starts and tail-seed rejection are physically covered after deployment,
+but the new sharp-deceleration action itself is exact-policy replayed rather than physically recaptured. The complete
+cross-app, multi-display, horizontal, zoom/effect, and content-boundary matrix remains manual. An intentional
+instantaneous deceleration below one quarter of the preceding modeled speed now receives a crisper stopped response
+and cannot alone establish a later sparse continuation. The current report remains fully delivered, and one
+subsequent genuine slow report can establish history again, limiting that ambiguity to the captured transition edge.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:
