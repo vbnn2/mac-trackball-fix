@@ -103,23 +103,36 @@ static void testWakeRampUsesResponsiveOpeningCap(void) {
 
 static void testAcceleratingLowUnitRampOnlyCapsVelocityNotch(void) {
     assert(MFScrollShouldCapAcceleratingLowUnitRamp(
-        true, true, 1, 8, 900.0, 160.0, 2250.0, 287.7, 250.0
+        true, true, 1, 8, 1, 900.0, 160.0, 2250.0, 287.7, 250.0
+    ));
+
+    /// Captured at 12:52:43.041: point magnitude rose from 6 to 14 during the
+    /// opening, but a longer packet gap made line-derived modeled speed fall.
+    /// Do not let that contradictory packet decelerate 342px/s live motion to
+    /// the old 228px/s request.
+    assert(MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 14, 6, 430.0, 624.5, 2250.0, 342.3, 227.5
     ));
 
     /// A genuine careful point report has no amplified point delta.
     assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
-        true, true, 1, 1, 180.0, 160.0, 2250.0, 287.7, 250.0
+        true, true, 1, 1, 1, 180.0, 160.0, 2250.0, 287.7, 250.0
+    ));
+    /// Falling modeled speed with flat/falling point magnitude is genuine
+    /// deceleration, not opening-ramp evidence.
+    assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
+        true, true, 1, 13, 15, 225.0, 624.5, 2250.0, 601.5, 270.3
     ));
     /// Do not make an already-accelerating retarget more aggressive.
     assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
-        true, true, 1, 8, 900.0, 160.0, 2250.0, 287.7, 440.0
+        true, true, 1, 8, 1, 900.0, 160.0, 2250.0, 287.7, 440.0
     ));
     /// Substantial or fast input keeps the ordinary bounded path.
     assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
-        true, true, 3, 32, 1800.0, 900.0, 2250.0, 287.7, 250.0
+        true, true, 3, 32, 8, 1800.0, 900.0, 2250.0, 287.7, 250.0
     ));
     assert(!MFScrollShouldCapAcceleratingLowUnitRamp(
-        true, true, 1, 8, 2250.0, 160.0, 2250.0, 287.7, 250.0
+        true, true, 1, 8, 1, 2250.0, 160.0, 2250.0, 287.7, 250.0
     ));
 }
 
@@ -153,6 +166,215 @@ static void testStoppedCloseReversalContinuationKeepsOpeningEnvelope(void) {
     ));
     assert(!MFScrollShouldCapStoppedCloseReversalContinuation(
         true, true, false, false, 1, 2250.0, 2250.0
+    ));
+}
+
+static void testStoppedMeasuredSlowContinuationRegainsOpeningEnvelope(void) {
+    const double slowSpeedMax = 2250.0;
+
+    /// Captured at 15:03:51.137 and 15:03:51.874: measured same-direction
+    /// one-unit reports restarted after motion had ended at only 111 and 107px/s.
+    assert(MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, false, false, 1, 82.5, slowSpeedMax
+    ));
+    assert(MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, false, false, 1, 62.3, slowSpeedMax
+    ));
+    assert(MFScrollStoppedSlowContinuationBaseDurationCap(
+        0.2704, 0.1329
+    ) == 0.1329);
+    assert(MFScrollStoppedSlowContinuationBaseDurationCap(
+        0.1000, 0.1329
+    ) == 0.1000);
+
+    /// Live overlapping sparse motion, an analyzer opening, a reversal,
+    /// substantial/fast input, and disabled adaptive control remain unchanged.
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, true, true, false, false, 1, 82.5, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, true, false, 1, 82.5, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, false, true, 1, 82.5, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, false, false, 3, 82.5, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, true, false, false, false, 1, slowSpeedMax, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        false, true, false, false, false, 1, 82.5, slowSpeedMax
+    ));
+    assert(!MFScrollShouldCapStoppedSlowContinuation(
+        true, false, false, false, false, 1, 82.5, slowSpeedMax
+    ));
+}
+
+static void testStoppedRememberedSlowOpeningRegainsOpeningEnvelope(void) {
+    const double slowSpeedMax = 2250.0;
+    const double gestureBoundary = 0.500;
+
+    /// Captured at 23:01:58.286 and 23:03:26.347: after 711ms and 616ms gaps,
+    /// the analyzer opened a new gesture but an already-stopped response reused
+    /// established 372ms and 275ms cadence references, producing 246ms and
+    /// 197ms bases. These visible openings regain the adaptive envelope.
+    assert(MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.2749,
+        1, 160.0, slowSpeedMax, 0.616, gestureBoundary
+    ));
+    assert(MFScrollStoppedSlowContinuationBaseDurationCap(
+        0.2457, 0.1329
+    ) == 0.1329);
+    assert(MFScrollStoppedSlowContinuationBaseDurationCap(
+        0.1969, 0.1329
+    ) == 0.1329);
+
+    /// Live overlap, measured in-gesture continuation, reversal, unestablished
+    /// cadence, substantial/fast input, and a sub-boundary gap stay unchanged.
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, true, true, false, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, false, false, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, true, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.3718,
+        3, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.3718,
+        1, slowSpeedMax, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.499, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        true, false, true, false, false, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+    assert(!MFScrollShouldCapStoppedRememberedSlowOpening(
+        false, false, true, false, true, 0.3718,
+        1, 160.0, slowSpeedMax, 0.711, gestureBoundary
+    ));
+}
+
+static void testStoppedPausedReversalContinuouslyRegainsOpeningEnvelope(void) {
+    const double slowSpeedMax = 2250.0;
+
+    /// The accepted 292ms reversal remains untouched. The reported 382ms
+    /// stopped reversal receives the full adaptive opening cap, while the
+    /// interval between them changes continuously.
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, 160.0, slowSpeedMax,
+        0.292, 0.300, 0.380, 0.500
+    ) == 0.0);
+    const double middleBlend = MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, 160.0, slowSpeedMax,
+        0.340, 0.300, 0.380, 0.500
+    );
+    assert(middleBlend > 0.499 && middleBlend < 0.501);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, 160.0, slowSpeedMax,
+        0.382, 0.300, 0.380, 0.500
+    ) == 1.0);
+
+    assert(MFScrollStoppedPausedReversalBaseDuration(
+        0.1738, 0.1012, 1.0
+    ) == 0.1012);
+    const double middleBase = MFScrollStoppedPausedReversalBaseDuration(
+        0.1738, 0.1012, middleBlend
+    );
+    assert(middleBase > 0.1374 && middleBase < 0.1376);
+
+    /// Live motion, a close reversal, ordinary same-direction sparse motion,
+    /// substantial input, fast input, and a fresh >=500ms reversal do not match.
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, true, true, true, true, 1, 160.0, slowSpeedMax,
+        0.382, 0.300, 0.380, 0.500
+    ) == 0.0);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, 160.0, slowSpeedMax,
+        0.200, 0.300, 0.380, 0.500
+    ) == 0.0);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, false, true, 1, 160.0, slowSpeedMax,
+        0.382, 0.300, 0.380, 0.500
+    ) == 0.0);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 3, 160.0, slowSpeedMax,
+        0.382, 0.300, 0.380, 0.500
+    ) == 0.0);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, slowSpeedMax, slowSpeedMax,
+        0.382, 0.300, 0.380, 0.500
+    ) == 0.0);
+    assert(MFScrollStoppedPausedReversalOpeningCapBlend(
+        true, false, true, true, true, 1, 160.0, slowSpeedMax,
+        0.500, 0.300, 0.380, 0.500
+    ) == 0.0);
+}
+
+static void testStoppedUnestablishedReversalRegainsOpeningEnvelope(void) {
+    const double slowSpeedMax = 2250.0;
+
+    /// Captured at 14:33:23.782: a stopped one-unit reversal arrived after
+    /// 209ms with no cadence estimate known before the report. Its own pause
+    /// expanded the base to 156ms and opened at only 205px/s.
+    assert(MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.209, 0.200, 0.500
+    ));
+    assert(MFScrollStoppedSlowContinuationBaseDurationCap(
+        0.1560, 0.1329
+    ) == 0.1329);
+
+    /// Established cadence, live overlap, the accepted fully continuous
+    /// <=200ms window, same-direction input, and a fresh >=500ms reversal do
+    /// not enter this narrowly scoped opening cap.
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.180,
+        1, 160.0, slowSpeedMax, 0.254, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, true, true, true, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.209, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.200, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, false, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.209, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.0,
+        1, 160.0, slowSpeedMax, 0.500, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.0,
+        3, 160.0, slowSpeedMax, 0.209, 0.200, 0.500
+    ));
+    assert(!MFScrollShouldCapStoppedUnestablishedReversalOpening(
+        true, false, true, true, true, 0.0,
+        1, slowSpeedMax, slowSpeedMax, 0.209, 0.200, 0.500
     ));
 }
 
@@ -246,10 +468,12 @@ static void testSharpDecelerationTailCannotWeakenStoppedOrLaterRestart(void) {
     /// Captured 2026-08-11 paths dropped from roughly 1021 -> 70px/s and
     /// 897 -> 111px/s. Both are deceleration edges, not established slow cadence.
     const bool stoppedTail = MFScrollIsSharpDecelerationTailReport(
-        true, true, false, 1, 69.8, 1021.0, slowSpeedMax, sharpRatioMax
+        true, true, false, 1, 1, 1,
+        69.8, 1021.0, slowSpeedMax, sharpRatioMax
     );
     const bool liveTail = MFScrollIsSharpDecelerationTailReport(
-        true, true, false, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+        true, true, false, 1, 1, 1,
+        110.5, 897.0, slowSpeedMax, sharpRatioMax
     );
     assert(stoppedTail);
     assert(liveTail);
@@ -269,19 +493,45 @@ static void testSharpDecelerationTailCannotWeakenStoppedOrLaterRestart(void) {
         true, true, liveTailCanSeedCadence, 1, false, 0.7121, 0.500, 1.500
     ));
 
-    /// Gradual careful deceleration, a reversal, substantial input, or an
+    /// Captured 2026-08-16 recurrence: modeled speed fell only to about one
+    /// third, but point magnitude collapsed from an amplified 19 to the
+    /// one-point baseline. This tail must not seed the stopped reversal 323ms
+    /// later with slow cadence.
+    const bool pointCollapseTail = MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 1, 1, 19,
+        179.2, 552.4, slowSpeedMax, sharpRatioMax
+    );
+    assert(pointCollapseTail);
+    assert(!MFScrollReportCanSeedSlowCadence(
+        1, 179.2, slowSpeedMax, false, false, pointCollapseTail
+    ));
+
+    /// Gradual careful deceleration, a still-amplified falling point report,
+    /// an unchanged one-point report, a reversal, substantial input, or an
     /// unmeasured opening keeps the established policy.
     assert(!MFScrollIsSharpDecelerationTailReport(
-        true, true, false, 1, 300.0, 900.0, slowSpeedMax, sharpRatioMax
+        true, true, false, 1, 4, 5,
+        300.0, 900.0, slowSpeedMax, sharpRatioMax
     ));
     assert(!MFScrollIsSharpDecelerationTailReport(
-        true, true, true, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+        true, true, false, 1, 13, 15,
+        225.0, 624.5, slowSpeedMax, sharpRatioMax
     ));
     assert(!MFScrollIsSharpDecelerationTailReport(
-        true, true, false, 3, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+        true, true, false, 1, 1, 1,
+        300.0, 900.0, slowSpeedMax, sharpRatioMax
     ));
     assert(!MFScrollIsSharpDecelerationTailReport(
-        true, false, false, 1, 110.5, 897.0, slowSpeedMax, sharpRatioMax
+        true, true, true, 1, 1, 19,
+        179.2, 552.4, slowSpeedMax, sharpRatioMax
+    ));
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, true, false, 3, 1, 19,
+        179.2, 552.4, slowSpeedMax, sharpRatioMax
+    ));
+    assert(!MFScrollIsSharpDecelerationTailReport(
+        true, false, false, 1, 1, 19,
+        179.2, 552.4, slowSpeedMax, sharpRatioMax
     ));
     assert(MFScrollReportCanSeedSlowCadence(
         1, 300.0, slowSpeedMax, false, false, false
@@ -320,6 +570,10 @@ int main(void) {
     testWakeRampUsesResponsiveOpeningCap();
     testAcceleratingLowUnitRampOnlyCapsVelocityNotch();
     testStoppedCloseReversalContinuationKeepsOpeningEnvelope();
+    testStoppedMeasuredSlowContinuationRegainsOpeningEnvelope();
+    testStoppedRememberedSlowOpeningRegainsOpeningEnvelope();
+    testStoppedPausedReversalContinuouslyRegainsOpeningEnvelope();
+    testStoppedUnestablishedReversalRegainsOpeningEnvelope();
     testPostFastMultiUnitReportCannotBootstrapAStickyRestart();
     testSecondGenuineSparseReportStillUsesMeasuredCadence();
     testTailAndAccelerationReportsNeverSeedCadence();

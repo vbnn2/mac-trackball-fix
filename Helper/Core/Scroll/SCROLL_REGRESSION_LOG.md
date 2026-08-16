@@ -1638,6 +1638,416 @@ instantaneous deceleration below one quarter of the preceding modeled speed now 
 and cannot alone establish a later sparse continuation. The current report remains fully delivered, and one
 subsequent genuine slow report can establish history again, limiting that ambiguity to the captured transition edge.
 
+### 2026-08-15 — stopped 382ms reversal retained a weak partial cadence opening
+
+Symptom: an ordinary Browser scroll again felt slow to start. The bounded rolling recorder was no longer active, but
+the current unified log retained the complete candidate sequence from helper PID `1797`:
+
+- At `09:51:40.930`, a stopped one-unit opening used the accepted unknown-cadence response: `baseMs=80.0`,
+  `targetV=400.0`, and first output in `8.30 ms` with `1.76 ms` queued.
+- At `09:51:41.313`, a one-unit reversal arrived after `382.0 ms`, with the preceding animator stopped. It entered
+  `action=taper-reversal-cadence` with `reversalBlend=0.39`, retained the actual `382.0 ms` duration reference, and
+  selected `baseMs=173.8`, `durationMs=243.1`, and only `targetV=184.1`. First output was still timely at `9.51 ms`
+  with `2.88 ms` queued; direction cancellation processed the same tick and display start returned `result=0`.
+- The next physical report arrived `38 ms` later and immediately retargeted to `812.9 px/s`. Active output returned
+  to about `120 Hz`. There was no event-tap disable, display recovery/failure, rate limit, dropped carry, target
+  churn, or retained old-direction distance around the sequence.
+
+Confirmed root cause: the reversal taper correctly made cadence influence decay between the accepted `200 ms` close
+boundary and the `500 ms` gesture boundary, but response visibility was independent of that taper. When the old
+response had already stopped, a later partially blended reversal was visibly another opening while still spreading
+its `32 px` over `173.8 ms`. That made it less than half as fast as the immediately preceding ordinary opening. The
+previous sharp-deceleration fix is working: at `09:49:11.878`, a captured `0.117` speed ratio logged
+`action=cap-stopped-sharp-deceleration-tail`, followed by the qualified wake cap and an `80 ms`/`362.5 px/s`
+response. This report is a distinct paused direction-change path, not a regression of tail classification.
+
+Change (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/ScrollCadencePolicy.h`,
+`Helper/Core/Scroll/Scroll.m`, `Tests/ScrollCadencePolicyTests.c`):
+
+- Only a stopped, first analyzer report that is a small/slow direction change and already qualified for remembered
+  slow cadence can enter the new response cap. The accepted `292 ms` paused-reversal capture remains unchanged.
+- Beginning at `300 ms`, continuously blend the cadence-derived base toward the adaptive opening envelope; reach
+  full influence at `380 ms`, before the reported `382 ms` case. The exact replay reduces `173.8 ms` to about
+  `101.2 ms`, raising its requested velocity from `184` to about `316 px/s` without changing distance or cadence
+  classification. Telemetry records `action=cap-stopped-paused-reversal-opening` with both blends and durations.
+- A live animator, a close reversal, same-direction sparse input, input above two units, input outside the slow band,
+  or a reversal at/after the `500 ms` fresh-gesture boundary does not match. The transition between `300–380 ms` is
+  continuous rather than a report-count or timing discontinuity.
+
+Preserved behavior: the current reversal still cancels old-direction motion and is delivered immediately. Full
+cadence continuity through `200 ms`, the accepted `292 ms` response, live velocity-preserving retargets, ordinary
+established sparse motion, stale same-direction tapering, long-idle wake shaping, sharp/fast/settling-tail handling,
+raw-cadence acceleration, distance/rate/carry bounds, target isolation, zoom/effect paths, and display recovery are
+unchanged. No report is delayed, confirmed, discarded, replayed, or stored in a second reservoir.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` pass under `clang -Wall -Wextra -Werror`. Deterministic cases cover
+  the exact `382 ms` full cap, the unchanged `292 ms` boundary, a continuous `340 ms` midpoint, the
+  `173.8 -> 101.2 ms` base replay, and non-matches for live, close, same-direction, substantial, fast, and fresh
+  `>=500 ms` reversals. Existing wake, acceleration, cadence seed, sharp-tail, close-reversal continuation,
+  display-link lifecycle, and output-bound suites also pass.
+- `./dev.sh build` and `./dev.sh run` pass; the rebuilt Debug helper is deployed. The bounded `2,000`-event recorder
+  was restarted after deployment so future recurrences no longer depend on sparse unified-log persistence.
+- Deployed helper PID `17139` supplied adjacent physical coverage. Its Hik-Connect fresh opening at
+  `10:07:36.889` used `80 ms`/`400 px/s`, reached output in `17.01 ms` with `1.59 ms` queued, accelerated through a
+  qualified long-idle wake ramp without leaving the `80 ms` envelope, and sustained `120 Hz` output. A stopped
+  `591 ms` reversal at `10:07:37.772` correctly remained a fresh `80 ms`/`400 px/s` opening, cancelled the old
+  direction, and reached output in `7.66 ms` with `1.10 ms` queued. Display starts returned `result=0`; no tap,
+  recovery, rate-limit, or dropped-carry failure appeared.
+- The same deployed helper then physically exercised the new transition in Kitty. A stopped `331 ms` reversal at
+  `10:07:56.356` logged `openingCapBlend=0.39` and reduced `baseMs=167.2` to `144.9`; first output arrived in
+  `12.06 ms` with `5.53 ms` queued. A near-boundary `487 ms` reversal at `10:08:00.251` logged the full
+  `openingCapBlend=1.00`, reduced `94.6 ms` to `82.3 ms`, and requested `388.9 px/s`, with first output in
+  `13.01 ms` and `1.15 ms` queued. The accepted `254 ms` close reversal at `10:07:56.993` emitted no new cap action,
+  while `653 ms` and `850 ms` fresh reversals remained the normal `80 ms`/`400 px/s` response. Follow-up reports
+  retargeted immediately and active output returned to approximately `112–120 Hz`.
+
+Remaining verification/tradeoff: the new partial and full stopped-reversal cap actions, close non-match, fresh
+reversals, acceleration, and display-paced output are physically covered after deployment; the exact reported
+`382 ms` parameters remain deterministic replay. The broader cross-app, multi-display, horizontal, zoom/effect,
+content-boundary, rebound, and genuinely parked-display matrix remains manual. A deliberate stopped reversal late
+in the old partial-cadence window is now crisper, while close, live, and the previously accepted `292 ms` reversal
+preserve their established behavior. The bounded recorder remains active for recurrence monitoring.
+
+### 2026-08-15 — stopped same-direction slow continuations repeatedly reopened at maximum smoothing
+
+Symptom: shortly after deploying the paused-reversal fix above, an ordinary Kitty scroll again felt slow. The active
+bounded recorder captured the complete sequence from helper PID `17139`:
+
+- The opening at `15:03:49.985` was healthy: one unit used the accepted `80.0 ms` base and `400.0 px/s` target;
+  first output arrived in `14.38 ms` with `0.84 ms` queued. Several following reports accelerated and retargeted
+  live without a velocity notch.
+- At `15:03:51.137`, a same-direction one-unit report arrived after the preceding animation had stopped. It had a
+  measured `245.0 ms` analyzer cadence but maximum adaptive smoothing selected `baseMs=270.4`,
+  `durationMs=311.4`, and only `targetV=111.0`. First output was on time at `13.29 ms` with `1.68 ms` queued.
+- At `15:03:51.874`, the same path recurred: the animator was stopped, yet another same-direction one-unit report
+  selected `baseMs=270.4`, `durationMs=309.7`, and `targetV=107.2`. Output began in `8.13 ms` with `0.66 ms`
+  queued. A physical report `43 ms` later immediately entered raw-cadence acceleration and retargeted to
+  `282.4 px/s`, confirming that the weak interval was the stopped opening response rather than missing input.
+- The rolling window contains the same stopped approximately `270 ms` response at `14:02:18.441`,
+  `14:20:33.131`, `14:50:38.702`, `14:50:44.247`, and `14:50:44.565`, so this is a recurring path rather than the
+  earlier paused reversal. Active output around the reported sequence returned to approximately `112–120 Hz`.
+  There was no unexplained tap disable, display-link start/recovery failure, target churn, rate limiting, dropped
+  carry, or retained old-direction distance.
+
+Confirmed root cause: maximum slow smoothing is useful while sparse reports overlap a still-running response, but
+the same approximately `270 ms` base was also applied after that response had completely ended. At that point there
+was no motion left for the long duration to preserve across the preceding silence; it merely reopened the current
+approximately `29–30 px` report at roughly `107–111 px/s`. The queue, display link, target app, and paused-reversal
+policy were healthy.
+
+Change (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Tests/ScrollCadencePolicyTests.c`):
+
+- A measured, same-direction, non-opening report of at most two units in the adaptive slow band now uses the
+  adaptive opening-duration envelope only when the animator is already stopped. The exact captured replays cap
+  `270.4 ms` to approximately `132.9 ms`, raising the requested target to approximately `218–226 px/s` without
+  changing distance, cadence history, or delivery timing.
+- A live sparse response does not match, preserving the overlap that makes deliberate extremely slow scrolling
+  continuous. Analyzer openings, reversals, substantial/fast reports, and Apple-acceleration paths also do not
+  match. Existing long-idle wake, stopped sharp-tail, expired close-reversal, and expired fast-tail policies remain
+  authoritative and are excluded from this generic stopped-continuation action to avoid double shaping.
+- Telemetry records `action=cap-stopped-slow-continuation` with gap, unit count, modeled speed, opening cap, and both
+  base durations. No report is delayed, confirmed, discarded, replayed, or stored in another reservoir.
+
+Preserved behavior: first-report `80 ms` response, live velocity-preserving retargets, established sparse cadence
+while an animation is active, slow-to-fast raw-cadence acceleration, fast/settling/sharp-tail behavior, paused and
+close reversals, long-idle wake shaping, target/session resets, rate/carry/distance bounds, horizontal and zoom/effect
+paths, display generation/recovery, and direction cancellation are unchanged.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` pass. The cadence suite runs under
+  `clang -std=c11 -Wall -Wextra -Werror` and covers both captured stopped speeds, the exact
+  `270.4 -> 132.9 ms` cap, preservation of a base already below the cap, and non-matches for live motion, an analyzer
+  opening, reversal, substantial/fast input, unmeasured cadence, and disabled adaptive control. Existing idle-wake,
+  acceleration, paused/close reversal, cadence-seed, sharp-tail, display lifecycle, and output-bound cases pass.
+- `./dev.sh build` and `./dev.sh run` pass with existing unrelated warnings. The rebuilt Debug helper was deployed
+  through the normal app lifecycle; PID `19045` logged the expected config reset and user-input tap re-enable at
+  `15:08:45–46`. The current build includes both today's paused-reversal fix and this stopped-continuation fix.
+- The bounded `2,000`-event recorder remained active across deployment. Pre-change physical telemetry covers fresh
+  starts, live slow-to-fast motion, stopped same-direction continuations, a paused reversal, normal first-output
+  latency, and display-paced output; the changed stopped decision is covered by deterministic captured-parameter
+  replay.
+
+Remaining verification/tradeoff: a physical post-deployment occurrence should log the new action and confirm feel.
+The broader cross-app, multi-display, horizontal, zoom/effect, content-boundary, rebound, and parked-display matrix
+remains manual. A deliberately sparse report that arrives only after its prior response has fully ended is now
+crisper; genuinely overlapping sparse motion retains the accepted longer smoothing. The recorder remains active.
+
+### 2026-08-16 — stopped remembered cadence weakened same-direction analyzer openings
+
+Symptom: another ordinary slow start was reported after the stopped measured-continuation fix above. The active
+bounded recorder had captured two remaining same-direction cases on deployed helper PID `19045`:
+
+- At `23:01:58.286`, a one-unit report arrived after `711 ms`. ScrollAnalyzer correctly classified it as the first
+  report of a new gesture and the preceding animator was stopped, but slow-cadence memory retained a `371.8 ms`
+  duration reference with `memoryBlend=0.79`. The report selected `baseMs=245.7`, `durationMs=295.2`, and only
+  `targetV=130.3`. First output still arrived in `14.52 ms`; `6.02 ms` was input queue time.
+- At `23:03:26.347`, the same stopped path recurred after `616 ms`, reusing a `274.9 ms` duration reference with
+  `memoryBlend=0.88`. It selected `baseMs=196.9`, `durationMs=258.9`, and `targetV=162.5`; first output arrived in
+  `7.77 ms` with `0.81 ms` queued. A report `48 ms` later accelerated immediately, isolating the weak interval to
+  the response chosen for the opening rather than delayed or missing input.
+- The newest pre-change physical sequence at `00:01:52.385–00:01:54.124` did not reproduce the branch. Its fresh
+  Browser opening used `80 ms`/`400 px/s` and reached output in `6.72 ms` with `0.76 ms` queued; stopped wake and
+  expired-tail openings were bounded to `80–132.7 ms`, follow-up acceleration was immediate, active output returned
+  to approximately `112–120 Hz`, and display starts returned `result=0`. Across the current window there was no
+  unexplained tap disable, display-link start/recovery failure, rate limit, dropped carry, or target churn.
+
+Confirmed root cause: the preceding fix intentionally handled measured in-gesture continuations only. These two
+reports crossed ScrollAnalyzer's `500 ms` gesture boundary, so they had no current measured cadence and escaped that
+cap even though established cadence memory still lengthened their response. Since the preceding animation had
+already ended, the remembered duration could not preserve visual continuity across the silence; it only made the
+new physical opening weak. The correspondence to the subjective report is inferred, while the policy hole and both
+weak response shapes are directly confirmed by telemetry and captured-parameter replay.
+
+Change (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Tests/ScrollCadencePolicyTests.c`):
+
+- A same-direction first analyzer report now regains the adaptive opening-duration envelope only when slow-cadence
+  continuation has qualified, an established positive duration reference is actually being reused, the old animator
+  is stopped, the physical gap is at or beyond the analyzer boundary, and the report is at most two units within the
+  slow band. The exact captured replays cap `245.7 ms` and `196.9 ms` to approximately `132.9 ms`, raising both
+  approximately `32 px` responses to about `241 px/s` without changing their distance.
+- Cadence estimate and memory are retained for later reports; only this stopped visible opening's response base is
+  bounded. Telemetry records `action=cap-stopped-remembered-slow-opening` with gap, duration reference, unit count,
+  modeled speed, opening cap, and both base durations.
+- A live overlapping response, measured in-gesture continuation, direction change, unestablished cadence, gap below
+  the analyzer boundary, substantial/fast input, and disabled adaptive control do not match.
+
+Preserved behavior: no report is delayed, confirmed, discarded, replayed, or distance-scaled. First unknown-cadence
+openings, unestablished second sparse reports, genuinely overlapping sparse motion, measured stopped continuation,
+close and paused reversals, slow-to-fast raw-cadence acceleration, fast/settling/sharp-tail handling, long-idle wake
+shaping, target/session resets, rate/carry/distance bounds, horizontal and zoom/effect paths, display recovery, and
+direction cancellation retain their existing policies.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` pass. The cadence suite runs under
+  `clang -std=c11 -Wall -Wextra -Werror` and covers both exact `711 ms`/`371.8 ms` and `616 ms`/`274.9 ms` captured
+  decisions, the `245.7/196.9 -> 132.9 ms` caps, preservation of an already shorter base, and non-matches for live
+  motion, measured continuation, reversal, zero duration reference, substantial/fast input, and a sub-boundary gap.
+  Existing idle-wake, low-unit acceleration, stopped measured continuation, close/paused reversal, cadence-seed,
+  sharp-tail, display lifecycle, and output-bound suites pass.
+- `./dev.sh build` and `./dev.sh run` pass with existing unrelated warnings. The rebuilt Debug helper was deployed
+  through the normal app lifecycle; helper PID `41765` logged the expected config reset and user-input tap re-enable
+  at `00:06:03–04`. The bounded `2,000`-event recorder remains active across deployment.
+- Pre-change physical telemetry supplies adjacent coverage for fresh starts, stopped wake continuation, slow-to-fast
+  acceleration, fast-to-slow tail handling, direction changes, Browser and Kitty targets, successful display starts,
+  and display-paced output. The changed stopped remembered-opening decision is covered by deterministic replay of
+  the captured parameters.
+
+Remaining verification/tradeoff: the next physical occurrence should log the new action and confirm subjective feel;
+the exact action has not yet recurred after deployment. The broader cross-app, multi-display, horizontal,
+zoom/effect, content-boundary, rebound, and genuinely parked-display matrix remains manual. An established sparse
+stream whose reports arrive only after the prior response has fully stopped will now visibly reopen more crisply at
+an analyzer boundary, while live overlap and the retained cadence state preserve the accepted continuity behavior.
+
+### 2026-08-16 — rising amplified point magnitude escaped the opening velocity-notch guard
+
+Symptom: after deploying the stopped remembered-opening cap, another ordinary Browser start felt slow. The current
+bounded recorder on helper PID `41765` shows the new stopped policies working, but captured one remaining live
+opening notch:
+
+- At `12:52:42.895`, a fresh one-unit/one-point Browser opening used the accepted `baseMs=80.0` and
+  `targetV=400.0`; first output arrived in `14.47 ms` with `0.77 ms` queued and display start returned `result=0`.
+- At `12:52:42.953`, its first measured one-unit report carried six points. The existing amplified-low-unit guard
+  prevented deceleration and selected `baseMs=129.8`, keeping the live response at about `402 px/s`.
+- At `12:52:43.041`, the next report still carried one line unit but its point magnitude rose from `6` to `14`,
+  evidence that the physical/macOS acceleration ramp was continuing. Its packet gap was longer, however, so the
+  line-derived modeled speed fell and the old guard did not match. Maximum slow smoothing selected `baseMs=252.3`
+  and retargeted live motion from `342.3` down to `227.5 px/s`. Output callbacks remained approximately `120 Hz`;
+  there was no tap, display-link, target, rate-limit, or dropped-carry failure.
+- The newest pre-change sequence at `12:53:35.889` was healthy rather than another policy failure: it opened at
+  `80 ms`/`400 px/s`, its `20 ms` amplified follow-up used the qualified long-idle cap and requested `830 px/s`,
+  active output ran at `120 Hz`, and first output arrived in `17.38 ms` with `5.90 ms` queued. The correspondence
+  between the subjective report and the `12:52:43.041` notch is inferred; the notch itself is directly captured.
+
+Confirmed root cause: `MFScrollShouldCapAcceleratingLowUnitRamp` required rising line-derived modeled speed even
+though point amplification was already used as independent binary evidence of a hardware acceleration ramp. A
+longer packet interval could therefore make modeled speed fall while point magnitude continued rising, allowing the
+duration curve to request a large live deceleration during the opening.
+
+Change (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Tests/ScrollCadencePolicyTests.c`):
+
+- The existing guard now qualifies when either modeled speed rises or the current amplified point magnitude rises
+  over the immediately preceding handled report. It still requires measured input of at most two line units, point
+  amplification above twice the line count, modeled speed inside the slow band, a live animator, and a requested
+  target below current velocity.
+- Point magnitude remains a binary response-shape signal only. It does not scale modeled speed, distance, carry, or
+  rate limits. The exact captured `14 > 6` replay now applies the existing adaptive opening envelope instead of the
+  `252.3 ms` base.
+- Session resets clear the previous point magnitude, and an early bounded settling micro-glide clears it before
+  returning. A flat or falling point magnitude with falling modeled speed remains ordinary deceleration; the nearby
+  captured `15 -> 13` falling-point case is an explicit deterministic non-match.
+- Telemetry retains `action=cap-accelerating-low-unit-ramp` and now records `previousPointPx` so the two acceleration
+  signals can be distinguished in later captures.
+
+Preserved behavior: first-report timing and distance, genuine falling-magnitude deceleration, reports without point
+amplification, already-accelerating retargets, substantial/fast input, measured/stale sparse cadence, stopped
+continuation and remembered-opening caps, close/paused reversals, long-idle wake shaping, fast/settling/sharp-tail
+handling, target/session resets, distance/rate/carry bounds, horizontal and zoom/effect paths, display recovery, and
+direction cancellation are unchanged. No report is delayed, confirmed, discarded, replayed, or amplified.
+
+Verification:
+
+- `git diff --check` and `./dev.sh scroll-tests` pass. Deterministic coverage includes the exact rising-point /
+  falling-model decision, the existing rising-model decision, a falling-point/falling-model non-match, a genuine
+  one-point careful report, an already-accelerating target, substantial input, and the slow-band boundary. Existing
+  stopped measured/remembered openings, wake, reversal, cadence-seed, sharp-tail, display lifecycle, and output-bound
+  suites pass under `clang -Wall -Wextra -Werror`.
+- `./dev.sh build` and `./dev.sh run` pass. The rebuilt Debug helper was deployed through the normal lifecycle as
+  PID `12093`, which logged the expected config reset and tap re-enable.
+- The first post-deployment Browser pass at `12:57:56.476` used `80 ms`/`400 px/s` and reached output in `10.36 ms`
+  with `0.70 ms` queued. Its amplified one-unit follow-up logged `pointPx=9 previousPointPx=1`, applied the existing
+  cap, and requested `506.3 px/s`; subsequent substantial reports accelerated immediately, active output ran at
+  approximately `116–120 Hz`, display starts returned `result=0`, and a live reversal cancelled the old session and
+  delivered its `80 ms`/`400 px/s` opening in `12.03 ms` with `1.32 ms` queued.
+
+Remaining verification/tradeoff: the exact rising-point/falling-model action is captured-parameter replayed but has
+not yet physically recurred on PID `12093`. The broader cross-app, multi-display, horizontal, zoom/effect,
+content-boundary, rebound, and parked-display matrix remains manual. A point-amplified low-unit report whose point
+magnitude rises while packet cadence slows now retains the opening envelope instead of decelerating live motion;
+flat/falling point magnitude still permits the accepted smooth deceleration path.
+
+### 2026-08-16 — unestablished stopped reversal used its own pause as a weak opening
+
+Symptom: another Browser scroll start felt slow after the rising-point ramp fix. The newest bounded telemetry on
+helper PID `12093` captured a different stopped reversal path immediately before the report:
+
+- At `14:33:23.572`, a one-unit negative opening used the accepted unknown-cadence response: `baseMs=80.0`,
+  `targetV=400.0`, and first output in `7.15 ms` with `0.75 ms` queued. Display-link start returned `result=0`.
+- At `14:33:23.781`, a one-unit reversal arrived after `209.0 ms`, just beyond the full close-reversal cadence
+  boundary. The preceding response had stopped and no cadence estimate existed before this report
+  (`priorEstimateMs=0.0`), but reversal handling promoted the current cross-direction gap to
+  `durationRefMs=209.0`. With `reversalBlend=0.97`, that selected `baseMs=156.0` and only `targetV=205.2`, about
+  half the ordinary opening velocity. First output was still timely at `6.66 ms` with `0.67 ms` queued, direction
+  cancellation kept the current report, and display start again returned `result=0`.
+- The amplified report `48 ms` later immediately used the qualified idle-wake cap and requested `747.7 px/s`,
+  isolating the weak interval to the stopped reversal's response envelope. Subsequent substantial input accelerated
+  normally and active output returned to approximately `120 Hz`.
+
+Confirmed root cause: the reversal duration policy intentionally permits the current bounded cross-direction gap
+to establish cadence when no prior estimate exists. That preserves useful close-reversal continuity while motion is
+still visible, but the new capture shows a failure just outside the fully continuous `200 ms` window: when the old
+response is already stopped, the report's own silence cannot bridge visible motion and only weakens a new opening.
+The correspondence between the subjective report and this immediately preceding sequence is inferred; the weak
+response shape and healthy delivery/display path are directly captured. This is not a recurrence of the live
+point-ramp notch.
+
+Change (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Tests/ScrollCadencePolicyTests.c`):
+
+- A stopped, first analyzer report now regains the adaptive opening envelope only when it is a small/slow reversal,
+  slow-cadence continuation qualified, no positive cadence estimate existed before this report, and its gap lies
+  strictly after the accepted `200 ms` full-continuity boundary but before the `500 ms` fresh-gesture boundary.
+  Captured-parameter replay caps `156.0 ms` to about `132.9 ms` and raises the unchanged `32 px` response from
+  approximately `205` to `241 px/s`.
+- The cadence classification and newly measured cross-direction estimate remain available to following reports;
+  only this stopped visible opening is bounded. Telemetry records
+  `action=cap-stopped-unestablished-reversal-opening` with prior estimate, reversal blend, and both base durations.
+- A cadence estimate known before the reversal remains authoritative, preserving the accepted established `254 ms`
+  case. Live overlap, the accepted `<=200 ms` close window, same-direction input, substantial/fast input, and a
+  fresh `>=500 ms` reversal do not match. The more general `300–380 ms` stopped paused-reversal blend remains the
+  fallback for established cadence and is excluded when this more specific unestablished action applies.
+
+Preserved behavior: the reversal is delivered immediately and still cancels old-direction motion. Established
+sparse cadence, live close reversals, first-report `80 ms` openings, measured and remembered stopped-continuation
+caps, slow-to-fast raw-cadence acceleration, long-idle wake shaping, live low-unit ramp protection,
+fast/settling/sharp-tail behavior, distance/rate/carry bounds, target/session resets, horizontal and zoom/effect
+paths, and display recovery are unchanged. No report is delayed, confirmed, discarded, replayed, or distance-scaled.
+
+Verification:
+
+- `git diff --check`, `./dev.sh scroll-tests`, and `./dev.sh build` pass. Deterministic coverage replays the exact
+  `209 ms`, zero-prior decision and `156.0 -> 132.9 ms` cap, plus non-matches for live motion, established cadence,
+  the exact `200 ms` boundary, same-direction input, substantial/fast input, and a `500 ms` fresh reversal. Existing
+  wake, low-unit acceleration, stopped measured/remembered opening, close/paused reversal, cadence-seed,
+  sharp-tail, display lifecycle, and output-bound suites pass under `clang -Wall -Wextra -Werror`.
+- Across the current `14:30–14:36` physical window, `62` first-output records measured `6.14–21.58 ms` total and
+  `0.44–8.61 ms` queued. `118` active output windows ran at `101.3–120.5 Hz`. Browser and Readdown supplied fresh
+  starts, slow-to-fast and fast-to-slow motion, both directions, live and stopped reversals, stopped slow
+  continuation, fast-tail settling, target reset, and successful display `4` starts. No unexplained tap disable,
+  display start/recovery failure, or retained cancelled-direction distance accompanied the affected path; bounded
+  carry drops occurred only during captured very-high-speed input.
+- `./dev.sh run` rebuilt and deployed the fix through the normal app lifecycle. Helper PIDs `46825` and then
+  `46865` logged the expected config reset and user-input tap re-enable. The `2,000`-event recorder remains active.
+
+Remaining verification/tradeoff: the changed action is exact-policy replayed but has not yet physically recurred on
+PID `46865`; the broader cross-app, multi-display, horizontal, zoom/effect, content-boundary, rebound, and parked-
+display matrix remains manual. A stopped unestablished reversal in the `200–500 ms` interval is intentionally
+crisper, while an established sparse reversal or visually continuous `<=200 ms` reversal retains its accepted
+cadence response.
+
+## 2026-08-16: point-collapse fast tail must not seed a weak paused reversal
+
+Symptom: the user reported another slow scroll start after the stopped unestablished-reversal opening fix was
+deployed. The most recent start at `14:55:37.783` was healthy (`6.54 ms` to first output, then an amplified
+one-unit report accelerated from `363` to `792 px/s`), so the report was correlated with the only adjacent weak
+stopped opening rather than attributed to the queue or display link.
+
+Evidence and root cause (helper PID `46865`):
+
+- At `14:53:39.505`, a one-unit opening used the normal `80 ms` base and `400 px/s` target. Point magnitude then
+  rose `1 -> 7 -> 19` at `14:53:39.559–39.626` and accelerated normally.
+- At `14:53:39.805`, the physical report fell from `19` points to the one-point baseline. Modeled speed fell from
+  about `552` to `179 px/s`, but its ratio of about `0.32` remained just above the existing `0.25` sharp-tail
+  threshold. The report was consequently eligible to seed slow cadence despite being the terminal edge of the
+  amplified ramp.
+- At `14:53:40.128`, a stopped one-unit reversal after `323 ms` consumed that seed and opened at only about
+  `288 px/s` instead of the normal `400 px/s`. This is the inferred correspondence to the report; the earlier
+  `209 ms` unestablished-reversal action did not recur because this path incorrectly appeared established.
+- First-output time was `11.10 ms`, including `0.42 ms` queued, and display-link start succeeded. No tap disable,
+  stale callback, retained cancelled-direction distance, or hardware/target failure accompanied the event.
+
+Change (`Helper/Core/Scroll/ScrollCadencePolicy.h`, `Helper/Core/Scroll/Scroll.m`,
+`Tests/ScrollCadencePolicyTests.c`):
+
+- The existing sharp-deceleration-tail classifier now also accepts captured point collapse as independent tail
+  evidence: a measured, same-direction, one-unit slow report at or below the two-point baseline following a point
+  magnitude above that baseline, with both point and modeled speed falling. This covers the captured `19 -> 1`,
+  `179 / 552` path even though analyzer smoothing leaves the modeled-speed ratio above `0.25`.
+- The current report remains fully delivered and retains its existing live tail response. Classification only
+  prevents this terminal report from seeding remembered slow cadence for a later stopped continuation/reversal.
+  Telemetry records point magnitudes and modeled-speed ratio with
+  `action=classify-sharp-deceleration-tail`.
+
+Preserved behavior: gradual careful deceleration, a still-amplified falling `15 -> 13` point report, unchanged
+one-point sparse input, direction reversal, multi-unit or fast input, and unmeasured openings do not enter the new
+branch. Genuine sparse cadence can still be established by following reports. Current-report distance, live
+retargeting, slow-to-fast acceleration, fast-tail settling, reversal cancellation, long-idle wake behavior,
+low-unit ramp protection, distance/rate/carry bounds, target/session resets, horizontal and zoom/effect paths, and
+display recovery are unchanged. The rejected timer/quarantine/confirmation approaches remain rejected; no input
+is delayed, discarded, replayed, or distance-scaled. The known short rebound/micro-reversal tradeoff is unchanged.
+
+Verification:
+
+- `git diff --check`, `./dev.sh scroll-tests`, and `./dev.sh build` pass. Deterministic coverage replays the exact
+  `19 -> 1`, approximately `0.32` modeled-speed-ratio case and verifies it cannot seed cadence. Adjacent negative
+  cases cover gradual `5 -> 4` decay, still-amplified `15 -> 13` decay, unchanged `1 -> 1`, reversal, larger input,
+  and unmeasured openings. Existing cadence, wake, reversal, tail, display-lifecycle, and output-policy suites pass
+  under `clang -Wall -Wextra -Werror`.
+- `./dev.sh run` rebuilt and deployed the fix through the normal app lifecycle. Helper PID `54766` logged config
+  reset and user-input tap re-enable. On the live path at `14:59:36.390`, the new branch physically classified
+  `18 -> 1` points with modeled speed `550.8 -> 140.8 px/s` and ratio `0.256`, just outside the old cutoff, while
+  delivering the report normally.
+- At `14:59:38.059`, a later `85 -> 1` terminal report was classified. Its next stopped reversal at
+  `14:59:39.300–39.308` logged `previousSeed=0`, used the normal `80 ms` base and `400 px/s` target, and reached its
+  first output in `12.11 ms` with `4.51 ms` queued. The next `1 -> 9` report immediately accelerated the target to
+  `490 px/s`. An adjacent established reversal at `14:59:37.461–37.475` also retained its normal `400 px/s`
+  opening and `13.98 ms` first-output time.
+- In the captured post-deploy window, `25` first-output records measured `6.13–14.25 ms` (mean `11.05 ms`), and
+  `47` steady output windows at or above `100 Hz` measured `100.6–120.5 Hz` (mean `117.3 Hz`). No error, fault,
+  unexplained tap disable, or display stall/timeout was present.
+
+Remaining verification/tradeoff: the exact inferred pre-fix sequence and the new point-collapse decision are both
+replayed, and the latter physically recurred with the desired subsequent restart. The broader cross-app,
+multi-display, horizontal, zoom/effect, content-boundary, rebound, and parked-display matrix remains manual. A
+genuine transition from an amplified one-unit ramp directly to intentional one-point sparse cadence now requires
+the next report to establish that cadence; the terminal one-point report itself is still visible immediately.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:
