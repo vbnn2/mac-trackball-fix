@@ -510,12 +510,6 @@ import Cocoa
     /// sparse input keeps the existing full-cadence range through that boundary.
     @objc let stableSlowCadenceReversalFullBlendMaxInterval: TimeInterval = 200.0 / 1000.0
 
-    /// A stopped reversal captured at 292ms retained the accepted paused-reversal response, while the reported
-    /// 382ms case restarted at only 184px/s. Preserve the former, then continuously introduce the adaptive opening
-    /// cap from 300ms until it is fully active at 380ms. Live and close reversals keep cadence continuity unchanged.
-    @objc let stableStoppedPausedReversalCapBlendStartInterval: TimeInterval = 300.0 / 1000.0
-    @objc let stableStoppedPausedReversalCapFullInterval: TimeInterval = 380.0 / 1000.0
-
     /// Keep the first report bounded even though the sustained speed ceiling is intentionally high. The first report
     /// has no measured duration, so applying the full pixels/second ceiling to an assumed interval would create a
     /// large initial lurch.

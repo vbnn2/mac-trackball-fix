@@ -2048,6 +2048,48 @@ multi-display, horizontal, zoom/effect, content-boundary, rebound, and parked-di
 genuine transition from an amplified one-unit ramp directly to intentional one-point sparse cadence now requires
 the next report to establish that cadence; the terminal one-point report itself is still visible immediately.
 
+### 2026-08-17 — collapsed six scattered stopped-opening caps into one invariant
+
+Symptom: slow starts kept recurring despite a month of targeted fixes. Each prior fix closed one classification
+path while a different combination slipped through, because the underlying invariant was only encoded piecemeal.
+
+Evidence/root cause (structural): the engine carried six near-identical `cap-stopped-*` duration caps, all guarding
+the same shape — a small/slow report arriving when the animator was already stopped — through different flag
+combinations (measured vs remembered cadence, first-gesture vs continuation, reversal vs same-direction, sharp vs
+close-reversal tail). Slow-smoothing duration inflation only exists to overlap live motion; once the animator has
+stopped there is nothing left to overlap, so every such report is a fresh visible opening and must not be spread
+across the maximum slow base. The scattered guards were the union of that one rule, and new report combinations
+kept escaping between them.
+
+Change:
+
+- `ScrollCadencePolicy.h`: replace `MFScrollShouldCapStoppedCloseReversalContinuation`,
+  `MFScrollShouldCapStoppedSlowContinuation`, `MFScrollShouldCapStoppedRememberedSlowOpening`,
+  `MFScrollShouldCapStoppedUnestablishedReversalOpening`, `MFScrollStoppedPausedReversalOpeningCapBlend`, and the
+  stopped sharp-tail cap with a single `MFScrollShouldCapStoppedSlowOpening` predicate plus
+  `MFScrollStoppedSlowOpeningBaseDurationCap`. `MFScrollIsSharpDecelerationTailReport` and the cadence-seeding
+  rules are unchanged.
+- `Scroll.m`: compute `stableStoppedSlowOpeningForTick` once, after the adaptive blend is finalized, and apply a
+  single cap to `effectiveOpeningDurationCap`. Remove the six application blocks, the close-reversal continuation
+  marker, and the 300–380 ms paused-reversal blend.
+- `ScrollConfig.swift`: remove the now-unused `stableStoppedPausedReversalCapBlendStartInterval` /
+  `stableStoppedPausedReversalCapFullInterval`.
+- `Tests/ScrollCadencePolicyTests.c`: collapse five scenario tests into one unified suite.
+
+Preserved behavior: live overlapping sparse motion keeps full slow smoothing; the first unknown-cadence report
+keeps the 80 ms bounded start; idle-wake, fast-tail/expired-tail, and the live velocity-notch guard are excluded
+via `tailPolicyActive`. No report is delayed, confirmed, discarded, or replayed.
+
+Verification: `./dev.sh scroll-tests` (ScrollCadence, DisplayLinkLifecycle, OutputPolicy all PASS),
+`./dev.sh build` (BUILD SUCCEEDED, existing unrelated warnings only), and `git diff --check` passed.
+
+Remaining tradeoff: the previously accepted 292 ms stopped paused reversal (kept full cadence under the old
+300–380 ms blend) now restarts crisply at the adaptive opening envelope. This matches the ledger's own repeated
+conclusion that a stopped report has no motion to preserve, and is the one intentional behavior change. The full
+physical matrix (fresh start, extremely slow motion, slow-to-fast, fast-to-slow, stop/rebound, close and paused
+reversals, app/window switch, multi-display, horizontal/zoom/effect paths, and a parked display) remains manual on
+a live helper; the rolling recorder should be sampled for the new single `cap-stopped-slow-opening` record.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:

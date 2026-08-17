@@ -101,191 +101,40 @@ static inline bool MFScrollShouldCapAcceleratingLowUnitRamp(
         && requestedTargetSpeed < animatorSpeed;
 }
 
-/// A close slow reversal deliberately keeps cadence continuity on its first
-/// opposite-direction report. If that bounded response finishes before the
-/// immediately following small same-direction report arrives, allowing maximum
-/// slow smoothing to restart from rest can make the continuation markedly weaker
-/// than the reversal that opened it. Reuse the adaptive opening cap for that one
-/// stopped continuation only. Live retargets and established sparse motion keep
-/// their ordinary cadence response.
-static inline bool MFScrollShouldCapStoppedCloseReversalContinuation(
+/// Slow-smoothing duration inflation exists only to overlap live motion across sparse
+/// reports. Once the animator has stopped there is no motion left to preserve, so a small
+/// slow report is a fresh visible opening and must stay inside the adaptive opening
+/// envelope. This single rule replaces the previously scattered per-scenario stopped caps
+/// (measured or remembered continuation, paused or unestablished reversal, sharp or
+/// close-reversal tail): each was only a different classification path into the same
+/// "stopped + small + slow" shape, and new report combinations kept slipping through.
+/// Idle-wake, fast-tail, and expired-tail responses have their own tighter or separate
+/// bounds and stay outside this rule via `tailPolicyActive`.
+static inline bool MFScrollShouldCapStoppedSlowOpening(
     bool overloadControlEnabled,
-    bool previousCloseReversalResponseExpired,
-    bool firstConsecutive,
-    bool directionChanged,
+    bool animatorRunning,
+    bool slowSmoothingActive,
+    bool tailPolicyActive,
     int64_t units,
     double modeledOutputSpeed,
     double slowCadenceSpeedMax
 ) {
     return overloadControlEnabled
-        && previousCloseReversalResponseExpired
-        && !firstConsecutive
-        && !directionChanged
+        && !animatorRunning
+        && slowSmoothingActive
+        && !tailPolicyActive
         && units <= 2
         && modeledOutputSpeed > 0.0
         && modeledOutputSpeed < slowCadenceSpeedMax;
 }
 
-static inline double MFScrollStoppedCloseReversalBaseDurationCap(
+static inline double MFScrollStoppedSlowOpeningBaseDurationCap(
     double baseDuration,
     double adaptiveOpeningCap
 ) {
     return baseDuration < adaptiveOpeningCap
         ? baseDuration
         : adaptiveOpeningCap;
-}
-
-/// Maximum slow smoothing helps only while repeated reports overlap an active response.
-/// Once that response has already stopped, a measured one- or two-unit continuation is
-/// visibly another opening; spreading it across the full slow base makes the restart
-/// weak without preserving any motion across the preceding silence. Reuse the adaptive
-/// opening envelope for that stopped continuation. Live sparse motion remains unchanged.
-static inline bool MFScrollShouldCapStoppedSlowContinuation(
-    bool overloadControlEnabled,
-    bool hasMeasuredInterval,
-    bool animatorRunning,
-    bool firstConsecutive,
-    bool directionChanged,
-    int64_t units,
-    double modeledOutputSpeed,
-    double slowCadenceSpeedMax
-) {
-    return overloadControlEnabled
-        && hasMeasuredInterval
-        && !animatorRunning
-        && !firstConsecutive
-        && !directionChanged
-        && units <= 2
-        && modeledOutputSpeed > 0.0
-        && modeledOutputSpeed < slowCadenceSpeedMax;
-}
-
-static inline double MFScrollStoppedSlowContinuationBaseDurationCap(
-    double baseDuration,
-    double adaptiveOpeningCap
-) {
-    return baseDuration < adaptiveOpeningCap
-        ? baseDuration
-        : adaptiveOpeningCap;
-}
-
-/// An analyzer timeout can label a same-direction sparse report as a new gesture while
-/// cadence memory still supplies a long response base. If the remembered response has
-/// already stopped, that cadence can no longer bridge the silence; retain the cadence
-/// estimate for later reports but bound this visible opening to the adaptive envelope.
-/// Require an established duration reference so an unestablished second sparse report
-/// keeps the separately accepted measured-response behavior.
-static inline bool MFScrollShouldCapStoppedRememberedSlowOpening(
-    bool overloadControlEnabled,
-    bool animatorRunning,
-    bool firstConsecutive,
-    bool directionChanged,
-    bool slowCadenceContinuation,
-    double slowCadenceDurationReference,
-    int64_t units,
-    double modeledOutputSpeed,
-    double slowCadenceSpeedMax,
-    double physicalInputGap,
-    double gestureBoundary
-) {
-    return overloadControlEnabled
-        && !animatorRunning
-        && firstConsecutive
-        && !directionChanged
-        && slowCadenceContinuation
-        && slowCadenceDurationReference > 0.0
-        && units <= 2
-        && modeledOutputSpeed > 0.0
-        && modeledOutputSpeed < slowCadenceSpeedMax
-        && physicalInputGap >= gestureBoundary;
-}
-
-/// A reversal just beyond the fully continuous close-reversal window can be
-/// mistaken for established sparse cadence even when no cadence estimate
-/// existed before this report. If the old response has already stopped, using
-/// that report's own cross-direction silence weakens a visible opening without
-/// preserving any motion across the gap. Bound only this unestablished stopped
-/// opening; established and live close reversals retain cadence continuity.
-static inline bool MFScrollShouldCapStoppedUnestablishedReversalOpening(
-    bool overloadControlEnabled,
-    bool animatorRunning,
-    bool firstConsecutive,
-    bool directionChanged,
-    bool slowCadenceContinuation,
-    double priorCadenceEstimate,
-    int64_t units,
-    double modeledOutputSpeed,
-    double slowCadenceSpeedMax,
-    double physicalInputGap,
-    double closeReversalFullBlendInterval,
-    double gestureBoundary
-) {
-    return overloadControlEnabled
-        && !animatorRunning
-        && firstConsecutive
-        && directionChanged
-        && slowCadenceContinuation
-        && priorCadenceEstimate <= 0.0
-        && units <= 2
-        && modeledOutputSpeed > 0.0
-        && modeledOutputSpeed < slowCadenceSpeedMax
-        && physicalInputGap > closeReversalFullBlendInterval
-        && physicalInputGap < gestureBoundary;
-}
-
-/// A paused reversal whose preceding response has already stopped is visually a new
-/// opening, even though retaining some cross-direction cadence remains useful. Preserve
-/// the accepted response through `capBlendStartInterval`, then continuously introduce
-/// the adaptive opening cap until it is fully applied at `capFullInterval`. Close and
-/// live reversals retain their existing continuity.
-static inline double MFScrollStoppedPausedReversalOpeningCapBlend(
-    bool overloadControlEnabled,
-    bool animatorRunning,
-    bool firstConsecutive,
-    bool directionChanged,
-    bool slowCadenceContinuation,
-    int64_t units,
-    double modeledOutputSpeed,
-    double slowCadenceSpeedMax,
-    double physicalInputGap,
-    double capBlendStartInterval,
-    double capFullInterval,
-    double gestureBoundary
-) {
-    if (!overloadControlEnabled
-        || animatorRunning
-        || !firstConsecutive
-        || !directionChanged
-        || !slowCadenceContinuation
-        || units > 2
-        || modeledOutputSpeed <= 0.0
-        || modeledOutputSpeed >= slowCadenceSpeedMax
-        || physicalInputGap <= capBlendStartInterval
-        || physicalInputGap >= gestureBoundary
-        || capFullInterval <= capBlendStartInterval) {
-        return 0.0;
-    }
-
-    if (physicalInputGap >= capFullInterval) {
-        return 1.0;
-    }
-    return (physicalInputGap - capBlendStartInterval)
-        / (capFullInterval - capBlendStartInterval);
-}
-
-static inline double MFScrollStoppedPausedReversalBaseDuration(
-    double baseDuration,
-    double adaptiveOpeningCap,
-    double openingCapBlend
-) {
-    double boundedBlend = openingCapBlend;
-    if (boundedBlend < 0.0) boundedBlend = 0.0;
-    if (boundedBlend > 1.0) boundedBlend = 1.0;
-    const double cappedBaseDuration = baseDuration < adaptiveOpeningCap
-        ? baseDuration
-        : adaptiveOpeningCap;
-    return baseDuration
-        + boundedBlend * (cappedBaseDuration - baseDuration);
 }
 
 /// A one- or two-unit report can be the abrupt deceleration edge of faster motion rather
@@ -294,8 +143,8 @@ static inline double MFScrollStoppedPausedReversalBaseDuration(
 /// A collapse from amplified point magnitude back to the low-unit baseline is independent
 /// evidence of the same tail edge when smoothing leaves the modeled ratio just above that
 /// conservative threshold. The current report is always delivered; this classification
-/// controls only its response envelope when motion has stopped and whether it may seed a
-/// later sparse restart.
+/// controls only whether it may seed a later sparse restart. Its stopped response envelope
+/// is handled by the unified `MFScrollShouldCapStoppedSlowOpening` rule.
 static inline bool MFScrollIsSharpDecelerationTailReport(
     bool overloadControlEnabled,
     bool hasMeasuredInterval,
@@ -326,22 +175,6 @@ static inline bool MFScrollIsSharpDecelerationTailReport(
         && modeledOutputSpeed < slowCadenceSpeedMax
         && previousModeledOutputSpeed > 0.0
         && (modeledSpeedDroppedSharply || amplifiedPointMagnitudeCollapsed);
-}
-
-static inline bool MFScrollShouldCapStoppedSharpDecelerationTail(
-    bool isSharpDecelerationTailReport,
-    bool animatorRunning
-) {
-    return isSharpDecelerationTailReport && !animatorRunning;
-}
-
-static inline double MFScrollStoppedSharpDecelerationBaseDurationCap(
-    double baseDuration,
-    double adaptiveOpeningCap
-) {
-    return baseDuration < adaptiveOpeningCap
-        ? baseDuration
-        : adaptiveOpeningCap;
 }
 
 /// A report may seed sparse-cadence continuity only when the report itself looked like
