@@ -7,6 +7,11 @@ Command-[ menu command is enabled invokes that shortcut, while invoking Back whe
 Accessibility menu hierarchy, matching either the shortcut character or its virtual key instead of the localized menu title. If Accessibility inspection
 fails or the shortcut cannot be found, the previous routing is preserved and the tab is not closed.
 
+[Sep 2026] Arc's sidebar is an exception to that history-boundary behavior. Arc uses native mouse buttons 4/5 over the sidebar to move to the previous/next
+Space or profile. Before preflighting Back, Mac Mouse Fix now hit-tests the pointer through Accessibility and only applies Command-[ / Command-W when the
+element is inside an `AXWebArea`. Pointer hits in Arc's native application hierarchy keep mouse-button routing; failed or inconclusive hit tests also keep
+mouse-button routing so an Accessibility failure cannot unexpectedly close a tab. Safari and Chrome routing is unchanged.
+
 [Aug 2025] The 'Back' and 'Forward' Actions in MMF simulate navigationSwipes. However, this doesn't work in all apps. (Most notably VSCode)
     So for 3.0.6, we're trying to do a hotfix to improve compatibility
 

@@ -31,6 +31,70 @@ typedef NS_ENUM(NSInteger, MFMenuCommandState) {
     MFMenuCommandStateEnabled,
 };
 
+typedef NS_ENUM(NSInteger, MFArcPointerRegion) {
+    MFArcPointerRegionUnknown,
+    MFArcPointerRegionChrome,
+    MFArcPointerRegionWebContent,
+};
+
+/// Arc gives mouse buttons 4/5 special meaning over its sidebar (switching
+/// Spaces/profiles), so its browser-history fallback must only run over the
+/// actual web page. Walk upward from the element under the pointer: Chromium
+/// exposes page contents beneath an AXWebArea, while Arc's sidebar stays in
+/// the native application hierarchy.
+///
+/// Unknown deliberately falls back to Arc's native mouse-button handling. A
+/// failed AX lookup must never make a sidebar Back action close the tab.
+static MFArcPointerRegion MFArcPointerRegionAtPoint(pid_t pid, CGPoint point) {
+    AXUIElementRef systemWideElement = AXUIElementCreateSystemWide();
+    if (systemWideElement == NULL) return MFArcPointerRegionUnknown;
+
+    AXUIElementRef element = NULL;
+    AXError hitTestError = AXUIElementCopyElementAtPosition(systemWideElement, point.x, point.y, &element);
+    CFRelease(systemWideElement);
+    if (hitTestError != kAXErrorSuccess || element == NULL) {
+        if (element != NULL) CFRelease(element);
+        return MFArcPointerRegionUnknown;
+    }
+
+    for (NSUInteger depth = 0; depth < 32; depth++) {
+        pid_t elementPID = -1;
+        if (AXUIElementGetPid(element, &elementPID) != kAXErrorSuccess || elementPID != pid) {
+            CFRelease(element);
+            return MFArcPointerRegionUnknown;
+        }
+
+        CFTypeRef roleValue = NULL;
+        AXError roleError = AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &roleValue);
+        if (roleError == kAXErrorSuccess && roleValue != NULL && CFGetTypeID(roleValue) == CFStringGetTypeID()) {
+            if (CFEqual(roleValue, CFSTR("AXWebArea"))) {
+                CFRelease(roleValue);
+                CFRelease(element);
+                return MFArcPointerRegionWebContent;
+            }
+            if (CFEqual(roleValue, kAXApplicationRole)) {
+                CFRelease(roleValue);
+                CFRelease(element);
+                return MFArcPointerRegionChrome;
+            }
+        }
+        if (roleValue != NULL) CFRelease(roleValue);
+
+        CFTypeRef parentValue = NULL;
+        AXError parentError = AXUIElementCopyAttributeValue(element, kAXParentAttribute, &parentValue);
+        CFRelease(element);
+        element = NULL;
+        if (parentError != kAXErrorSuccess || parentValue == NULL || CFGetTypeID(parentValue) != AXUIElementGetTypeID()) {
+            if (parentValue != NULL) CFRelease(parentValue);
+            return MFArcPointerRegionUnknown;
+        }
+        element = (AXUIElementRef)parentValue;
+    }
+
+    CFRelease(element);
+    return MFArcPointerRegionUnknown;
+}
+
 /// Look up a command by its menu shortcut instead of its title so this keeps
 /// working when the browser or macOS is using a non-English localization.
 /// Unknown is deliberately distinct from disabled: failing to inspect the menu
@@ -191,11 +255,20 @@ static MFMenuCommandState MFMenuCommandStateForShortcut(pid_t pid, NSString *com
                         /// Browser Back at the start of history closes the active tab.
                         ///     Safari, Arc, and Chrome expose Back as Command-[ in their menu. Checking the
                         ///     enabled state avoids browser-specific scripting and remains localization-safe.
+                        ///     Arc is preflighted only over web content. Over its sidebar, native MB 4/5 events
+                        ///     retain Arc's previous/next Space or profile behavior.
                         ///     If AX inspection is unavailable or inconclusive, preserve the old routing.
                         BOOL isSafari = isbundle("com.apple.Safari");
                         BOOL isArc = isbundle("company.thebrowser.Browser");
                         BOOL isChrome = isbundle("com.google.Chrome");
-                        if (isleft && (isSafari || isArc || isChrome)) {
+                        BOOL shouldPreflightBrowserBack = isSafari || isChrome;
+                        if (isleft && isArc) {
+                            MFArcPointerRegion pointerRegion = MFArcPointerRegionAtPoint(targetApp.processIdentifier, getPointerLocation());
+                            DDLogDebug("Actions.m: Arc pointer preflight: region=%@", @(pointerRegion));
+                            if (pointerRegion == MFArcPointerRegionChrome) goto bfmethod_mouseButton;
+                            shouldPreflightBrowserBack = pointerRegion == MFArcPointerRegionWebContent;
+                        }
+                        if (isleft && shouldPreflightBrowserBack) {
                             MFMenuCommandState backState = MFMenuCommandStateForShortcut(targetApp.processIdentifier, @"[", kVK_ANSI_LeftBracket);
                             DDLogDebug("Actions.m: Browser Back preflight: bundle=%@ state=%@", bundleID, @(backState));
                             if (backState == MFMenuCommandStateEnabled) goto bfmethod_commandBracket;
