@@ -1,0 +1,11 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-target-reset","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","captureDate":"2026-09-02","scenario":"The routed target changes Browser to Messages to Photos; each target begins a clean ring generation."}
+{"kind":"session","timestamp":0.0,"event":"reset","reason":"fixture-start","target":"browser","targetGeneration":1,"display":3}
+{"kind":"input","timestamp":0.0,"axis":"vertical","rawUnits":1,"cgLine":1,"cgPoint":1,"source":"hid"}
+{"kind":"session","timestamp":248.631,"event":"reset","reason":"target-change","target":"messages","targetGeneration":2,"display":3}
+{"kind":"input","timestamp":248.631,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-1,"source":"hid"}
+{"kind":"input","timestamp":248.679,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-7,"source":"hid"}
+{"kind":"session","timestamp":323.123,"event":"reset","reason":"target-change","target":"photos","targetGeneration":3,"display":3}
+{"kind":"input","timestamp":323.123,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-1,"source":"hid"}
+{"kind":"input","timestamp":323.605,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-1,"source":"hid"}
+{"kind":"expected","invariant":"target-reset-clears-velocity-cadence-and-direction","value":true}
+{"kind":"expected","invariant":"first-report-after-reset-is-immediate","value":true}

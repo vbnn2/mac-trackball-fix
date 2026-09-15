@@ -30,6 +30,9 @@
 #import "ScrollCadencePolicy.h"
 #import "ScrollOutputPolicy.h"
 #import "ScrollSyntheticEvent.h"
+#import "RingHIDSource.h"
+#import "RingMotionModel.h"
+#import "RingScrollRenderer.h"
 #import <stdatomic.h>
 #import <os/lock.h>
 
@@ -53,6 +56,41 @@ static atomic_bool _eventTapShouldBeEnabled = false;
 static CGEventSourceRef _eventSource;
 
 static dispatch_queue_t _scrollQueue;
+
+typedef NS_ENUM(NSInteger, MFRingScrollEngineMode) {
+    kMFRingScrollEngineModeLegacy = 0,
+    kMFRingScrollEngineModeShadow,
+    kMFRingScrollEngineModeLive,
+};
+
+/// Development selection is read once at helper startup. Release builds and
+/// missing/invalid values always use legacy, making rollback a restart-only
+/// operation with no mutable engine authority inside a session.
+static MFRingScrollEngineMode _ringScrollEngineMode =
+    kMFRingScrollEngineModeLegacy;
+static NSString *_ringScrollEngineName = @"legacy";
+
+/// Phase 3 shadow renderer. The scroll queue produces immutable reports and
+/// reset generations; this queue is the sole owner of model state. It never
+/// posts events or calls TouchAnimator, so legacy output remains authoritative.
+static dispatch_queue_t _ringShadowQueue;
+static uint64_t _ringShadowGeneration = 1;
+static MFRingAxis _ringShadowInputAxis = kMFRingAxisNone;
+
+/// The fields below are touched only by `_ringShadowQueue`.
+static MFRingMotionState _ringShadowState;
+static BOOL _ringShadowStateInitialized;
+static double _ringShadowIntegratedOutputPixels;
+static double _ringShadowDirectionIntegratedOutputPixels;
+static double _ringShadowPeakVelocityPixelsPerSecond;
+static double _ringShadowMaximumRemainingPixels;
+
+/// Phase 4/5 vertical and horizontal live renderer. It shares TouchAnimator's
+/// DisplayLink and serial queue so axis, cancellation, and fallback transitions
+/// cannot briefly run two independent output producers.
+static RingScrollRenderer *_ringLiveRenderer;
+static uint64_t _ringLiveGeneration = 1;
+static BOOL _ringLivePathActive;
 
 static TouchAnimator *_animator;
 
@@ -131,6 +169,273 @@ static NSUInteger _legacyOutputIntervalCount;
 static CFTimeInterval _legacyOutputIntervalSum;
 static CFTimeInterval _legacyOutputMaxGap;
 static int64_t _legacyOutputPixelSum;
+
+static void configureRingScrollEngine(void) {
+    NSString *requestedEngine = nil;
+#if DEBUG
+    requestedEngine = NSProcessInfo.processInfo.environment[@"MMF_RING_SCROLL_ENGINE"];
+    if (requestedEngine.length == 0) {
+        requestedEngine = [NSUserDefaults.standardUserDefaults
+            stringForKey:@"MFRingScrollEngine"];
+    }
+#endif
+
+    if ([requestedEngine isEqualToString:@"ring-shadow"]) {
+        _ringScrollEngineMode = kMFRingScrollEngineModeShadow;
+        _ringScrollEngineName = @"ring-shadow";
+    } else if ([requestedEngine isEqualToString:@"ring-live"]) {
+        _ringScrollEngineMode = kMFRingScrollEngineModeLive;
+        _ringScrollEngineName = @"ring-live";
+    } else {
+        _ringScrollEngineMode = kMFRingScrollEngineModeLegacy;
+        _ringScrollEngineName = @"legacy";
+    }
+
+    DDLogInfo("MFSCROLL_RING_ENGINE: engineVersion=1 action=select requested=%{public}@ selected=%{public}@ debugBuild=%d legacyFallback=1 verticalOnly=0 horizontalPan=1 independentAxes=1",
+              requestedEngine ?: @"default",
+              _ringScrollEngineName,
+#if DEBUG
+              1
+#else
+              0
+#endif
+    );
+}
+
+static double ringShadowRefreshRate(CGDirectDisplayID displayID) {
+    double refreshRate = 0.0;
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
+    if (mode != NULL) {
+        refreshRate = CGDisplayModeGetRefreshRate(mode);
+        CGDisplayModeRelease(mode);
+    }
+    /// Adaptive-refresh modes can report zero. A prediction needs only a
+    /// documented nominal interval; captured frame schedules remain the gate
+    /// for refresh independence.
+    return refreshRate > 0.0 ? refreshRate : 120.0;
+}
+
+static MFRingMotionConfig ringMotionConfigSnapshot(ScrollConfig *config) {
+    return MFRingMotionConfigFromUI((MFRingMotionUIParameters) {
+        .sensitivity = config.u_sensitivity,
+        .acceleration = config.u_acceleration,
+        .adaptiveSmoothnessEndSpeedRatio = config.u_adaptiveSmoothnessEndSpeedRatio,
+        .glide = config.u_glide,
+        .distanceMultiplier = config.velocityModelDistanceMultiplier,
+        .attackTimeConstantSeconds = config.velocityFilterAttackTimeConstant,
+        .releaseTimeConstantSeconds = config.velocityFilterReleaseTimeConstant,
+        .initialVelocityIntervalSeconds = config.isolatedTickVelocityInterval,
+        .startDecaySeconds = config.stableInitialResponseBaseDurationMax,
+        .slowCadenceDurationRatio = config.stableSlowCadenceBaseDurationRatio,
+        .slowCadenceDurationMaximumSeconds = config.stableSlowCadenceBaseDurationMax,
+        .cadenceEstimateAlpha = config.stableSlowCadenceEstimateAlpha,
+        .cadenceMemorySeconds = config.stableSlowCadenceMemoryMaxInterval,
+        .maximumSpeedSetting = config.u_maxSpeed,
+    });
+}
+
+/// Must be called on `_scrollQueue`. Dispatching reset and report blocks from
+/// the same producer preserves their order without synchronously waiting on the
+/// diagnostics queue.
+static void ringShadowReset_Unsafe(NSString *reason) {
+    if (_ringShadowQueue == nil) return;
+
+    _ringShadowGeneration += 1;
+    _ringShadowInputAxis = kMFRingAxisNone;
+    uint64_t generation = _ringShadowGeneration;
+    NSString *reasonSnapshot = [reason copy];
+    dispatch_async(_ringShadowQueue, ^{
+        double predictedTotal = _ringShadowIntegratedOutputPixels;
+        if (_ringShadowStateInitialized) {
+            predictedTotal += copysign(
+                MFRingMotionRemainingDistance(&_ringShadowState),
+                _ringShadowState.velocityPixelsPerSecond);
+        }
+        double remainingSigned = _ringShadowStateInitialized
+            ? copysign(MFRingMotionRemainingDistance(&_ringShadowState),
+                       _ringShadowState.velocityPixelsPerSecond)
+            : 0.0;
+        DDLogInfo("MFSCROLL_RING_COMPARE: engineVersion=1 engine=ring-shadow action=reset generation=%llu reason=%{public}@ sessionNetIntegratedPx=%.3f directionIntegratedPx=%.3f remainingSignedPx=%.3f sessionNetPredictedTotalPx=%.3f directionPredictedTotalPx=%.3f peakVelocity=%.3f maximumRemainingPx=%.3f legacyAuthoritative=1",
+                  generation,
+                  reasonSnapshot,
+                  _ringShadowIntegratedOutputPixels,
+                  _ringShadowDirectionIntegratedOutputPixels,
+                  remainingSigned,
+                  predictedTotal,
+                  _ringShadowDirectionIntegratedOutputPixels + remainingSigned,
+                  _ringShadowPeakVelocityPixelsPerSecond,
+                  _ringShadowMaximumRemainingPixels);
+        MFRingMotionReset(&_ringShadowState, generation);
+        _ringShadowStateInitialized = YES;
+        _ringShadowIntegratedOutputPixels = 0.0;
+        _ringShadowDirectionIntegratedOutputPixels = 0.0;
+        _ringShadowPeakVelocityPixelsPerSecond = 0.0;
+        _ringShadowMaximumRemainingPixels = 0.0;
+    });
+}
+
+static void ringShadowObserve_Unsafe(MFRingCGObservation observation,
+                                     MFRingAxis axis,
+                                     MFDirection direction,
+                                     CFTimeInterval timestamp,
+                                     double inputQueueDelayMs,
+                                     CGDirectDisplayID displayID,
+                                     ScrollConfig *config) {
+    if (_ringScrollEngineMode != kMFRingScrollEngineModeShadow) {
+        return;
+    }
+    if (!observation.isTargetDevice || observation.correlation.signedUnits == 0) {
+        return;
+    }
+
+    BOOL isRegularCustomAcceleration =
+        config.animationCurve == kMFScrollAnimationCurveNameLowInertia
+        && !config.useAppleAcceleration
+        && _modifications.effectMod == kMFScrollEffectModificationNone;
+    if (!isRegularCustomAcceleration
+        || !MFRingCorrelationHasRawMotionUnits(observation.correlation)) {
+        if (_ringShadowInputAxis != kMFRingAxisNone) {
+            ringShadowReset_Unsafe(@"ineligible-path");
+        }
+        return;
+    }
+
+    if (_ringShadowInputAxis != kMFRingAxisNone
+        && _ringShadowInputAxis != axis) {
+        ringShadowReset_Unsafe(@"axis-change");
+    }
+    _ringShadowInputAxis = axis;
+
+    int directionSign = direction == kMFDirectionUp
+        || direction == kMFDirectionRight ? 1 : -1;
+    int64_t signedUnits = llabs(observation.correlation.signedUnits)
+        * directionSign;
+    uint64_t generation = _ringShadowGeneration;
+    uint64_t sequence = observation.sequence;
+    MFRingInputSource source = observation.correlation.source;
+    MFRingMotionConfig modelConfig = ringMotionConfigSnapshot(config);
+    double refreshRate = ringShadowRefreshRate(displayID);
+
+    dispatch_async(_ringShadowQueue, ^{
+        if (!_ringShadowStateInitialized
+            || _ringShadowState.generation != generation) {
+            MFRingMotionReset(&_ringShadowState, generation);
+            _ringShadowStateInitialized = YES;
+            _ringShadowIntegratedOutputPixels = 0.0;
+            _ringShadowDirectionIntegratedOutputPixels = 0.0;
+            _ringShadowPeakVelocityPixelsPerSecond = 0.0;
+            _ringShadowMaximumRemainingPixels = 0.0;
+        }
+
+        if (_ringShadowState.hasAcceptedReport
+            && timestamp > _ringShadowState.lastAcceptedReportTimestamp) {
+            MFRingMotionFrame elapsed = MFRingMotionAdvance(
+                &_ringShadowState,
+                timestamp - _ringShadowState.lastAcceptedReportTimestamp);
+            if (elapsed.accepted) {
+                _ringShadowIntegratedOutputPixels += elapsed.distancePixels;
+                _ringShadowDirectionIntegratedOutputPixels += elapsed.distancePixels;
+            }
+        }
+
+        MFRingMotionUpdate update = MFRingMotionApplyReport(
+            &modelConfig,
+            &_ringShadowState,
+            (MFRingMotionReport) {
+                .generation = generation,
+                .timestamp = timestamp,
+                .signedUnits = signedUnits,
+            });
+        if (!update.accepted) {
+            DDLogInfo("MFSCROLL_RING_MODEL: engineVersion=1 engine=ring-shadow sequence=%llu generation=%llu action=reject staleGeneration=%d invalidTimestamp=%d legacyAuthoritative=1",
+                      sequence,
+                      generation,
+                      update.staleGeneration,
+                      update.invalidTimestamp);
+            return;
+        }
+        if (update.directionChanged) {
+            _ringShadowDirectionIntegratedOutputPixels = 0.0;
+        }
+
+        _ringShadowPeakVelocityPixelsPerSecond = MAX(
+            _ringShadowPeakVelocityPixelsPerSecond,
+            fabs(update.velocityAfterPixelsPerSecond));
+        _ringShadowMaximumRemainingPixels = MAX(
+            _ringShadowMaximumRemainingPixels,
+            update.remainingDistancePixels);
+
+        MFRingMotionState firstFrameState = _ringShadowState;
+        MFRingMotionFrame firstFrame = MFRingMotionAdvance(
+            &firstFrameState,
+            1.0 / refreshRate);
+        double remainingSigned = copysign(
+            update.remainingDistancePixels,
+            update.velocityAfterPixelsPerSecond);
+        double sessionNetPredictedTotal = _ringShadowIntegratedOutputPixels
+            + remainingSigned;
+        double directionPredictedTotal =
+            _ringShadowDirectionIntegratedOutputPixels + remainingSigned;
+        double stopTimeMs = fabs(update.velocityAfterPixelsPerSecond) > 1.0
+            ? update.decaySeconds
+                * log(fabs(update.velocityAfterPixelsPerSecond)) * 1000.0
+            : 0.0;
+        NSString *axisName = axis == kMFRingAxisVertical
+            ? @"vertical" : @"horizontal";
+        NSString *sourceName = source == kMFRingInputSourceHID
+            ? @"hid" : @"cg-line-fallback";
+
+        DDLogInfo("MFSCROLL_RING_MODEL: engineVersion=1 engine=ring-shadow sequence=%llu generation=%llu source=%{public}@ axis=%{public}@ direction=%d directionChanged=%d units=%lld queueMs=%.3f dtMs=%.3f rawOmega=%.3f filteredOmega=%.3f cadenceMs=%.3f cadenceConfidence=%.3f pxPerUnit=%.3f tauMs=%.3f responsivenessDecayLimited=%d startsFromStoppedOutput=%d stoppedOpeningResponsivenessDecayLimited=%d stoppedOpeningVelocityDecayLimited=%d velocityBefore=%.3f carriedVelocity=%.3f impulseVelocity=%.3f velocityAfter=%.3f remainingPx=%.3f velocityLimited=%d carryDroppedPx=%.3f legacyAuthoritative=1",
+                  sequence,
+                  generation,
+                  sourceName,
+                  axisName,
+                  directionSign,
+                  update.directionChanged,
+                  signedUnits,
+                  inputQueueDelayMs,
+                  isfinite(update.reportIntervalSeconds)
+                      ? update.reportIntervalSeconds * 1000.0 : -1.0,
+                  update.rawSpeedUnitsPerSecond,
+                  update.filteredSpeedUnitsPerSecond,
+                  update.cadenceEstimateSeconds * 1000.0,
+                  update.cadenceConfidence,
+                  update.pixelsPerUnit,
+                  update.decaySeconds * 1000.0,
+                  update.responsivenessDecayLimited,
+                  update.startsFromStoppedOutput,
+                  update.stoppedOpeningResponsivenessDecayLimited,
+                  update.stoppedOpeningVelocityDecayLimited,
+                  update.velocityBeforePixelsPerSecond,
+                  update.carriedVelocityPixelsPerSecond,
+                  update.impulseVelocityPixelsPerSecond,
+                  update.velocityAfterPixelsPerSecond,
+                  update.remainingDistancePixels,
+                  update.velocityLimited,
+                  update.carryDroppedPixels);
+        if (update.lowSpeedReversalFrequencyPreserved) {
+            DDLogInfo("MFSCROLL_RING_FREQUENCY: engine=ring-shadow sequence=%llu generation=%llu axis=%{public}@ action=preserve-slow-reversal rawOmega=%.3f filteredOmega=%.3f cadenceMs=%.3f",
+                      sequence, generation, axisName, update.rawSpeedUnitsPerSecond,
+                      update.filteredSpeedUnitsPerSecond,
+                      update.cadenceEstimateSeconds * 1000.0);
+        }
+        DDLogInfo("MFSCROLL_RING_COMPARE: engineVersion=1 engine=ring-shadow action=prediction sequence=%llu generation=%llu display=%u frameHz=%.3f firstFramePx=%.3f velocityEnvelope=%.3f sessionNetIntegratedPx=%.3f directionIntegratedPx=%.3f remainingSignedPx=%.3f sessionNetPredictedTotalPx=%.3f directionPredictedTotalPx=%.3f predictedStopMs=%.3f reversalLatencyMs=%.3f maximumRemainingPx=%.3f legacyAuthoritative=1",
+                  sequence,
+                  generation,
+                  displayID,
+                  refreshRate,
+                  firstFrame.accepted ? firstFrame.distancePixels : 0.0,
+                  _ringShadowPeakVelocityPixelsPerSecond,
+                  _ringShadowIntegratedOutputPixels,
+                  _ringShadowDirectionIntegratedOutputPixels,
+                  remainingSigned,
+                  sessionNetPredictedTotal,
+                  directionPredictedTotal,
+                  stopTimeMs,
+                  update.directionChanged ? 0.0 : -1.0,
+                  _ringShadowMaximumRemainingPixels);
+    });
+}
 
 static void legacyRecordOutput(int64_t px, MFDirection direction) {
     if (px <= 0) return;
@@ -265,6 +570,158 @@ static void sendZoomChangeIfActive(double magnification, uint64_t generation) {
 }
 
 static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, MFAnimationCallbackPhase animationPhase, MFMomentumHint momentumHint, ScrollConfig *config, MFScrollModificationResult modifications, uint64_t zoomGestureGeneration);
+static void sendRingLiveOutput(int64_t dx,
+                               int64_t dy,
+                               MFRingAxis resetSubpixelAxes,
+                               BOOL startsOutput,
+                               ScrollConfig *config);
+
+/// Must be called on `_scrollQueue`.
+static void ringLiveReset_Unsafe(NSString *reason) {
+    if (_ringScrollEngineMode != kMFRingScrollEngineModeLive
+        || _ringLiveRenderer == nil) {
+        return;
+    }
+    _ringLiveGeneration += 1;
+    if (_ringLiveGeneration == 0) _ringLiveGeneration = 1;
+    _ringLivePathActive = NO;
+    [_ringLiveRenderer resetToGeneration:_ringLiveGeneration reason:reason];
+}
+
+/// Returns YES only when the development-gated renderer has accepted complete
+/// authority for this physical report. A NO return continues immediately into
+/// the unchanged legacy pipeline.
+static BOOL ringLiveTryHandle_Unsafe(MFRingCGObservation observation,
+                                     MFRingAxis axis,
+                                     MFDirection direction,
+                                     int64_t legacyLineUnits,
+                                     CFTimeInterval timestamp,
+                                     double inputQueueDelayMs,
+                                     CGDirectDisplayID displayID,
+                                     ScrollConfig *config) {
+    if (_ringScrollEngineMode != kMFRingScrollEngineModeLive) {
+        return NO;
+    }
+
+    NSString *axisName = axis == kMFRingAxisHorizontal
+        ? @"horizontal" : @"vertical";
+    BOOL isSupportedAxis = axis == kMFRingAxisVertical
+        || axis == kMFRingAxisHorizontal;
+    BOOL directionMatchesAxis =
+        (axis == kMFRingAxisVertical
+            && (direction == kMFDirectionUp
+                || direction == kMFDirectionDown))
+        || (axis == kMFRingAxisHorizontal
+            && (direction == kMFDirectionLeft
+                || direction == kMFDirectionRight));
+    BOOL isRegularCustomAcceleration =
+        config.animationCurve == kMFScrollAnimationCurveNameLowInertia
+        && !config.useAppleAcceleration
+        && _modifications.effectMod == kMFScrollEffectModificationNone;
+    MFRingMotionConfig modelConfig = ringMotionConfigSnapshot(config);
+    BOOL isEligible = observation.isTargetDevice
+        && MFRingCorrelationHasRawMotionUnits(observation.correlation)
+        && isSupportedAxis
+        && directionMatchesAxis
+        && displayID != kCGNullDirectDisplay
+        && isRegularCustomAcceleration
+        && isfinite(timestamp)
+        && MFRingMotionConfigIsValid(&modelConfig);
+    if (!isEligible) {
+        if (observation.isTargetDevice) {
+            NSString *reason = observation.correlation.signedUnits == 0
+                ? @"no-units"
+                : !isSupportedAxis || !directionMatchesAxis
+                ? @"axis-direction"
+                : displayID == kCGNullDirectDisplay
+                ? @"display"
+                : _modifications.effectMod != kMFScrollEffectModificationNone
+                ? @"effect"
+                : config.useAppleAcceleration
+                ? @"system-acceleration"
+                : config.animationCurve != kMFScrollAnimationCurveNameLowInertia
+                ? @"non-regular"
+                : !isfinite(timestamp)
+                ? @"timestamp"
+                : observation.correlation.source != kMFRingInputSourceHID
+                ? @"raw-correlation-miss"
+                : @"model-config";
+            DDLogInfo("MFSCROLL_RING_ROUTE: engineVersion=1 engine=ring-live action=fallback generation=%llu sequence=%llu axis=%{public}@ reason=%{public}@ effect=%ld appleAcceleration=%d curve=%ld",
+                      _ringLiveGeneration,
+                      observation.sequence,
+                      axisName,
+                      reason,
+                      (long)_modifications.effectMod,
+                      config.useAppleAcceleration,
+                      (long)config.animationCurve);
+        }
+        if (_ringLivePathActive) {
+            /// Publish invalidation before legacy can enqueue output. This
+            /// clears both axes and raw frequency history once on handoff;
+            /// consecutive misses continue on legacy without repeated resets.
+            ringLiveReset_Unsafe(@"ineligible-path");
+        }
+        return NO;
+    }
+
+    /// Wheel and Consumer Pan are separate physical controls. Their raw
+    /// reports can legitimately overlap after one ring is released, so an
+    /// axis change is not a session reset. Both models share one renderer,
+    /// display callback, output event, and target/config generation.
+    BOOL enteringLivePath = !_ringLivePathActive;
+    _ringLivePathActive = YES;
+    int directionSign = direction == kMFDirectionUp
+        || direction == kMFDirectionRight ? 1 : -1;
+    int64_t signedUnits = llabs(observation.correlation.signedUnits)
+        * directionSign;
+    uint64_t generation = _ringLiveGeneration;
+    NSString *sourceName =
+        observation.correlation.source == kMFRingInputSourceHID
+        ? @"hid" : @"cg-line-fallback";
+    ScrollConfig *configSnapshot = config;
+
+    DDLogInfo("MFSCROLL_RING_ROUTE: engineVersion=1 engine=ring-live action=live generation=%llu sequence=%llu axis=%{public}@ reason=eligible effect=%ld appleAcceleration=0 curve=%ld",
+              generation,
+              observation.sequence,
+              axisName,
+              (long)_modifications.effectMod,
+              (long)config.animationCurve);
+
+    /// Keep ScrollAnalyzer current only for the surrounding routing/session
+    /// lifecycle. Its velocity, cadence, and classifier output do not enter
+    /// the ring model.
+    [ScrollAnalyzer updateWithTickOccuringAt:timestamp
+                                   direction:direction
+                                       units:MAX(1, llabs(legacyLineUnits))
+                                      config:config];
+
+    /// Both objects use the same serial display-link queue. On entry from a
+    /// legacy-only path, cancellation is enqueued before ring-live replaces
+    /// the callback. Same-path reports add energy without restarting the link.
+    if (enteringLivePath) {
+        [_animator cancel];
+    }
+    [_ringLiveRenderer enqueueReportWithSequence:observation.sequence
+                                      generation:generation
+                                            axis:axis
+                                        timestamp:timestamp
+                                      signedUnits:signedUnits
+                                       sourceName:sourceName
+                                inputQueueDelayMs:inputQueueDelayMs
+                                        displayID:displayID
+                                           config:modelConfig
+                                           output:^(int64_t horizontalPixels,
+                                                    int64_t verticalPixels,
+                                                    MFRingAxis resetSubpixelAxes,
+                                                    BOOL startsOutput) {
+        sendRingLiveOutput(horizontalPixels,
+                           verticalPixels,
+                           resetSubpixelAxes,
+                           startsOutput,
+                           configSnapshot);
+    }];
+    return YES;
+}
 
 /// Give an ambiguous one-unit settling report a visible but tightly bounded response. This deliberately bypasses
 /// ScrollAnalyzer so a possible mechanical rebound cannot change cadence/direction history. The normal TouchAnimator
@@ -329,8 +786,21 @@ static void startSettlingTailMicroGlide(int64_t distance,
     ///  For multithreading while still retaining control over execution order.
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, -1);
     _scrollQueue = dispatch_queue_create("com.nuebling.mac-mouse-fix.helper.scroll", attr);
+    configureRingScrollEngine();
+    if (_ringScrollEngineMode == kMFRingScrollEngineModeShadow) {
+        _ringShadowQueue = dispatch_queue_create(
+            "com.nuebling.mac-mouse-fix.helper.scroll.ring-shadow",
+            dispatch_queue_attr_make_with_qos_class(
+                DISPATCH_QUEUE_SERIAL,
+                QOS_CLASS_USER_INITIATED,
+                -1));
+    }
     _scrollInputObservationStartTime = CACurrentMediaTime();
     _previousPhysicalScrollInputTime = 0;
+
+    /// Phase 1 of the TB800 ring rewrite is observation-only. Its independent
+    /// manager is explicitly non-seizing and cannot change live scroll output.
+    [RingHIDSource startObserving];
     
     /// Create AXUIElement for getting app under mouse pointer
     _systemWideAXUIElement = AXUIElementCreateSystemWide();
@@ -359,6 +829,10 @@ static void startSettlingTailMicroGlide(int64_t distance,
     
     /// Create animator
     _animator = [[TouchAnimator alloc] init];
+    if (_ringScrollEngineMode == kMFRingScrollEngineModeLive) {
+        _ringLiveRenderer = [[RingScrollRenderer alloc]
+            initWithDisplayLink:_animator.displayLink];
+    }
 
     /// Create initial config instance
     ///     Edit: I don't think this makes sense. `_scrollConfig` will be retrieved as necessary on first consecutive ticks
@@ -380,6 +854,8 @@ void resetState_Sync(void) {
 }
 void resetState_Unsafe(void) {
     DDLogDebug("Scroll.m: reset-animator");
+    ringShadowReset_Unsafe(@"session-reset");
+    ringLiveReset_Unsafe(@"session-reset");
     /// A zoom gesture is intentionally longer-lived than an individual animator response,
     /// but any explicit session reset still needs a terminal phase before stale callbacks are
     /// cancelled or a new target begins receiving input.
@@ -561,6 +1037,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     int64_t scrollDeltaAxis2 = CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2);
     int64_t lineDeltaAxis1   = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
     int64_t lineDeltaAxis2   = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+    double fixedDeltaAxis1   = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1);
+    double fixedDeltaAxis2   = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2);
     /// ^ The *line* deltas, as opposed to the point deltas above. See `unitsForThisTick` in heavyProcessing() for
     ///     why we carry both: point delta is already accelerated by macOS and is not a usable unit count.
     int64_t drawingTabletID  = CGEventGetIntegerValueField(event, kCGTabletEventDeviceID);
@@ -605,8 +1083,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
               lineDeltaAxis2,
               scrollDeltaAxis1,
               scrollDeltaAxis2,
-              CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1),
-              CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2),
+              fixedDeltaAxis1,
+              fixedDeltaAxis2,
               (int)isDiagonal,
               scrollTargetWindowID);
 
@@ -621,6 +1099,73 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
     /// Get timestamp
     ///     Get timestamp here instead of _scrollQueue for accurate timing
     CFTimeInterval tickTime = CGEventGetTimestampInSeconds(event);
+
+    /// Observe the raw TB800 Wheel/Pan value without changing the event which
+    /// reaches the frozen legacy engine. Missing or incompatible HID data falls
+    /// back immediately to the signed CG line unit; point magnitude is telemetry
+    /// only and never becomes a physical-unit substitute.
+    MFRingAxis ringAxis = scrollDeltaAxis1 != 0
+        ? kMFRingAxisVertical
+        : kMFRingAxisHorizontal;
+    int64_t ringLineUnits = ringAxis == kMFRingAxisVertical
+        ? lineDeltaAxis1
+        : lineDeltaAxis2;
+    int64_t ringPointDelta = ringAxis == kMFRingAxisVertical
+        ? scrollDeltaAxis1
+        : scrollDeltaAxis2;
+    double ringFixedDelta = ringAxis == kMFRingAxisVertical
+        ? fixedDeltaAxis1
+        : fixedDeltaAxis2;
+    int64_t ringFallbackUnits = ringLineUnits != 0
+        ? ringLineUnits
+        : MFRingSign(ringPointDelta);
+    MFRingCGObservation ringObservation = { 0 };
+    CGDirectDisplayID ringDisplayID = kCGNullDirectDisplay;
+    if ([RingHIDSource hasAttachedTarget]) {
+        IOHIDDeviceRef ringSendingDevice = CGEventGetSendingDevice(event);
+        ringObservation =
+            [RingHIDSource observeCGEventAtTimestamp:tickTime
+                                      sendingDevice:ringSendingDevice
+                                               axis:ringAxis
+                                        cgLineUnits:ringLineUnits
+                                    cgFallbackUnits:ringFallbackUnits];
+    }
+    if (ringObservation.isTargetDevice) {
+        CVReturn ringDisplayResult =
+            [HelperUtility displayUnderMousePointer:&ringDisplayID withEvent:event];
+        if (ringDisplayResult != kCVReturnSuccess
+            || ringDisplayID == kCGNullDirectDisplay) {
+            ringDisplayID = CGMainDisplayID();
+        }
+
+        MFRingCorrelationResult correlation = ringObservation.correlation;
+        NSString *source = correlation.source == kMFRingInputSourceHID
+            ? @"hid"
+            : @"cg-line-fallback";
+        NSString *axis = ringAxis == kMFRingAxisVertical
+            ? @"vertical"
+            : @"horizontal";
+        double hidToCGMs = correlation.source == kMFRingInputSourceHID
+            ? correlation.hidToCGSeconds * 1000.0
+            : -1.0;
+        DDLogInfo("MFSCROLL_RING_INPUT: engineVersion=1 engine=%{public}@ sequence=%llu generation=%llu source=%{public}@ rawSequence=%llu device=%llu axis=%{public}@ units=%lld hidToCGMs=%.6f magnitudeMatch=%d cgLine=%lld cgPoint=%lld cgFixed=%.3f target=%{public}@ window=%lld display=%u",
+                  _ringScrollEngineName,
+                  ringObservation.sequence,
+                  ringObservation.generation,
+                  source,
+                  correlation.rawSequence,
+                  correlation.deviceRegistryID,
+                  axis,
+                  correlation.signedUnits,
+                  hidToCGMs,
+                  correlation.magnitudeMatchesCGLine,
+                  ringLineUnits,
+                  ringPointDelta,
+                  ringFixedDelta,
+                  HelperState.shared.frontmostAppBundleID ?: @"",
+                  scrollTargetWindowID,
+                  ringDisplayID);
+    }
     
     /// Create copy of event
     
@@ -636,7 +1181,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
                         lineDeltaAxis1,
                         lineDeltaAxis2,
                         scrollTargetWindowID,
-                        tickTime);
+                        tickTime,
+                        ringObservation,
+                        ringAxis,
+                        ringDisplayID);
     });
     
     return NULL;
@@ -650,7 +1198,10 @@ static void heavyProcessing(CGEventRef event,
                             int64_t lineDeltaAxis1,
                             int64_t lineDeltaAxis2,
                             int64_t scrollTargetWindowID,
-                            CFTimeInterval tickTS) {
+                            CFTimeInterval tickTS,
+                            MFRingCGObservation ringObservation,
+                            MFRingAxis ringAxis,
+                            CGDirectDisplayID ringDisplayID) {
     
     /// Declare stuff for later
     static DriverUnsuspender unsuspendDrivers = ^{}; /// This is old stuff that should be removed I think [Jun 2 2025]
@@ -878,6 +1429,29 @@ static void heavyProcessing(CGEventRef event,
     
     scrollDirection = [ScrollUtility directionForInputAxis:inputAxis inputDelta:scrollDelta invertSetting:_scrollConfig.u_invertDirection horizontalModifier:(_modifications.effectMod == kMFScrollEffectModificationHorizontalScroll)]; /// Why do we need to get the scrollDirection again? We already calculated it during the "preliminary scrollAnalysis". Can it ever change betweent he 2 times we calculate it?
 
+    /// Phase 3: submit the same physical report to the new engine after the
+    /// authoritative path has resolved config/modifiers/direction, but before
+    /// any legacy compatibility classifier can consume it. The shadow owns no
+    /// output API and cannot alter any value read below.
+    ringShadowObserve_Unsafe(ringObservation,
+                             ringAxis,
+                             scrollDirection,
+                             tickTS,
+                             inputQueueDelayMs,
+                             ringDisplayID,
+                             _scrollConfig);
+    if (ringLiveTryHandle_Unsafe(ringObservation,
+                                 ringAxis,
+                                 scrollDirection,
+                                 lineDelta,
+                                 tickTS,
+                                 inputQueueDelayMs,
+                                 ringDisplayID,
+                                 _scrollConfig)) {
+        CFRelease(event);
+        return;
+    }
+
     /// Intercept the narrow mechanical-rebound signature before ScrollAnalyzer sees it. A blanket late-report drop
     /// previously made real scroll starts sticky, so this guard is armed only by a fast gesture and only matches a
     /// one-unit/one-point report. It never releases an isolated report later: that would merely move the burst.
@@ -1056,6 +1630,7 @@ static void heavyProcessing(CGEventRef event,
     BOOL stableRestartAfterExpiredFastTailForTick = NO;
     BOOL stableSharpDecelerationTailForTick = NO;
     BOOL stableStoppedSlowOpeningForTick = NO;
+    BOOL stableIdleWakeBaselineForTick = NO;
     double stableIdleWakeOpeningCapBlendForTick = 0.0;
     double stableIdleWakeOpeningGapForTick = 0.0;
     double stableIdleWakeElapsedForTick = DBL_MAX;
@@ -1159,6 +1734,26 @@ static void heavyProcessing(CGEventRef event,
         stableAdaptiveControlEnabled =
             _scrollConfig.animationCurve == kMFScrollAnimationCurveNameLowInertia;
         stableBoundsEnabled = !_scrollConfig.useAppleAcceleration;
+
+        stableIdleWakeBaselineForTick = MFScrollShouldBoundIdleWakeBaseline(
+            stableAdaptiveControlEnabled,
+            firstConsecutive,
+            physicalInputGap,
+            _scrollConfig.stableIdleWakeMinimumIdle,
+            unitsForThisTick,
+            llabs(scrollDelta));
+        if (stableIdleWakeBaselineForTick) {
+            double fullIdleWakeBaselineDistance = pxForThisTickDouble;
+            pxForThisTickDouble = MFScrollIdleWakeBaselineDistanceCap(
+                pxForThisTickDouble,
+                _scrollConfig.stableIdleWakeBaselineDistanceMax);
+            DDLogInfo("MFSCROLL_ADAPTIVE: cadence=unknown idleGapMs=%.1f units=%lld pointPx=%lld fullPx=%.1f outputPx=%.1f action=bound-idle-wake-baseline",
+                      physicalInputGap * 1000.0,
+                      unitsForThisTick,
+                      llabs(scrollDelta),
+                      fullIdleWakeBaselineDistance,
+                      pxForThisTickDouble);
+        }
 
         double modeledOutputSpeed = MFScrollModeledOutputSpeed(
             scrollSpeed,
@@ -1429,7 +2024,8 @@ static void heavyProcessing(CGEventRef event,
             slowCadenceSpeedMax,
             stableFastTailReport,
             stableSettlingTailSameDirectionCandidate,
-            stableSharpDecelerationTailForTick);
+            stableSharpDecelerationTailForTick)
+            && !stableIdleWakeBaselineForTick;
 
         if (stableAdaptiveControlEnabled
             && (stableHasMeasuredTickInterval || stableSlowCadenceContinuationForTick)) {
@@ -1716,6 +2312,11 @@ static void heavyProcessing(CGEventRef event,
             if (stableAdaptiveControlEnabled
                 && (firstConsecutive || stableRestartAfterExpiredFastTailForTick)) {
                 baseDuration = MIN(baseDuration, configCopyForBlock.stableInitialResponseBaseDurationMax);
+            }
+            if (stableIdleWakeBaselineForTick) {
+                baseDuration = MIN(
+                    baseDuration,
+                    configCopyForBlock.stableIdleWakeBaselineBaseDurationMax);
             }
 
             /// Very slow TB800 movement produces sparse change reports, so the fixed slider value can expose each
@@ -2101,7 +2702,7 @@ static void sendScroll(int64_t px, MFDirection scrollDirection, BOOL animated, M
     
     /// Send event
     
-    sendOutputEvents(dx, dy, outputType, animationPhase, momentumHint, config, zoomGestureGeneration);
+    sendOutputEvents(dx, dy, outputType, animationPhase, momentumHint, config, zoomGestureGeneration, kMFRingAxisNone);
 }
 
 /// Define output types
@@ -2119,7 +2720,7 @@ typedef enum {
 
 /// Output
 
-static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputType, MFAnimationCallbackPhase animatorPhase, MFMomentumHint momentumHint, ScrollConfig *config, uint64_t zoomGestureGeneration) {
+static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputType, MFAnimationCallbackPhase animatorPhase, MFMomentumHint momentumHint, ScrollConfig *config, uint64_t zoomGestureGeneration, MFRingAxis resetSubpixelAxes) {
     
     /// Init eventPhase
     IOHIDEventPhaseBits eventPhase = kIOHIDEventPhaseUndefined;
@@ -2140,7 +2741,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
     
     /// Validate
     
-    if (dx+dy == 0) {
+    if (dx == 0 && dy == 0) {
         assert(eventPhase == kIOHIDEventPhaseEnded || eventPhase == kIOHIDEventPhaseCancelled);
     }
     
@@ -2302,6 +2903,13 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         }
         if (animatorPhase == kMFAnimationCallbackPhaseStart) {
             [linePixelator reset];
+        } else {
+            if ((resetSubpixelAxes & kMFRingAxisHorizontal) != 0) {
+                [linePixelator resetX];
+            }
+            if ((resetSubpixelAxes & kMFRingAxisVertical) != 0) {
+                [linePixelator resetY];
+            }
         }
         
         /// Get alt deltas
@@ -2353,7 +2961,7 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         
         /// We ignore the phases here
         
-        if (dx+dy == 0) return;
+        if (dx == 0 && dy == 0) return;
         
         /// Create a real line-based scroll event.
         CGEventRef event = CGEventCreateScrollWheelEvent(_eventSource, kCGScrollEventUnitLine, 2, 0, 0);
@@ -2492,6 +3100,26 @@ static void sendOutputEvents(int64_t dx, int64_t dy, MFScrollOutputType outputTy
         assert(false);
     }
     
+}
+
+/// The two TB800 rings are independent physical controls but one routed wheel
+/// device. Emit their display-paced components together so target applications
+/// observe one ordered event stream and the helper retains one output authority.
+static void sendRingLiveOutput(int64_t dx,
+                               int64_t dy,
+                               MFRingAxis resetSubpixelAxes,
+                               BOOL startsOutput,
+                               ScrollConfig *config) {
+    sendOutputEvents(dx,
+                     dy,
+                     kMFScrollOutputTypeContinuousScroll,
+                     startsOutput
+                         ? kMFAnimationCallbackPhaseStart
+                         : kMFAnimationCallbackPhaseContinue,
+                     kMFMomentumHintNone,
+                     config,
+                     0,
+                     resetSubpixelAxes);
 }
 
 /// Output - Helper funcs

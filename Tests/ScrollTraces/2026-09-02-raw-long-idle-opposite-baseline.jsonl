@@ -1,0 +1,10 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-long-idle-opposite-baseline","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","sourceBuild":"uncommitted-phase-1","captureDate":"2026-09-02","helperPID":null,"scenario":"After 21.025 seconds idle, a raw one-count report preceded the real opposite-direction amplified ramp by 28 ms."}
+{"kind":"session","timestamp":0.0,"event":"reset","idleBeforeMs":21025.2,"targetGeneration":null,"configGeneration":null,"display":3}
+{"kind":"input","timestamp":0.0,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":-0.100,"source":"hid"}
+{"kind":"input","timestamp":0.028016875,"axis":"vertical","hidElementUnits":-1,"rawUnits":1,"reportID":1,"cgLine":3,"cgPoint":34,"cgFixed":3.388,"source":"hid"}
+{"kind":"input","timestamp":0.056963208,"axis":"vertical","hidElementUnits":-1,"rawUnits":1,"reportID":1,"cgLine":3,"cgPoint":34,"cgFixed":3.363,"source":"hid"}
+{"kind":"input","timestamp":0.084969666,"axis":"vertical","hidElementUnits":-1,"rawUnits":1,"reportID":1,"cgLine":6,"cgPoint":61,"cgFixed":6.091,"source":"hid"}
+{"kind":"input","timestamp":0.112972500,"axis":"vertical","hidElementUnits":-1,"rawUnits":1,"reportID":1,"cgLine":6,"cgPoint":68,"cgFixed":6.714,"source":"hid"}
+{"kind":"expected","invariant":"raw-baseline-origin","value":true,"note":"The opposite first report exists before WindowServer acceleration."}
+{"kind":"expected","invariant":"first-report-indistinguishable","value":true,"note":"The first report has the same report ID, element, and one-count magnitude as a genuine isolated tick; no causal discriminator exists at arrival."}
+{"kind":"expected","invariant":"immediate-input","value":true,"note":"The first report remains visible and the opposite report cancels it immediately without confirmation or delayed replay."}

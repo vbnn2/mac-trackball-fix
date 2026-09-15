@@ -1,0 +1,11 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-sparse-slow","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","captureDate":"2026-09-02","scenario":"Six one-count reports from deliberate sparse vertical rotation, with 140–295 ms gaps."}
+{"kind":"session","timestamp":0.0,"event":"reset","targetGeneration":1,"display":3}
+{"kind":"input","timestamp":0.0,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"input","timestamp":0.140,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"input","timestamp":0.370,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"input","timestamp":0.579,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"input","timestamp":0.863,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"input","timestamp":1.158,"axis":"vertical","hidElementUnits":1,"rawUnits":-1,"reportID":1,"cgLine":-1,"cgPoint":-1,"cgFixed":null,"source":"hid"}
+{"kind":"expected","invariant":"second-report-may-establish-sparse-overlap","value":true}
+{"kind":"expected","invariant":"no-event-three-activation","value":true}
+{"kind":"expected","invariant":"bounded-remaining-area","value":true}

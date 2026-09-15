@@ -1,0 +1,13 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-active-reversal","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","captureDate":"2026-09-02","scenario":"Fast positive vertical motion reverses while reports are still arriving, then accelerates negative."}
+{"kind":"session","timestamp":0.0,"event":"reset","targetGeneration":1,"display":3}
+{"kind":"input","timestamp":0.000,"axis":"vertical","rawUnits":1,"cgLine":8,"cgPoint":88,"source":"hid"}
+{"kind":"input","timestamp":0.029,"axis":"vertical","rawUnits":1,"cgLine":8,"cgPoint":88,"source":"hid"}
+{"kind":"input","timestamp":0.061,"axis":"vertical","rawUnits":1,"cgLine":8,"cgPoint":87,"source":"hid"}
+{"kind":"input","timestamp":0.113,"axis":"vertical","rawUnits":1,"cgLine":8,"cgPoint":85,"source":"hid"}
+{"kind":"input","timestamp":0.148,"axis":"vertical","rawUnits":-1,"cgLine":-3,"cgPoint":-31,"source":"hid"}
+{"kind":"input","timestamp":0.171,"axis":"vertical","rawUnits":-1,"cgLine":-3,"cgPoint":-34,"source":"hid"}
+{"kind":"input","timestamp":0.188,"axis":"vertical","rawUnits":-1,"cgLine":-6,"cgPoint":-63,"source":"hid"}
+{"kind":"input","timestamp":0.204,"axis":"vertical","rawUnits":-1,"cgLine":-7,"cgPoint":-71,"source":"hid"}
+{"kind":"expected","invariant":"reversal-cancels-old-sign-immediately","value":true}
+{"kind":"expected","invariant":"reversing-report-is-delivered","value":true}
+{"kind":"expected","invariant":"no-old-sign-remaining-area","value":true}

@@ -26,6 +26,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (Vector)peekIntVectorWithDoubleVector:(Vector)inpDelta;
 
 - (void)reset;
+- (void)resetX;
+- (void)resetY;
 
 @end
 

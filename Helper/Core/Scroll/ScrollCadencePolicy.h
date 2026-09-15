@@ -11,6 +11,34 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/// After a long idle, the TB800 can emit one baseline one-unit/one-point report
+/// before the physical ramp establishes its real direction. The report is
+/// indistinguishable from a legitimate isolated slow tick, so it must remain
+/// visible and must not wait for confirmation. Bound only this exact opening
+/// signature; any amplified, multi-unit, recent, or follow-up report keeps the
+/// ordinary distance immediately.
+static inline bool MFScrollShouldBoundIdleWakeBaseline(
+    bool overloadControlEnabled,
+    bool firstConsecutive,
+    double idleBeforeOpening,
+    double idleThreshold,
+    int64_t units,
+    int64_t pointDelta
+) {
+    return overloadControlEnabled
+        && firstConsecutive
+        && idleBeforeOpening >= idleThreshold
+        && units == 1
+        && pointDelta == 1;
+}
+
+static inline double MFScrollIdleWakeBaselineDistanceCap(
+    double distance,
+    double distanceMax
+) {
+    return distance < distanceMax ? distance : distanceMax;
+}
+
 /// Some TB800 starts after a long wheel-idle interval arrive as a short ramp of
 /// one-unit reports before the hardware reaches the cadence implied by the physical
 /// spin. The first report already receives the bounded opening response. Keep that

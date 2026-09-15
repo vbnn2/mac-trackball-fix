@@ -1,0 +1,10 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-rebound-shaped-resume","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","captureDate":"2026-09-02","scenario":"A negative one-count report arrives 226 ms after a positive fast tail and continues into a real negative ramp; its first packet overlaps the historical rebound signature."}
+{"kind":"session","timestamp":0.0,"event":"reset","targetGeneration":1,"display":3}
+{"kind":"input","timestamp":0.000,"axis":"vertical","rawUnits":1,"cgLine":7,"cgPoint":80,"source":"hid"}
+{"kind":"input","timestamp":0.226,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-1,"source":"hid"}
+{"kind":"input","timestamp":0.267,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-8,"source":"hid"}
+{"kind":"input","timestamp":0.301,"axis":"vertical","rawUnits":-1,"cgLine":-2,"cgPoint":-30,"source":"hid"}
+{"kind":"input","timestamp":0.329,"axis":"vertical","rawUnits":-1,"cgLine":-4,"cgPoint":-46,"source":"hid"}
+{"kind":"expected","invariant":"ambiguous-first-reversal-is-immediate","value":true}
+{"kind":"expected","invariant":"no-rebound-classifier-in-pure-core","value":true}
+{"kind":"expected","invariant":"following-ramp-is-not-suppressed","value":true}

@@ -425,6 +425,8 @@
 		4FFAEBEA2E74367300832CE2 /* AddField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4FFAEBE92E74367300832CE2 /* AddField.swift */; };
 		4FFBC5A8266977CA001D389B /* DoubleExponentialSmoother.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4FFBC5A7266977CA001D389B /* DoubleExponentialSmoother.swift */; };
 		4FFE2895291B35AA0058ABE0 /* (null) in Sources */ = {isa = PBXBuildFile; };
+		A6F001000000000000000001 /* RingHIDSource.m in Sources */ = {isa = PBXBuildFile; fileRef = A6F001000000000000000004 /* RingHIDSource.m */; };
+		A6F001000000000000000008 /* RingScrollRenderer.m in Sources */ = {isa = PBXBuildFile; fileRef = A6F001000000000000000007 /* RingScrollRenderer.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -2499,6 +2501,13 @@
 		4FF6661E25F2C93A00689B77 /* ButtonInputReceiver.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = ButtonInputReceiver.m; sourceTree = "<group>"; };
 		4FF6662025F2C93A00689B77 /* SmoothScroll_old_.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = SmoothScroll_old_.h; sourceTree = "<group>"; };
 		4FF6662125F2C93A00689B77 /* Scroll.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = Scroll.m; sourceTree = "<group>"; };
+		A6F001000000000000000002 /* RingInputCorrelator.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = RingInputCorrelator.h; sourceTree = "<group>"; };
+		A6F001000000000000000003 /* RingHIDSource.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = RingHIDSource.h; sourceTree = "<group>"; };
+		A6F001000000000000000004 /* RingHIDSource.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = RingHIDSource.m; sourceTree = "<group>"; };
+		A6F001000000000000000005 /* RingMotionModel.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = RingMotionModel.h; sourceTree = "<group>"; };
+		A6F001000000000000000009 /* RingMotionPlane.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = RingMotionPlane.h; sourceTree = "<group>"; };
+		A6F001000000000000000006 /* RingScrollRenderer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = RingScrollRenderer.h; sourceTree = "<group>"; };
+		A6F001000000000000000007 /* RingScrollRenderer.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = RingScrollRenderer.m; sourceTree = "<group>"; };
 		4FF6662325F2C93A00689B77 /* SmoothScroll.m (old) */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text; path = "SmoothScroll.m (old)"; sourceTree = "<group>"; };
 		4FF6662425F2C93A00689B77 /* CubicUnitBezier.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = CubicUnitBezier.m; sourceTree = "<group>"; };
 		4FF6662525F2C93A00689B77 /* SmoothScroll.h (old) */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text; path = "SmoothScroll.h (old)"; sourceTree = "<group>"; };
@@ -7699,6 +7708,13 @@
 			children = (
 				4FF6662C25F2C93A00689B77 /* Scroll.h */,
 				4FF6662125F2C93A00689B77 /* Scroll.m */,
+				A6F001000000000000000002 /* RingInputCorrelator.h */,
+				A6F001000000000000000003 /* RingHIDSource.h */,
+				A6F001000000000000000004 /* RingHIDSource.m */,
+				A6F001000000000000000005 /* RingMotionModel.h */,
+				A6F001000000000000000009 /* RingMotionPlane.h */,
+				A6F001000000000000000006 /* RingScrollRenderer.h */,
+				A6F001000000000000000007 /* RingScrollRenderer.m */,
 				4F7CFFF02E60F4B900ACEDEF /* Bug Log [Aug 2025] - Scroll Stopped Working.md */,
 				4FA994BC26678AC90007F003 /* ScrollAnalyzer.h */,
 				4FA994BD26678AC90007F003 /* ScrollAnalyzer.m */,
@@ -8591,6 +8607,8 @@
 				4FF6669F25F2C93A00689B77 /* main.m in Sources */,
 				4FFA4E4928B7D3750062A1FE /* NSView+Additions.m in Sources */,
 				4FF6668925F2C93A00689B77 /* Scroll.m in Sources */,
+				A6F001000000000000000001 /* RingHIDSource.m in Sources */,
+				A6F001000000000000000008 /* RingScrollRenderer.m in Sources */,
 				4FC55E31285E6F1F00F2FCCF /* GlobalDefaults.swift in Sources */,
 				4FF6669525F2C93A00689B77 /* ModifiedDrag.m in Sources */,
 				4F4C737D2C4FB06E001D97C3 /* NSString+Steganography.m in Sources */,

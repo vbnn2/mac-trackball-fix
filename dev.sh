@@ -22,6 +22,8 @@
 #   logs-record  Keep the latest 2,000 MFSCROLL events in a background rolling capture
 #   logs-record-snapshot  Refresh the readable log without stopping the recorder
 #   logs-record-stop  Stop background recording and print the saved file path
+#   ring-capture-report [file]  Summarize raw-HID/CG pairing from a scroll capture
+#   ring-engine [legacy|ring-shadow|ring-live]  Show/set the Debug helper engine for its next restart
 #   clean     Wipe DerivedData for this project
 
 set -euo pipefail
@@ -163,6 +165,7 @@ do_build() {
 
 do_scroll_tests() {
   require_command clang
+  require_command python3
 
   local test_dir
   test_dir="$(mktemp -d)"
@@ -181,6 +184,23 @@ do_scroll_tests() {
     Tests/ScrollOutputPolicyTests.c \
     -o "$test_dir/scroll-output-tests"
   "$test_dir/scroll-output-tests"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/RingInputCorrelatorTests.c \
+    -o "$test_dir/ring-input-correlator-tests"
+  "$test_dir/ring-input-correlator-tests"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/RingMotionModelTests.c \
+    -o "$test_dir/ring-motion-model-tests"
+  "$test_dir/ring-motion-model-tests"
+
+  clang -std=c11 -Wall -Wextra -Werror \
+    Tests/RingMotionReplay.c \
+    -o "$test_dir/ring-motion-replay"
+  "$test_dir/ring-motion-replay" Tests/ScrollTraces/*.jsonl
+
+  python3 Tests/RingCaptureAnalyzerTests.py
 
   rm -rf "$test_dir"
 }
@@ -551,6 +571,30 @@ case "${1:-run}" in
     echo "==> Scroll log recording stopped"
     echo "    File: $SCROLL_LOG_FILE"
     echo "    Events: $(wc -l < "$SCROLL_LOG_FILE" | tr -d ' ') (maximum $SCROLL_LOG_LIMIT)"
+    ;;
+
+  ring-capture-report)
+    capture_file="${2:-$SCROLL_LOG_FILE}"
+    require_command python3
+    python3 Tests/ring_capture_analyzer.py "$capture_file"
+    ;;
+
+  ring-engine)
+    ring_engine="${2:-}"
+    if [ -z "$ring_engine" ]; then
+      configured_engine="$(defaults read "$HELPER_LABEL" MFRingScrollEngine 2>/dev/null || true)"
+      echo "${configured_engine:-legacy}"
+      exit 0
+    fi
+    case "$ring_engine" in
+      legacy|ring-shadow|ring-live) ;;
+      *) die "Engine must be legacy, ring-shadow, or ring-live" ;;
+    esac
+    defaults write "$HELPER_LABEL" MFRingScrollEngine "$ring_engine"
+    echo "==> Debug ring engine set to: $ring_engine"
+    echo "    Restart with './dev.sh run' for the immutable startup selection to take effect"
+    [ "$ring_engine" != "ring-live" ] \
+      || echo "    ring-live is TB800-only, independent Wheel/Raw-Pan, Regular custom-acceleration-only"
     ;;
 
   stop)

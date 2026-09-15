@@ -71,4 +71,12 @@
     [_spY reset];
 }
 
+- (void)resetX {
+    [_spX reset];
+}
+
+- (void)resetY {
+    [_spY reset];
+}
+
 @end

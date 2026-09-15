@@ -482,6 +482,13 @@ import Cocoa
     @objc let stableIdleWakeResponseHoldDuration: TimeInterval = 750.0 / 1000.0
     @objc let stableIdleWakeResponseFadeDuration: TimeInterval = 750.0 / 1000.0
 
+    /// A captured long-idle start emitted a one-unit/one-point report in the opposite direction 250ms before the
+    /// real ramp. Keep that ambiguous physical report visible without turning it into the ordinary ~32px opening.
+    /// The 10px/50ms bounds match the already accepted stopped settling micro-response; the next report is processed
+    /// at full distance immediately and is never held for direction confirmation.
+    @objc let stableIdleWakeBaselineDistanceMax: Double = 10.0
+    @objc let stableIdleWakeBaselineBaseDurationMax: TimeInterval = 50.0 / 1000.0
+
     /// Keep enough cadence history to recognize extremely slow same-direction trackball movement even when its
     /// reports cross the 500ms gesture-grouping timeout. Acceleration, clicks, and target changes clear this memory
     /// immediately; a slow reversal can retain its scalar cadence only through the shorter reversal taper below.

@@ -1,0 +1,8 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-02-raw-paused-reversal","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"sanitized MFSCROLL_RING capture","captureDate":"2026-09-02","scenario":"A positive one-count report is followed by a deliberate negative reversal after 453 ms, then immediate acceleration."}
+{"kind":"session","timestamp":0.0,"event":"reset","targetGeneration":1,"display":3}
+{"kind":"input","timestamp":0.000,"axis":"vertical","rawUnits":1,"cgLine":1,"cgPoint":1,"source":"hid"}
+{"kind":"input","timestamp":0.453,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-1,"source":"hid"}
+{"kind":"input","timestamp":0.489,"axis":"vertical","rawUnits":-1,"cgLine":-1,"cgPoint":-9,"source":"hid"}
+{"kind":"input","timestamp":0.518,"axis":"vertical","rawUnits":-1,"cgLine":-3,"cgPoint":-32,"source":"hid"}
+{"kind":"expected","invariant":"paused-reversal-has-no-timer-dead-zone","value":true}
+{"kind":"expected","invariant":"reversing-report-is-delivered","value":true}

@@ -1,0 +1,9 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-01-same-sign-long-idle-start","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"macOS unified log","sourceBuild":"9125a5ed52ccd432ef14bceb371b435e58f6a18e+uncommitted-legacy-baseline","captureDate":"2026-09-01","helperPID":1800,"scenario":"A genuine one-unit start after long idle was classified as the indistinguishable bounded wake baseline."}
+{"kind":"session","timestamp":0.0,"event":"reset","idleBeforeMs":284017.6,"targetGeneration":null,"configGeneration":null,"display":null}
+{"kind":"input","timestamp":0.0,"axis":"vertical","rawUnits":null,"cgLine":1,"cgPoint":1,"cgFixed":null,"source":"cg-capture"}
+{"kind":"legacy-observation","timestamp":0.0,"decision":"bound-idle-wake-baseline","requestedPx":32.0,"outputPx":10.0,"baseDurationMs":50.0,"totalDurationMs":123.4,"queueMs":0.52,"firstOutputMs":6.85,"displayStart":"success"}
+{"kind":"input","timestamp":0.277,"axis":"vertical","rawUnits":null,"cgLine":1,"cgPoint":1,"cgFixed":null,"source":"cg-capture"}
+{"kind":"legacy-observation","timestamp":0.277,"decision":"ordinary-stopped-opening","requestedPx":31.0,"outputPx":31.0,"baseDurationMs":80.0,"totalDurationMs":null,"queueMs":0.43,"firstOutputMs":13.47,"previousAnimator":"stopped"}
+{"kind":"expected","invariant":"immediate-input","value":true,"note":"Neither report may wait for confirmation or raw-HID correlation."}
+{"kind":"expected","invariant":"same-sign-start-consistency","value":true,"note":"The rewrite must not select an idle-dependent amplitude when raw HID cannot distinguish the report."}
+{"kind":"expected","invariant":"legacy-output-authoritative-in-phase-1","value":true}

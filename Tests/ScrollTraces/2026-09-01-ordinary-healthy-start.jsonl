@@ -1,0 +1,6 @@
+{"kind":"metadata","schema":"mf-scroll-trace-v1","fixture":"2026-09-01-ordinary-healthy-start","device":"Kensington Expert Mouse TB800 EQ 2.4GHz","source":"macOS unified log","sourceBuild":"9125a5ed52ccd432ef14bceb371b435e58f6a18e+uncommitted-legacy-baseline","captureDate":"2026-09-01","helperPID":1800,"scenario":"Adjacent ordinary start used as the healthy responsiveness comparator."}
+{"kind":"session","timestamp":0.0,"event":"start","idleBeforeMs":null,"targetGeneration":null,"configGeneration":null,"display":null}
+{"kind":"input","timestamp":0.0,"wallClock":"23:12:15.215","axis":"vertical","rawUnits":null,"cgLine":null,"cgPoint":null,"cgFixed":null,"source":"cg-capture"}
+{"kind":"legacy-observation","timestamp":0.0,"decision":"ordinary-opening","requestedPx":32.0,"outputPx":32.0,"baseDurationMs":80.0,"totalDurationMs":null,"queueMs":null,"firstOutputMs":14.45,"displayStart":"success"}
+{"kind":"expected","invariant":"first-output-within-two-display-callbacks","value":true}
+{"kind":"expected","invariant":"first-report-normal-bounded-response","value":true}

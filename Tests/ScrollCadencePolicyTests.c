@@ -12,6 +12,34 @@
 
 #include "../Helper/Core/Scroll/ScrollCadencePolicy.h"
 
+static void testLongIdleBaselineOpeningIsBoundWithoutConfirmation(void) {
+    /// Captured 2026-08-21: after 43.251s idle, the TB800 delivered +1/+1,
+    /// then 250ms later began the intended opposite ramp at -1/-1, -1/-8,
+    /// -2/-29. Keep the ambiguous first physical report visible but small.
+    assert(MFScrollShouldBoundIdleWakeBaseline(
+        true, true, 43.251, 20.0, 1, 1
+    ));
+    assert(MFScrollIdleWakeBaselineDistanceCap(32.0, 10.0) == 10.0);
+
+    /// Short-idle starts, amplified or multi-unit openings, follow-up reports,
+    /// and non-stable engines keep their ordinary response.
+    assert(!MFScrollShouldBoundIdleWakeBaseline(
+        true, true, 19.999, 20.0, 1, 1
+    ));
+    assert(!MFScrollShouldBoundIdleWakeBaseline(
+        true, true, 43.251, 20.0, 1, 2
+    ));
+    assert(!MFScrollShouldBoundIdleWakeBaseline(
+        true, true, 43.251, 20.0, 2, 1
+    ));
+    assert(!MFScrollShouldBoundIdleWakeBaseline(
+        true, false, 43.251, 20.0, 1, 1
+    ));
+    assert(!MFScrollShouldBoundIdleWakeBaseline(
+        false, true, 43.251, 20.0, 1, 1
+    ));
+}
+
 static void testLongIdleWakeRampKeepsOpeningCapThroughMeasuredRamp(void) {
     const double blend = MFScrollIdleWakeOpeningCapBlend(
         true,
@@ -341,6 +369,7 @@ static void testResetAndMemoryHorizonCannotReuseCadence(void) {
 }
 
 int main(void) {
+    testLongIdleBaselineOpeningIsBoundWithoutConfirmation();
     testLongIdleWakeRampKeepsOpeningCapThroughMeasuredRamp();
     testLongIdleWakeCapFadesContinuouslyAfterMeasuredRamp();
     testLateSecondWakeReportDoesNotConsumeProtectionDuringSilence();

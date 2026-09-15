@@ -2090,6 +2090,1352 @@ physical matrix (fresh start, extremely slow motion, slow-to-fast, fast-to-slow,
 reversals, app/window switch, multi-display, horizontal/zoom/effect paths, and a parked display) remains manual on
 a live helper; the rolling recorder should be sampled for the new single `cap-stopped-slow-opening` record.
 
+### 2026-08-21 — long-idle baseline report moved opposite the real wake ramp
+
+Symptom: after a slow start, scrolling appeared to move briefly in the opposite direction before following the
+physical ring direction.
+
+Current telemetry before attribution (helper PID `1641`):
+
+- At `13:11:31.270`, after `43.251 s` without physical wheel input, the TB800 path delivered a baseline positive
+  report: `line=(1,0) point=(1,0)`. The helper processed it as the ordinary `32 px`, `80 ms` base opening and
+  reached first output in `13.32 ms` with `3.83 ms` queued.
+- At `13:11:31.520`, `253 ms` later by event timestamps, the device delivered the first negative report:
+  `line=(-1,0) point=(-1,0)`. Direction cancellation retained that report, and its first output arrived in
+  `10.39 ms` with `0.76 ms` queued. The real negative ramp then continued at `13:11:31.563/.600/.636` with point
+  magnitudes `-8/-29/-43`.
+- Display starts returned `result=0`, active output returned to approximately `120 Hz`, and there was no tap disable,
+  display recovery/failure, target churn, rate limit, dropped carry, or retained old-direction animator distance.
+
+Root cause: the opposite sign was already present in physical `MFSCROLL_INPUT` telemetry, so it was not created by
+the scroll queue, animator, display link, or application. The exact device/receiver cause is inferred: after long
+idle, a single baseline report can precede the amplified wake ramp and can have the opposite sign. Treating that
+ambiguous baseline as a full `32 px` opening made the physical artifact clearly visible before the real direction
+arrived.
+
+Change (`Helper/Core/Config/ScrollConfig.swift`, `Helper/Core/Scroll/ScrollCadencePolicy.h`,
+`Helper/Core/Scroll/Scroll.m`, `Tests/ScrollCadencePolicyTests.c`):
+
+- Only a Regular stable-engine first analyzer report after the existing `>=20 s` idle boundary, with the exact
+  one-unit/one-point baseline signature, receives the accepted stopped-settling response bounds: at most `10 px`
+  and a `50 ms` base. It is still emitted immediately and never waits for the next report.
+- The ambiguous baseline cannot seed remembered slow cadence. A following opposite report therefore opens crisply
+  instead of inheriting direction cadence from the possible wake artifact. Amplified, multi-unit, short-idle, and
+  every follow-up report retain their ordinary full distance on that same report.
+- Telemetry records `MFSCROLL_ADAPTIVE action=bound-idle-wake-baseline` with idle gap and full/bounded distance.
+
+Preserved behavior: no timer, confirmation count, quarantine, delayed replay, or second distance reservoir was
+added. The first physical report remains visible; a genuine isolated baseline tick after long idle is intentionally
+smaller but not discarded. The existing duration shaping for subsequent long-idle reports, unknown-cadence normal
+smoothness, live velocity-preserving retargets, direction cancellation, slow-cadence continuity outside the
+ambiguous baseline, settling/fast-tail protection, distance/rate/carry bounds, target resets, effect paths, and
+display recovery are unchanged.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes exact captured-signature coverage plus non-matches for short idle, amplified and
+  multi-unit openings, follow-up reports, and non-stable engines. Existing cadence, display-link lifecycle, and
+  output-policy suites pass under their warning-as-error builds.
+- `git diff --check` and `./dev.sh build` pass (`BUILD SUCCEEDED`, existing unrelated warnings only).
+- `./dev.sh run` rebuilt and deployed the Debug app/helper. Final helper PID `79302` logged the expected config reset
+  and event-tap re-enable. The bounded `2,000`-event recorder was restarted before deployment and remains active.
+
+Physical reproduction captured (helper PID `79302`, rolling snapshot `23:05–23:09`): the single long-idle start in
+that capture arrived after a `128,649 ms` (≈`128 s`) idle. Its telemetry confirms the intended sequence:
+
+- `23:09:46.431` the baseline `line=(-1,0) point=(-1,0)` report logged
+  `action=bound-idle-wake-baseline idleGapMs=128649.2 fullPx=32.0 outputPx=10.0` and reached first output in
+  `14.01 ms` with `0.89 ms` queued — bounded to `10 px` without being deferred or discarded.
+- `23:09:46.786`, `355 ms` later, the real opposite `line=(1,0) point=(1,0)` ramp logged
+  `MFSCROLL_DIRECTION action=cancel-old-session` and opened at the ordinary full `32 px` (`8.85 ms` first output,
+  `0.62 ms` queued). It did not inherit the baseline's direction or cadence.
+- The physical spin then accelerated normally (`point=(7,0)/(26,0)/(40,0)/(49,0)`) through
+  `action=cap-idle-wake-ramp` and `cap-accelerating-low-unit-ramp`, returning to ≈`120 Hz` active output.
+
+Across the full snapshot, first-output latency stayed `7–15 ms`, queue time `≤4.9 ms`, and there was no tap disable,
+display recovery/start failure, target churn, rate limit, or dropped carry. This closes the previously pending
+capture: the guard fires exactly once on the ambiguous long-idle baseline and the real ramp is unaffected.
+
+Remaining verification/tradeoff: the broader physical matrix (horizontal, multi-display, zoom/effect paths, and a
+genuinely parked display) remains manual on a live helper. Because a genuine isolated deliberate one-point tick is
+indistinguishable from the captured wake baseline, it now produces `10 px` after long idle instead of the ordinary
+approximately `32 px`. This bounded immediate response is preferred to either amplifying the confirmed wrong-sign
+artifact or reintroducing a timer-based dead zone.
+
+## 2026-09-01 — Ring rewrite Phase 0/1 begins with passive raw-HID observation
+
+Symptom/evidence: the `23:16:59.565` helper PID `1800` capture above showed that the accepted long-idle baseline
+classifier can select a `10 px` response for a genuine TB800 start whose `line=(1,0) point=(1,0)` signature is
+indistinguishable at the CGEvent layer. Queue (`0.52 ms`), first output (`6.85 ms`), display start, target, and tap
+telemetry were healthy. The same-sign continuation arrived `277 ms` later only after the first finite response had
+stopped. This reconfirms that the recurring slow-start class is response-shape ambiguity, not queue or display-link
+latency.
+
+Root cause/design decision: point delta is already accelerated and the isolated line packet does not contain enough
+information to distinguish a real tick from the captured receiver baseline. Instead of adding another intent
+classifier, the rewrite now begins by measuring the TB800's raw Generic Desktop Wheel and Consumer Pan values before
+WindowServer acceleration. Output remains on the frozen legacy engine until raw/CG pairing reliability and artifact
+distinguishability are measured.
+
+Change:
+
+- Added `SCROLL_REWRITE_PLAN.md` plus sanitized JSONL fixtures for the same-sign long-idle false positive and its
+  adjacent healthy-start comparator. Unknown fields are explicitly `null`; no missing raw data was invented.
+- Added `RingHIDSource`, an independent `IOHIDManager` sidecar matched only to vendor `1149`, product `33129`. It
+  opens with `kIOHIDOptionsTypeNone`, observes only Wheel `0x38` and Pan `0x0238`, handles attach/removal, and never
+  suppresses or posts an event.
+- Added a fixed `64`-sample buffer and pure `RingInputCorrelator`. Pairing requires the same device, axis, sign, and
+  a raw timestamp no more than `30 ms` old (with only `2 ms` future-skew tolerance). Samples are consumed once,
+  expired samples are reclaimed, and overwrite loss is counted. A miss returns CG line units immediately; it never
+  waits for raw HID. Point magnitude remains telemetry only.
+- Added versioned `MFSCROLL_RING_HID` attach/sample/detach records and one `MFSCROLL_RING_INPUT` record per handled
+  TB800 CG report, including engine=`legacy`, source, raw/CG timing and magnitude agreement, target window, and
+  display. The existing heavy-processing arguments and legacy output path are unchanged.
+
+Preserved behavior: this slice does not select `ring-shadow` or `ring-live`, create a motion model, change distance,
+duration, direction, carry, cadence, target routing, output phases, animator/display behavior, zoom/effects, or
+synthetic event handling. When the target device is absent, the event tap does not perform sending-device lookup.
+When raw data is absent or incompatible, the physical CG report proceeds immediately through the existing path.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes the existing cadence, display lifecycle, and output-policy suites plus the new
+  warning-as-error correlator suite. New coverage includes nearest-compatible selection, device/axis/sign rejection,
+  one-time consumption, bounded clock skew, stale expiry, magnitude mismatch, device removal, fallback, and bounded
+  overflow.
+- Both checked-in JSONL fixtures parse successfully with `jq`; `plutil -lint Mouse\ Fix.xcodeproj/project.pbxproj`,
+  `git diff --check`, and `./dev.sh build` pass. The full Debug app and embedded Helper build succeeded.
+- Runtime launch could not complete the physical pairing gate because the machine had no active display
+  (`system_profiler SPDisplaysDataType` listed the GPU but no display). The Helper aborted in the pre-existing
+  `DisplayLink.m:230` startup assertion after `CVDisplayLinkCreateWithCGDisplays` received an empty display list.
+  The crash stack faulted entirely in DisplayLink/TouchAnimator construction; the sidecar's IOHID manager state
+  queue was alive but no scroll capture was possible. This is recorded as an environment/lifecycle blocker, not
+  attributed to HID correlation. After launchd repeated the same abort, the development Helper service was booted
+  out to stop the crash loop; it must be re-enabled from the GUI when an active display is present.
+
+Remaining tradeoffs/gates: Phase 1 is not complete. On the next active-display run, capture normal slow/fast,
+multi-unit, long-idle, stop/rebound, vertical, and horizontal motion; measure registry-ID and sign agreement,
+pairing/fallback rates, timestamp distribution, and overflow before raw values influence output. The per-sample HID
+record is intentionally verbose during observation and must be reduced or aggregated after the capture gate. The
+legacy long-idle behavior and its known genuine-tick tradeoff remain active until a later evidence-backed live-engine
+phase replaces them.
+
+## 2026-09-02 — Phase 1 capture analyzer and exact TB800 mouse-collection match
+
+Objective/evidence: Phase 1 requires measured HID/CG pairing reliability before the raw value can influence output.
+The development Helper was running as PID `85986` from the expected DerivedData build, and the bounded recorder was
+started successfully, but no physical scroll report arrived during three observed capture windows. The empty trace
+is not evidence about pairing success or failure. Current `ioreg` state did confirm the receiver is attached and
+exposes two collections with vendor `1149` and product `33129`: the intended Generic Desktop Mouse collection
+contains relative Wheel `0x38` and Consumer Pan `0x0238`, while a second vendor/keyboard collection has the same
+product identity and unrelated elements.
+
+Change:
+
+- Narrowed `RingHIDSource` device matching from VID/PID alone to VID/PID plus Generic Desktop Mouse usage. Element
+  matching remains Wheel/Pan only. This prevents the receiver's second collection from incrementing attachment
+  generations or making `hasAttachedTarget` true without the scroll collection.
+- Added `Tests/ring_capture_analyzer.py` and `./dev.sh ring-capture-report [file]`. The analyzer reports sidecar
+  lifecycle, raw/CG counts, HID pairing and fallback rates, axis/source coverage, sign and magnitude agreement,
+  registry-ID sets, HID-to-CG min/p50/p95/max timing, negative skew, raw utilization, and maximum buffer overflow.
+- Added deterministic analyzer tests for paired/fallback input, both axes, timestamp percentiles, sign/magnitude
+  agreement, device identity, overflow, and empty-capture gate behavior. `./dev.sh scroll-tests` now runs them.
+
+Preserved behavior: the running and built helpers remain `engine=legacy`; this work changes neither event handling
+latency nor scroll output. The analyzer is offline. The source match only removes an unrelated receiver collection
+which cannot emit the matched Wheel/Pan elements. The newly built collection filter was not force-deployed into the
+currently stable headless Helper process because restarting with no enumerated active display previously triggered
+the existing DisplayLink startup assertion.
+
+Verification: `./dev.sh scroll-tests` passes all four C suites plus two analyzer tests; Python syntax compilation
+passes with a sandbox-local bytecode cache; `git diff --check`, Xcode project validation, and `./dev.sh build` pass.
+The recorder service remains active and bounded at `/tmp/mac-trackball-fix-scroll.log`. At the time of this entry its
+snapshot contains zero events, so Phase 1 is deliberately not marked complete.
+
+Remaining gate: physically exercise slow/fast/reversal/stop and horizontal motion, then include long-idle genuine
+and artifact starts. Refresh the snapshot and run `./dev.sh ring-capture-report`. Pairing distribution, fallback,
+registry/sign agreement, packet aggregation, and artifact distinguishability must be reviewed before Phase 2.
+
+## 2026-09-02 — Phase 1 closes; raw baseline origin and TB800 axis polarity captured
+
+Symptom/evidence: the first physical exercise produced 374 ordinary `MFSCROLL_INPUT` reports (295 multi-unit,
+both directions) with healthy `6.54–14.37 ms` first-output latency, but zero `MFSCROLL_RING_HID` samples. That
+helper predated the exact Generic Desktop Mouse collection deployment, so the absence isolated acquisition without
+implicating the scroll queue, animator, display link, target application, or hardware output path. After deploying
+the exact VID `1149` / PID `33129` / Mouse collection match, helper PID `6960` attached registry ID `4294971676`
+non-seizing and captured Wheel and Consumer Pan values. Those records exposed axis-specific protocol polarity:
+vertical raw `-1` corresponded to positive CG line input, while horizontal raw and CG signs already agreed.
+
+The final corrected helper PID `7908` captured 240 raw reports and 240 handled CG reports: 204 vertical, 36
+horizontal, 100% HID pairing, both directions, matching registry-ID sets, zero sign mismatches, zero fallbacks, and
+zero buffer overflow. Only 24.2% of paired raw magnitudes equaled CG line magnitude because the HID stream delivered
+one physical count per callback while WindowServer aggregated/accelerated corresponding CG line reports as high as
+eight or nine units. HID and CG timestamps were identical at the available Mach timestamp resolution. Legacy output
+remained healthy at `6.14–14.34 ms` first-output latency.
+
+The same capture reproduced the long-idle opposite-baseline case. At `12:20:37.817`, after `21,025.2 ms` idle, the
+receiver emitted Wheel `rawUnits=1`, normalized units `-1`, report ID `1`; CG reported `line=(-1,0) point=(-1,0)`.
+Only `28.017 ms` later, Wheel `rawUnits=-1`, normalized units `1`, report ID `1` began the real opposite ramp while
+CG had already amplified it to `line=(3,0) point=(34,0)`. The first report therefore originates before WindowServer
+and has no report-ID, element, magnitude, or companion-field discriminator from a genuine isolated count at arrival.
+The later ramp cannot be used without reintroducing the rejected timer/confirmation dead zone.
+
+Root cause: the initial raw-acquisition gap was an undeployed collection matcher, not runtime scroll latency. Once
+attached, vertical correlation failed because the TB800 Generic Desktop Wheel element uses the inverse polarity from
+CGEvent; Consumer Pan does not. The recurring long-idle wrong-sign baseline is confirmed receiver/HID input, while
+its mechanical cause remains unknown. It is causally indistinguishable on its first packet, so the rewrite must use
+the same bounded immediate low-speed response for both artifact and deliberate one-count starts.
+
+Change:
+
+- Normalize TB800 Wheel units into CGEvent direction convention before buffering; preserve both `rawUnits` and
+  canonical `units` in telemetry. Pan remains unchanged. The rule is exact-device and exact-axis scoped.
+- Extend the capture analyzer with ordinary-input and latency evidence, explicit raw-acquisition-gap diagnosis, and
+  latest-helper-session selection so rolling captures cannot mix sequence numbers across restarts.
+- Sanitize the captured raw opposite-baseline/ramp into
+  `Tests/ScrollTraces/2026-09-02-raw-long-idle-opposite-baseline.jsonl`.
+- Begin Phase 2 with a pure `RingMotionModel`: explicit physical/output units, current-report acceleration,
+  immediate second-report sparse cadence, additive same-direction impulses, atomic reversal, analytic exponential
+  frame integration, generation reset, and separate initial-distance, velocity, and remaining-area caps. Add a
+  deterministic JSONL runner plus unit, randomized boundedness, packetization, fixed/variable-refresh, reset, stale
+  generation, invalid-time, and parked-frame tests. The model is not wired to runtime output.
+
+Preserved behavior: `engine=legacy` remains the only output authority. Raw lookup never waits; a correlation miss
+still returns the CG line fallback immediately. No timer, confirmation count, direction vote, quarantine, delayed
+replay, new target routing, output phase, display-link behavior, or legacy response policy was added or changed.
+
+Verification: `./dev.sh scroll-tests` passes all legacy policy suites, correlator tests, pure motion tests, all JSONL
+replays, and four capture-analyzer tests under warning-as-error C builds. `./dev.sh run` built and deployed the helper
+successfully (existing unrelated warnings only). The exact sidecar logged `action=start result=0` and `action=attach`
+for registry ID `4294971676`; the physical matrix above then produced the 240/240 accepted session. `git diff
+--check` and Xcode project property-list validation pass.
+
+Remaining tradeoffs/gates: Phase 1 is complete, but Phase 2 is not. More sanitized captured fixtures are still needed
+for sparse slow motion, active/paused reversal, hard stop/rebound, target/config/display reset, and horizontal motion.
+The Phase 2 constants establish bounded model behavior rather than accepted feel; replay and physical A/B tuning must
+precede shadow/live selection. Because the raw long-idle baseline is indistinguishable at arrival, no sanitizer is
+justified; consistent calibrated low-speed response must replace the legacy idle-dependent 10 px classifier when the
+new engine eventually becomes live.
+
+## 2026-09-02 — Phase 2 closes; Phase 3 shadow renderer begins without output authority
+
+Symptom/evidence: Phase 1 established that the recurring long-idle opposite one-count report is real raw TB800 HID
+input and indistinguishable from a deliberate count at arrival. The retained helper PID `7908` capture also contains
+sparse reports, active and paused reversals, a rebound-shaped real resume, horizontal Pan, and target changes. Queue
+and first-output measurements remained healthy, so no evidence attributes the perceived slow start to the event
+queue, animator callback admission, display link, target application, or device attachment.
+
+Root cause: the remaining work is architectural rather than another legacy classifier fix. Captured ambiguous inputs
+cannot be separated causally, while the per-report legacy animation has accumulated idle, cadence, settling, and tail
+policies that interact through retained distance. A bounded continuous velocity model can give indistinguishable
+inputs the same immediate response and make cancellation, remaining area, and reset ownership explicit.
+
+Change:
+
+- Expanded the sanitized replay suite with raw sparse-slow, active-reversal, paused-reversal,
+  rebound-shaped-resume, horizontal-Pan, and target-reset fixtures from the current capture.
+- Added explicit mapping from current UI/config values into physical/output units in `RingMotionModel`, and made the
+  replay runner assert first-frame sign, atomic reversal, reset clearing, and maximum remaining area in addition to
+  deterministic total output.
+- Routed eligible TB800 Regular custom-acceleration reports through a Phase 3 `ring-shadow` diagnostics queue. The
+  scroll queue publishes immutable report/config/display snapshots and monotonically generated resets; the shadow
+  queue solely owns its motion state and analytic between-report integration.
+- Added versioned `MFSCROLL_RING_MODEL` and `MFSCROLL_RING_COMPARE` records for source, queue time, speed/filter,
+  cadence, decay, impulse/carry, first-frame prediction, velocity envelope, predicted signed total/stop time,
+  immediate reversal timing, maximum remaining area, and reset summaries.
+
+Preserved behavior: legacy `TouchAnimator` output remains the only authority. The shadow code has no event-posting
+or animator call, does not mutate a legacy input/config/result, does not wait for raw HID, and runs after current
+target/config/modifier/direction resolution but before legacy artifact classifiers. System acceleration and effect
+paths remain legacy-only. Target, click, modifier, config, and axis transitions clear shadow state by generation; no
+timer, confirmation gate, direction vote, artifact sanitizer, delayed replay, output phase, or display recovery rule
+was added.
+
+Verification: `./dev.sh scroll-tests` passes the cadence, display-link lifecycle, output policy, raw correlator,
+motion-model unit/property/refresh tests, all JSONL traces, and capture-analyzer tests. Replayed reversals replace the
+old sign on their first opposite input, every replayable input predicts a same-sign nonzero 120 Hz first frame,
+target resets retain zero state, and all traces stay below the configured remaining-area cap. `./dev.sh build`
+succeeds and `git diff --check` is clean.
+
+Remaining tradeoffs/gates: Phase 2 is complete, but Phase 3 is not accepted from automated evidence alone. The
+deployed shadow build still needs extended physical use across fresh/sparse/fast/stop/rebound/reversal/idle/target,
+each display, horizontal, and compatibility/effect cases. Its predictions must be compared with the simultaneous
+legacy records before parameters change or `ring-live` is enabled. The historical ordinary healthy-start fixture
+lacks physical unit values and therefore remains a legacy latency comparator rather than a model replay.
+
+## 2026-09-02 — First Phase 3 capture finds a raw-unit tuning-domain error
+
+Symptom/evidence: helper PID `41944` filled the retained 2,000-event shadow window. It contains 266 raw reports and
+266 CG inputs with 100% HID pairing, 254 vertical and 12 horizontal, both directions, no fallback, no sign mismatch,
+and no overflow. The ring model accepted 206 eligible Regular reports from sequence `176` through `442`, including
+18 immediate reversals, with no rejected timestamp/generation, velocity limit, or carry drop. The other consecutive
+inputs were exercised under Rotate/Zoom effects and correctly stayed on the legacy path. Model queue time averaged
+`1.047 ms` and peaked at `6.142 ms`. Legacy first output was `5.94–16.18 ms` on retained Regular cases; the sole
+`27.32 ms` outlier was the Chromium zoom opening impulse. All 59 display-link starts on captured display `3`
+succeeded, with no tap disable or display recovery.
+
+The first mapping was not ready for live output. Across 200 aligned Regular reports, legacy requested distance was
+`1.01x` the shadow impulse for slow reports below 50 px, but `7.87x` for fast reports at or above 150 px. Legacy's
+line-derived reported speed averaged `3.86x` raw HID report-rate speed and ranged up to `9x`; this is the exact domain
+difference visible in paired records where raw HID remained one count while CG line magnitude rose to nine. The
+shadow did preserve all structural bounds: predicted first frames were nonzero and same-sign, 18 reversals replaced
+old velocity on their first input, and maximum remaining area was `185.19 px` under the then-`630 px` cap.
+
+Root cause: Phase 2 copied the legacy `50 line-units/s` reference pivot and `gamma=1.2` UI mapping into a raw HID
+model. Those legacy units already contain WindowServer magnitude amplification; raw input instead presents signed
+one-count impulses and carries free-spin speed mainly in their interval. The low-speed coincidence hid the mismatch,
+but the candidate would have made fast live scrolling several times too slow. This is model parameterization, not
+queue delay, display-link liveness, target leakage, or a missing input classifier.
+
+Change:
+
+- Recalibrate the candidate raw domain around `5 reports/s` careful motion and `50 reports/s` sustained free-spin
+  delivery. Default sensitivity now anchors 20 base pixels/count at the slow pivot and default acceleration maps to
+  `gamma=2.0`; the separate 50 reports/s output/carry calibration preserves bounded high-speed ceilings.
+- Keep the observed slow response near its already-matching value while restoring a candidate fast envelope near
+  the current accepted behavior. Replay fast traces now reach, but cannot exceed, the explicit `525 px` remaining
+  area cap.
+- Correct `dtMs` telemetry so reversal reports retain their measured interval instead of displaying `-1`, and split
+  comparison totals into session-net integrated/predicted output, current-direction integrated/predicted output,
+  and signed remaining area. This prevents a valid cumulative opposite-sign history from looking like reversal lag.
+
+Preserved behavior: the recalibrated model remains `ring-shadow`; legacy output is still the only authority. No
+posted delta, target routing, display link, animator curve, effect lifecycle, raw correlation, session reset, or
+legacy classifier changed. The evidence does not justify a new timer, confirmation gate, rebound classifier, or
+CG-point/line fallback inside the raw model.
+
+Verification: after recalibration, `./dev.sh scroll-tests` passes all policy, correlator, model/property/refresh,
+JSONL replay, and capture-analyzer suites. All replay responses remain finite, every first frame is nonzero and
+same-sign, reversals remain atomic, resets clear state, and fast fixtures clamp at or below `525 px`. `./dev.sh build`
+succeeds and `git diff --check` is clean.
+
+Remaining tradeoffs/gates: Phase 3 remains open. The recalibrated build needs a second physical shadow capture before
+any live gate. Only display `3` and the Browser/trackball-mode exercise are present in this retained window; other
+attached displays and Safari, Telegram, Finder, VS Code/Xcode compatibility are not evidenced. Reaching the carry cap
+in deterministic fast traces is intentional boundedness but must be inspected for repeated clipping and subjective
+fast-spin feel in the next shadow comparison.
+
+## 2026-09-02 — Second Phase 3 capture separates fast speed from bounded tail area
+
+Symptom/evidence: the recalibrated helper PID `47254` retained 297/297 paired raw/CG reports with no fallback, sign
+mismatch, or overflow: 260 vertical, 37 horizontal, both directions. The shadow accepted 278 eligible Regular
+updates, including 15 atomic reversals. Queue time averaged `0.952 ms` and peaked at `6.459 ms`; legacy first output
+was `5.63–16.65 ms` with `10.41 ms` average. No model reject, tap disable, display start failure, or recovery occurred.
+
+Raw-distance calibration improved as intended: across 275 aligned reports, legacy requested distance averaged
+`0.82x` the shadow impulse for slow reports and `1.72x` for fast reports, versus the first run's `1.01x` and `7.87x`.
+However, 129/278 model updates hit the user-configured `582.195 px` remaining-area limit and discarded a total
+`25,931.99 px` of requested carry. Every report at 60 or more raw reports/s clipped. Shadow velocity therefore
+plateaued near `8,213 px/s`, while retained legacy output windows reached `15,732 px/s`. Raising the remaining-area
+cap would restore speed only by creating a much longer post-stop tail, violating the rewrite's latency budget.
+
+Root cause: with normal decay near `70.9 ms`, remaining area divided by decay formed an unintended effective speed
+ceiling near `8.2k px/s`, well below the separate configured maximum velocity. Acceleration was no longer the main
+problem; lowering it would undo the now-correct raw distance curve. The model needed speed-dependent friction so a
+free spin could reach its speed ceiling without storing more future distance.
+
+Change:
+
+- Add explicit fast-decay start/full-speed parameters. Above 20 raw reports/s, decay smoothly shortens from the
+  normal value toward `remainingAreaLimit / maximumOutputVelocity`, which is 35 ms for the current mapping and
+  reaches full strength at 50 reports/s.
+- Preserve signed retained area exactly whenever decay changes by converting the old velocity/tau representation
+  into the new tau before adding the current impulse. Expose this converted `carriedVelocity` in model telemetry.
+  This avoids silently creating or deleting distance as friction adapts.
+- Keep initial and sparse response unchanged. The fast ring's physical reports supply continued motion; extra
+  software tail is neither required nor permitted to raise top speed.
+
+Preserved behavior: this remains diagnostics-only `ring-shadow`; legacy is the only event producer. The tail-area
+limit is not raised, every cap remains independent, reversals still discard old-sign area atomically, and no legacy
+animation, classifier, effect, target, display, or output behavior changed.
+
+Verification: `./dev.sh scroll-tests` passes after adding adaptive fast decay and area-preserving tau conversion.
+The packetization-independence test initially caught the missing area conversion; after correcting it, linear
+aggregated and split reports again integrate identically. All captured replays remain bounded at or below the
+configured area limit, reversal/reset/refresh invariants pass, capture analysis passes, and `git diff --check` is
+clean.
+
+Remaining tradeoffs/gates: Phase 3 remains open for a third physical capture. The next evidence must show that the
+velocity envelope rises without extending stop area, that clipping represents deliberate maximum-speed saturation
+rather than ordinary mid-speed loss, and that first-frame output remains acceptable. Only display `3` is captured;
+multi-display and wider application compatibility remain unproven.
+
+## 2026-09-02 — Third Phase 3 capture reaches explicit fast limits and exposes a sparse integer-output edge
+
+Symptom/evidence: helper PID `4477` retained 270/270 paired raw/CG reports with no fallback, sign mismatch, or
+overflow. The window contains 271 shadow updates because its first input record rolled out one line earlier, 16
+reversals, and three app/window target resets. Queue time averaged `1.005 ms` and peaked at `5.940 ms`; 39 legacy
+starts produced first output in `5.49–14.61 ms`. Every display start on display `3` succeeded and there was no tap
+disable, display recovery, model rejection, or carry drop.
+
+Adaptive fast friction achieved its intended separation. Maximum remaining area stayed exactly at the configured
+`582.195 px`, carry drops fell from 129 to zero, and 39 reports saturated through the explicit velocity limit instead.
+Peak shadow velocity reached the current Maximum Speed setting's `27,846.95 px/s`; tau shortened as raw speed rose,
+from ordinary/sparse values down to `20.907 ms` at the ceiling. All 16 reversals retained their measured
+`98.004–478.979 ms` intervals, discarded the old sign on the same update, and emitted no wrong-sign model velocity.
+
+One retained slow sequence exposed a distinct response edge. Sequence `354` arrived one count after a `928.038 ms`
+gap. Its honest raw-speed acceleration distance was `8.713 px`, but sparse overlap selected `217.434 ms` tau, so the
+120 Hz first-frame prediction was only `0.334 px` and two callbacks accumulated `0.655 px`. The current integer sink
+could therefore wait roughly three callbacks even though the physical report reached the model immediately. Across
+the capture, eight of 271 updates shared this two-fast-callback visibility problem.
+
+Root cause: the fast path was now correctly bounded, but sparse cadence and very-low-speed acceleration were allowed
+to combine without an explicit integer-output responsiveness constraint. Total distance was finite and intentional;
+only its temporal distribution could remain subpixel beyond the plan's one-or-two-callback gate.
+
+Change:
+
+- Add an explicit visibility window of two 144 Hz callbacks and a one-pixel minimum. If a nonzero impulse has enough
+  total area but its selected tau would emit less than one pixel inside that window, shorten tau analytically just
+  enough to cross the threshold. Do not add distance or alter acceleration.
+- Expose `responsivenessDecayLimited` per model update. On the retained capture the rule would affect only eight
+  sparse updates, changing their average tau from `219.2 ms` to `154.5 ms`; fast and ordinary responses are unchanged.
+- Add a deterministic test reproducing the 928 ms sparse case and assert at least one pixel of analytic output in two
+  144 Hz callbacks.
+
+Preserved behavior: legacy remains authoritative and unchanged. The bound creates no timer, held report, synthetic
+confirmation, delayed replay, extra distance, carry reservoir, or artifact classification. Fast velocity/area caps,
+atomic reversal, raw correlation, routing, effects, and display lifecycle remain unchanged.
+
+Verification: `./dev.sh scroll-tests` passes all legacy policy, correlator, model/property, packetization, fixed and
+variable refresh, replay, and capture-analyzer suites. The new two-callback visibility test passes; all prior bounds
+and sign/reset invariants remain green. `./dev.sh build` succeeds and `git diff --check` is clean.
+
+Remaining tradeoffs/gates: a short physical shadow confirmation of sparse single-count input remains before Phase 3
+can close. Horizontal evidence exists in the prior two captures but not this third window. All three captures used
+display `3`; no evidence shows another display is attached, so multi-display validation remains a Phase 4 live gate
+if additional hardware is available.
+
+## 2026-09-02 — Final sparse confirmation closes Phase 3 shadow mode
+
+Symptom/evidence: helper PID `7071` captured the requested deliberate single-count sequence. It paired 41/41 CG
+inputs from 44 retained raw samples with no fallback, sign mismatch, or overflow. The model accepted all 41 reports;
+15 selected `responsivenessDecayLimited=1`. Recomputing every accepted response at the plan's fastest tested schedule
+found minimum cumulative output of `1.000461 px` within two 144 Hz callbacks, with zero reports below one pixel.
+Three reversals remained same-update and same-sign, maximum retained area was `227.731 px`, and there were no carry
+drops, velocity-cap events, stale/invalid rejects, display failures, or recovery records.
+
+Queue time averaged `1.225 ms`. One report queued `7.972 ms` and produced the sole `20.28 ms` legacy first-output
+sample; the other 35 latency records and `10.43 ms` overall mean show no repeated long-tail class. The outlier occurred
+on sequence `2` immediately after helper launch while the routed target was the Mac Mouse Fix app. It did not coincide
+with a tap disable, failed display start, raw fallback, model reject, target leak, or later slow-response failure.
+
+Root cause: the prior captured subpixel delay was fully explained by sparse tau distributing a small honest raw-speed
+impulse below the integer sink's threshold. The analytic response-time cap addresses that representation boundary;
+there is no evidence for an idle artifact classifier, report confirmation, queue workaround, or display recovery.
+
+Change: no further model change was needed after the two-callback response bound. Mark Phase 3 complete in the rewrite
+plan and retain `legacy` as the only live output authority. Phase 4 is authorized only to add a development-gated
+vertical renderer with an immediate legacy fallback; it must not switch the default.
+
+Preserved behavior: all application-visible scrolling in these four shadow passes came from the legacy engine. Raw
+observation remained non-seizing and immediate, effects remained legacy-only, resets stayed generation ordered, and
+the shadow never posted or modified an event.
+
+Verification: final physical telemetry proves the response bound on real 0.3–1 second single-count intervals.
+`./dev.sh scroll-tests`, the full Xcode build, and `git diff --check` passed on the deployed candidate. Across the
+preceding shadow captures, raw/CG pairing, active/paused reversal, fast saturation, hard-stop area, target resets,
+horizontal input, Rotate/Zoom exclusion, and legacy first-output health were also observed without a new unexplained
+failure class.
+
+Remaining tradeoffs/gates: only display `3` appeared in every capture; if another display is attached later, Phase 4
+must test it before live acceptance. Safari, Telegram, Finder, VS Code/Xcode, and the full effect matrix remain Phase
+4/5 compatibility gates. The raw model intentionally gives a genuinely near-1-report/s count less total distance
+than legacy's isolated 32 px floor, but makes it visible immediately; subjective A/B testing must decide UI tuning,
+not another hidden-state classifier.
+
+## 2026-09-02 — Phase 4 vertical live renderer is gated for physical A/B
+
+Symptom/evidence: four Phase 3 captures established healthy raw/CG pairing, normal queue delivery, atomic model
+reversal, explicit fast saturation, bounded remaining area, and two-callback sparse visibility. They also showed no
+evidence for another wake/tail classifier. The remaining gap was architectural: `ring-shadow` could predict motion
+but had no display-paced integer output owner, liveness supervision, or mutually exclusive handoff from the legacy
+animator. This change does not attribute any perceived delay to the queue, display link, target application, or
+hardware beyond the raw baseline behavior already captured above.
+
+Root cause/design decision: using an independent second display link would permit old legacy callbacks and new live
+callbacks to overlap during vertical/horizontal or effect transitions. Phase 4 instead shares the existing
+`TouchAnimator` `DisplayLink` and its serial queue. Ordered cancellation/reset, display rebinding, callback
+replacement, and legacy restart now establish exactly one output authority. The pure leaky-impulse model remains the
+only new motion state; no finite target curve or legacy intent classifier was copied into it.
+
+Change (`Helper/Core/Scroll/RingScrollRenderer.h/.m`, `Helper/Core/Scroll/Scroll.m`, `dev.sh`, capture analyzer and
+tests, Xcode project, rewrite plan):
+
+- Added a renderer which owns model/subpixel state on the shared display-link queue, analytically integrates actual
+  frame intervals, emits phase-less vertical pixel-wheel output through the existing sink, stops when no visible
+  integer output remains, and aggregates frame cadence/output telemetry.
+- Reset publishes its generation before queue delivery so an already-admitted old callback cannot post after a
+  target/config/modifier/click reset. Reversal clears old-sign velocity and subpixel error on the same report.
+- Retained the hardened 110 ms cold-start watchdog contract with three restarts and a true stopped abort. New input
+  invalidates a requested-running stalled link, discards its old tail, and processes the current report as a fresh
+  model opening. A callback resuming after a greater-than-100 ms parked interval discards the old remaining area
+  instead of posting it as one secondary burst.
+- Added a startup-immutable, Debug-only `legacy|ring-shadow|ring-live` selector. Legacy is the default and the forced
+  Release behavior. Live eligibility is exact TB800, vertical, Regular/Low Inertia custom acceleration, and no effect;
+  all nonmatches reset live state and enter legacy immediately.
+- Extended capture reporting with selected engine, live first-output/queue distributions, model rejects/reversals/
+  limits/carry, frame cadence/gaps, parked/stall discards, and display/tap lifecycle counts. Added the exact A/B and
+  rollback procedure to the rewrite plan. The independent HID sidecar now identifies itself as a non-authoritative
+  observer instead of hard-coding `output=legacy`, which would be false while the gated live renderer is selected.
+
+Preserved behavior: raw HID correlation never waits and CG-line fallback remains immediate. Horizontal, other-device,
+Apple-acceleration, non-Regular, zoom, rotate, and all other effect paths remain legacy. Continuous events retain the
+existing synthetic marker, HID-tap posting, line/fixed-field pixelation, and unset phase/momentum fields. The selector
+does not change at runtime, Release cannot select live, discarded area is not stored or replayed, and no timer,
+confirmation count, direction vote, artifact sanitizer, or second distance reservoir was added.
+
+Verification: `plutil -lint Mouse\ Fix.xcodeproj/project.pbxproj`, `git diff --check`, and `./dev.sh scroll-tests`
+pass, including all legacy cadence/display/output policy suites, raw correlator tests, motion model properties,
+60/120/144/variable-refresh schedules, captured JSONL replays, and five capture-analyzer tests. The full Debug app and
+embedded Helper build succeeds. The first sandboxed build attempt could not write Xcode/Swift caches; the same build
+run with normal cache access completed with `BUILD SUCCEEDED`, so that environmental failure is not attributed to the
+renderer.
+
+Remaining gate/tradeoff: no `ring-live` physical event has been posted by this implementation yet. Phase 4 therefore
+remains open for the documented legacy/live A/B, full vertical regression matrix, every attached display, and a
+telemetry-confirmed rollback. A display gap above 100 ms intentionally discards bounded old motion rather than
+bursting it on resume; the next physical report remains independently cold-startable. Subjective testing must still
+decide whether the calibrated raw one-count distance and sparse overlap feel correct before any default change.
+
+## 2026-09-02 — Phase 4 legacy baseline passes and ring-live A/B begins
+
+Symptom/evidence: the completed legacy half of the Phase 4 physical A/B was captured from helper PID `50471` and
+preserved at `/tmp/mac-trackball-fix-scroll-phase4-legacy.log`. Its retained window contains 390 vertical CG reports
+and 390 successful raw-HID correlations, both directions, 308 multi-unit CG reports, and Browser/kitty target
+transitions. There were zero fallbacks, sign mismatches, buffer overflows, tap disables, display recoveries, or
+display-start failures. Queue time was `0.38–4.34 ms` (`0.98 ms` mean), and first output was `5.86–14.38 ms`.
+All 54 display starts on the only observed display, display `3`, returned success. This evidence does not attribute
+perceived response shape to the queue, display link, target application, or raw acquisition.
+
+Change/progression: no scroll policy or model constant changed. The baseline snapshot was frozen before changing the
+startup-immutable selector. `./dev.sh ring-engine ring-live` followed by `./dev.sh run` built successfully and
+deployed the Debug candidate. The final helper PID `54090` logged at `22:31:04.201`
+`requested=ring-live selected=ring-live debugBuild=1 legacyFallback=1 verticalOnly=1`; the sidecar started
+non-seizing, the TB800 attached as registry ID `4294971676`, and generation-ordered model/session resets completed.
+
+Preserved behavior: the legacy capture is unchanged and remains available for direct comparison. The live selector
+still affects only exact-TB800 vertical Regular/Low Inertia custom acceleration with no effect; all other paths keep
+their immediate legacy fallback. Release defaults, raw correlation, routing, synthetic marking, and output fields
+remain unchanged.
+
+Verification: `./dev.sh ring-capture-report /tmp/mac-trackball-fix-scroll-phase4-legacy.log` reported the accepted
+pairing/lifecycle/latency evidence above. `./dev.sh run` completed with `BUILD SUCCEEDED`, and the rolling recorder
+captured the final live startup and attachment records. The live physical matrix has not yet been exercised, so this
+entry advances the A/B handoff but does not close Phase 4.
+
+Remaining gate/tradeoff: repeat the identical vertical matrix under PID `54090`, inspect live model/frame/latency
+telemetry and subjective feel against the preserved baseline, then restart in `legacy` and verify the rollback
+selection. Only display `3` has been observed; every additional attached display remains required if available.
+
+## 2026-09-02 — Phase 4 live A/B and rollback pass
+
+Symptom/evidence: the `ring-live` candidate physical pass from helper PID `54090` was preserved at
+`/tmp/mac-trackball-fix-scroll-phase4-ring-live.log`. Its retained window contains 301 raw reports and 301 CG
+reports with 100% correlation: 275 vertical, 26 horizontal, both directions, zero fallback, zero sign mismatch, and
+zero overflow. Browser, kitty, and Safari targets were present, along with explicit target resets and three complete
+Chromium zoom sessions. The user completed the requested physical matrix without reporting a subjective failure.
+
+Candidate behavior:
+
+- All 301 physical inputs are accounted for by 240 eligible `ring-live` model updates and 61 legacy-path model
+  reports. Horizontal and effect paths reset the live generation and used legacy; there is no evidence of concurrent
+  output authority.
+- Ten direction changes cleared carried velocity to zero and established the current report's sign on the same
+  model update. There were no stale/invalid rejects and no carry drops. Twenty-four fast reports reached the explicit
+  velocity limit, while maximum remaining area stayed at the configured `582.195 px` bound.
+- Live first-output latency was `0.59–20.65 ms` (`4.82 ms` median, `11.87 ms` p95, `5.30 ms` mean) and queue time
+  was `0.34–7.52 ms` (`1.04 ms` mean). The sole `20.65 ms` maximum was sequence `589`, a one-count sparse report
+  whose `responsivenessDecayLimited=1` response crossed the integer sink after display-paced subpixel integration;
+  its queue time was only `1.26 ms`, display start succeeded, and adjacent callbacks remained at `8.333 ms`.
+- Across 103 frame summaries, the renderer processed 3,040 callbacks and posted 2,201 nonzero events at exactly
+  `120 Hz`, with maximum callback gap `8.333 ms`. There were no parked-frame or stalled-start discards, display
+  recoveries, start failures, or tap disables.
+
+Comparison/root-cause conclusion: the frozen legacy baseline had `10.33 ms` median / `14.07 ms` p95 first-output
+latency and `0.98 ms` mean queue time. The live candidate reduced typical first-output latency without moving work
+into the event queue. Its one larger sparse maximum was bounded integer visibility, not a queue, display-link,
+target, or HID-acquisition stall. No new classifier, timer, confirmation gate, delayed replay, or retained-distance
+failure is justified by this capture.
+
+Change/progression: no model parameter or output policy changed after the live evidence. The startup selector record
+had rolled out of the bounded candidate file, but the pre-pass snapshot and preceding ledger entry independently
+recorded PID `54090` selecting `ring-live`, and every retained model/frame record identifies `engine=ring-live` with
+`legacyAuthoritative=0`. After preserving the candidate, `./dev.sh ring-engine legacy` and `./dev.sh run` rebuilt and
+restarted the helper. Final helper PID `56505` logged at `22:39:23.159`
+`requested=legacy selected=legacy debugBuild=1 legacyFallback=1 verticalOnly=1`, completing the rollback gate.
+
+Preserved behavior: the installed Debug helper is back on legacy. The live engine remains opt-in, exact-TB800,
+vertical, Regular/Low Inertia, and no-effect only; Release still forces legacy. Horizontal, zoom/effect, raw fallback,
+target resets, synthetic output fields, and shared display-link lifecycle remain unchanged.
+
+Verification: `./dev.sh ring-capture-report` was run on both preserved captures; targeted input/model/frame/latency/
+target/zoom/display/tap correlation supplied the evidence above. `./dev.sh scroll-tests` passes the cadence,
+display-lifecycle, output-policy, correlator, motion-model, captured replay, and five analyzer suites. Both candidate
+deployment and rollback builds completed with `BUILD SUCCEEDED`; `git diff --check` passes.
+
+Remaining tradeoff: only runtime display `3` was observable, and `system_profiler SPDisplaysDataType` did not
+enumerate another attached display at closure. Phase 4 is complete for the available hardware, but a later attached
+physical display still requires a fixed-pointer pass. Wider Safari/Chromium/Telegram/Finder/VS Code/Xcode and
+horizontal/effect compatibility remain Phase 5 gates. The one-count raw model intentionally favors immediate bounded
+visibility over legacy's larger idle-dependent opening, and the user-facing default remains unchanged.
+
+## 2026-09-03 — Phase 5 raw Pan renderer and compatibility routing begin
+
+Symptom/evidence: before changing output authority, the rolling capture on legacy helper PID `56505` contained
+303/303 paired vertical TB800 reports, both directions, zero fallback, sign mismatch, or overflow. First output was
+`5.58–21.00 ms` (`11.51 ms` median, `14.80 ms` p95); no display-start failure, recovery, or tap disable appeared.
+This current capture does not contain horizontal input and therefore is not evidence for horizontal feel, but it
+rules out a new general queue/display/tap regression. Phase 4's preserved live capture already contained 26 paired
+horizontal reports which intentionally fell back to legacy, while the earlier raw Pan capture established that
+Consumer Pan polarity agrees with CGEvent and the deterministic horizontal replay passes both directions and
+reversal.
+
+Root cause/design decision: Phase 4 deliberately hard-coded live eligibility and renderer telemetry to vertical.
+Simply admitting Pan while retaining one unlabelled scalar state could post vertical velocity or biased subpixel
+error through horizontal event fields during an axis transition. Maintaining two simultaneously coasting models
+would instead create two output authorities and ambiguous cancellation. Phase 5 treats axis as scroll-session
+identity: an axis change publishes a new generation and clears the old scalar motion before processing the current
+report, while both axes reuse the same bounded model, display link, and compatibility sink.
+
+Change (`Helper/Core/Scroll/RingScrollRenderer.h/.m`, `Helper/Core/Scroll/Scroll.m`, `dev.sh`, capture analyzer,
+tests, and rewrite plan):
+
+- The exact TB800 Regular custom-acceleration live gate now accepts vertical Wheel and horizontal Consumer Pan.
+  Canonical positive output maps to up/right and negative output to down/left through the existing phase-less
+  two-axis pixel-wheel event constructor, preserving its line/point/fixed fields and HID-tap routing.
+- Renderer reports and callbacks carry an explicit axis. Vertical <-> horizontal transitions reset generation,
+  velocity, pending latency, and the biased subpixel accumulator before the same report opens the new axis. A
+  mismatched axis without a reset is rejected defensively instead of leaking old-axis state.
+- Added `MFSCROLL_RING_ROUTE` for each exact-device live decision. It records live ownership or immediate legacy
+  fallback with reason `effect`, `system-acceleration`, `non-regular`, or a validation failure. Analyzer schema v3
+  now reports route/model/frame counts and first-output/queue distributions by axis, fallback-reason counts,
+  observed horizontal live output, and the System/non-Regular/effect fallback coverage gate.
+- The Debug selector message/startup record now advertises `horizontalPan=1`; Release behavior and the restart-only
+  rollback selector remain unchanged.
+
+Preserved behavior: raw correlation never waits and CG-line fallback remains usable. A report is never held,
+confirmed, replayed, or discarded to infer axis intent. Same-axis acceleration, sparse overlap, atomic reversal,
+velocity/area/initial-distance caps, parked-frame discard, watchdog recovery, target/config/click reset, and
+phase-less ordinary output are unchanged. Effects—including zoom and its terminal lifecycle—System acceleration,
+non-Regular curves, other devices, and invalid live inputs still enter the legacy `TouchAnimator` path on the same
+report. No second display link, second motion reservoir, or simultaneous axis coast was introduced.
+
+Verification: `./dev.sh scroll-tests` passes the full cadence, display lifecycle, output policy, correlator, motion
+model/property/refresh, captured replay, and six analyzer tests, including the captured horizontal Pan replay and
+new vertical/horizontal live-route plus fallback-reason accounting. `plutil -lint` on the Xcode project,
+`bash -n dev.sh`, `git diff --check`, and the full Debug build pass. The first sandboxed build was denied access to
+existing Swift/Xcode cache directories; the normal-cache build then completed with `BUILD SUCCEEDED`, so that
+environmental error is not attributed to the code. The final instrumented candidate was deployed through
+`./dev.sh run`; helper PID `66968` selected `ring-live` at `19:39:00.589`, started the non-seizing HID observer,
+attached registry ID
+`4294971676`, reset configuration, and re-enabled its event tap.
+
+Remaining gate/tradeoff: implementation is complete but Phase 5 is not physically accepted. PID `66968` must cover
+native horizontal slow/fast/stop/reversal, active vertical/horizontal handoffs, Safari/Chromium boundaries,
+Telegram, Finder, VS Code/Xcode, System and non-Regular fallbacks, zoom/rotate/other effects with terminal phases,
+target changes, and every available display. A vertical/horizontal transition intentionally discards the bounded
+old-axis tail rather than allowing diagonal synthetic coasting; the new-axis physical report is delivered
+immediately. The installed candidate is development-gated and rollback remains `./dev.sh ring-engine legacy`
+followed by `./dev.sh run`.
+
+## 2026-09-04 — independent Wheel/Pan overlap repeatedly reset the live renderer
+
+Symptom: after releasing the vertical ring and beginning horizontal Pan, scrolling visibly stuttered. The hardware
+has separate physical Wheel and Consumer Pan controls rather than one control whose axis changes.
+
+Current telemetry before attribution (helper PID `66968`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-axis-stutter.log`):
+
+- The retained window has 248/248 paired raw/CG reports (220 vertical, 28 horizontal), zero fallback, sign mismatch,
+  buffer overflow, model rejection, display recovery/start failure, or tap disable. Ring-live first output was
+  `0.59–14.18 ms`; horizontal queue time was `0.33–2.43 ms`, and renderer callbacks stayed at `120 Hz` with an
+  `8.333 ms` maximum gap. This rules out the input queue, HID correlation, target application, display callback
+  cadence, and event tap as the source of the reported transition stutter.
+- At `09:08:21.578–.657`, the actual input order was vertical sequence `502`, horizontal `503`, trailing vertical
+  `504`, horizontal `505`, and vertical `506`. Each axis transition emitted `reason=axis-change`, stopped the shared
+  display link, discarded the other axis's bounded motion/subpixels, opened with `dtMs=-1`, and started the link
+  again. The complete window contains 28 such axis resets—the same count as horizontal reports—and two reports
+  never reached an axis-specific first-output record before a following reset.
+
+Confirmed root cause: Phase 5 modeled axis as mutually exclusive session identity. That assumption conflicts with
+the device protocol: a released free-spinning Wheel can continue emitting while the independent Pan ring begins.
+Interleaved legitimate reports therefore caused generation ping-pong and repeated cold openings. The previous
+single-axis design avoided cross-axis leakage, but did so by discarding real independent motion and churning the
+one display lifecycle.
+
+Change (`RingMotionPlane.h`, `RingScrollRenderer.h/.m`, `Scroll.m`, motion/analyzer tests, project, and rewrite plan):
+
+- Add a pure two-axis plane containing one bounded `RingMotionModel` state for Wheel and one for Pan. They share the
+  target/config generation and actual frame interval, but retain independent input timestamps, speed/cadence,
+  velocity/decay, remaining-area cap, direction, and biased subpixel accumulator.
+- Axis reports no longer publish a generation reset. Same-axis reversal still clears old-sign velocity, subpixels,
+  and pending latency on that axis only. Target/config/modifier/click/display, liveness recovery, and compatibility
+  fallback resets still clear both axes atomically.
+- One renderer, one shared `DisplayLink`, and one output callback remain authoritative. Each frame advances both
+  states and combines nonzero horizontal/vertical integer components into one phase-less two-axis pixel-wheel event.
+  The link stops only after neither axis has visible future output. The output zero-vector check now tests both
+  components instead of their sum, so equal-and-opposite diagonal components are valid.
+- Pending first-output latency is consumed only when its own axis produces a pixel. Frame telemetry adds per-axis
+  event/output/remaining fields and `axis=mixed`; analyzer schema v4 reconstructs per-axis output and makes any
+  `reason=axis-change` reset an explicit regression signal.
+- The shared continuous-wheel line pixelator now supports selective X/Y reset, so reversing one physical ring also
+  cancels that ring's fractional line bias without erasing the other ring's independent fraction.
+
+Preserved behavior: reports are processed immediately without a timer, confirmation count, axis arbiter, or replay.
+Each wheel keeps atomic reversal and its independent initial-distance, velocity, and remaining-area bounds. There is
+still one event producer and no second display link or target-distance reservoir. Raw fallback, synthetic marking,
+phase-less ordinary output, legacy System/non-Regular/effect routing, effect terminal phases, generation ordering,
+parked-tail discard, and cold-start watchdog semantics are unchanged.
+
+Verification: `./dev.sh scroll-tests` passes all cadence, display-lifecycle, output-policy, correlator, motion,
+captured replay, and seven analyzer suites. The new pure test exercises vertical -> horizontal -> trailing vertical,
+proves both signed frame components coexist, proves a vertical reversal cannot mutate horizontal state, and confirms
+that a real session reset clears both. `plutil -lint`, `bash -n dev.sh`, and `git diff --check` pass. The full Debug
+Xcode build succeeds; the first sandboxed attempt failed only because existing Swift/Clang cache directories were
+not writable, and both normal-cache retries completed with `BUILD SUCCEEDED` after the final selective-subpixel
+integration.
+
+Remaining gate/tradeoff: deployment was attempted, and the rebuilt app installed the candidate, but macOS currently
+enumerates no active display (`system_profiler SPDisplaysDataType` lists only the GPU). Helpers `97160`, `97188`, and
+later launchd retries aborted in the pre-existing `DisplayLink.m` startup assertion with `InvalidArgument` before
+HID attachment or renderer use. The exact `com.pixeption.mac-mouse-fix.helper` job was booted out to stop the
+10-second crash loop. This is the same no-display environment blocker recorded in Phase 1, not evidence about the
+two-axis change. Once a display is available, restart through `./dev.sh run` and perform the exact overlap retest;
+its capture must show zero axis-change resets and no display stop/start churn while interleaved Wheel/Pan reports
+retain one generation. Simultaneously coasting both independent rings can intentionally create diagonal wheel
+events; each component remains independently bounded, so combined vector magnitude can reach `sqrt(2)` times one
+axis's maximum if both rings are physically driven at their individual ceilings. Compatibility/effect and wider
+application gates for Phase 5 remain open.
+
+## 2026-09-04 — independent Wheel/Pan overlap passes the physical telemetry gate
+
+Symptom retested: beginning horizontal Pan while the released vertical Wheel still emitted reports previously
+stuttered because every axis transition reset the shared renderer and display link. The two-axis replacement needed
+physical evidence that independent motion can overlap without cross-axis cancellation or lifecycle churn.
+
+Evidence (helper PID `29474`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-independent-axes.log`):
+
+- Startup selected `ring-live` with `horizontalPan=1 independentAxes=1`, and the exact TB800 attached non-seizing as
+  registry ID `4294971676`.
+- All 126 raw reports paired with 126 handled CG reports: 96 vertical and 30 horizontal, both directions, with zero
+  fallback, sign mismatch, buffer overflow, model rejection, or carry drop. All reports routed to the live renderer.
+- Sequences `20–24` interleaved vertical/horizontal input, and sequences `64–81` repeatedly alternated axes. They
+  retained generation `5` and produced zero `reason=axis-change` resets. Eleven frame windows reported `axis=mixed`;
+  their vertical and horizontal pixel components were both represented in the shared output event stream.
+- The renderer processed 975 callbacks and posted 829 nonzero events across 34 summaries at `120 Hz`, with an
+  `8.333 ms` maximum callback gap. Display starts occurred only at real cold session starts, not on axis transitions.
+- Six horizontal and five vertical direction changes discarded the reversing axis's carried velocity on the same
+  update without a generation reset. Mixed output continued around the overlap sequences, providing runtime evidence
+  that reversal did not clear the other axis.
+- First-output latency was `0.92–21.03 ms`; p95 was `12.54 ms` horizontally and `11.72 ms` vertically. Horizontal
+  queue time was `0.50–5.92 ms`, vertical queue time was `0.31–5.23 ms`. The one 21.03 ms horizontal maximum was
+  still within the planned integer-output visibility window, not accompanied by queue, display, HID, or tap failure.
+- The explicit remaining-area bound held at `582.195 px`; two reports reached the velocity cap. There was no parked
+  or stalled-tail discard, display start failure/recovery, or unexplained tap disable.
+
+Conclusion/progression: the prior failure was the rejected axis-as-session design, not the input queue, HID pairing,
+target application, or display cadence. The independent two-model plane fixes that specific physical regression: it
+retains one renderer generation and one display lifecycle while emitting combined phase-less two-axis events. No
+additional code or tuning change was justified by this capture.
+
+Verification: refreshed the bounded recorder, ran `./dev.sh ring-capture-report`, inspected interleaved model,
+mixed-frame, reversal, display, target, latency, and tap records, preserved the snapshot, reran the full
+`./dev.sh scroll-tests` suite, and ran `git diff --check`. Automated cadence, display lifecycle, output policy,
+correlator, motion-plane/property/refresh, captured replay, and analyzer tests all pass.
+
+Preserved behavior/tradeoff: reports remain immediate and each physical ring retains independent cadence, velocity,
+subpixels, reversal, and bounds under one event producer. Simultaneous coasting may intentionally produce diagonal
+wheel events, whose vector magnitude can exceed a single axis while each component stays independently bounded.
+This capture covered Browser and Kitty on display `3`; it did not exercise System/non-Regular/effect fallbacks,
+Safari/Telegram/Finder/VS Code/Xcode compatibility, additional displays, or an explicit post-test subjective verdict.
+Phase 5 therefore remains open for those gates and a telemetry-confirmed legacy rollback before Phase 6.
+
+## 2026-09-04 — sparse stopped openings felt slow despite healthy delivery
+
+Symptom: an isolated slow ring count after output had stopped felt as though scrolling started late. The delay was
+reproducible in the first visible part of the response, but it was not accompanied by a stalled helper or an input
+delivery failure.
+
+Current telemetry before attribution (helper sequence `2020` at `23:02:44.619`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-slow-start-2026-09-04-2302.log`):
+
+- The prior output had stopped and the physical report gap was `694.026 ms`. The report reached the scroll queue in
+  `1.107 ms`, and its first integer output arrived in `9.02 ms`; HID/CG pairing, the event tap, and the display-link
+  callback stream were healthy. The perceived slow start therefore was not queueing, target-application, HID,
+  event-tap, or display latency.
+- The one-count report had raw omega `1.441`, mapped distance `11.347 px`, and decay `150.543 ms`. Its resulting
+  velocity was only about `76.146 px/s`, so the same bounded distance was distributed too softly after the screen
+  had already become still. The existing responsiveness cap was active, but its one-pixel/two-fast-callback
+  visibility criterion guaranteed detection rather than a decisive stopped opening.
+
+Confirmed root cause: the response floor did not distinguish a live sparse report, where preserving ongoing motion
+is important, from a report arriving after velocity and retained distance were effectively exhausted. Applying a
+larger impulse or restoring the rejected legacy `32 px` minimum would add distance and amplify wrong-sign hardware
+rebound. Waiting for another report would restore the rejected confirmation delay. The missing distinction was
+only the rate at which an already-bounded stopped-opening distance becomes visible.
+
+Change (`RingMotionModel.h`, ring renderer/shadow telemetry, motion/analyzer tests):
+
+- A report starts from stopped output only when pre-report velocity is at most the renderer's existing `1 px/s`
+  stop threshold and pre-report remaining distance is at most the existing `1 px` visibility floor. First reports
+  meet the same definition. Sparse reports arriving over still-visible motion do not enter this branch.
+- Stopped openings now choose a decay no slower than required to expose `2 px` over the existing two-fast-callback
+  visibility window. Live sparse updates retain the previous `1 px` rule. This changes only decay/rate: impulse
+  distance, retained area, initial-distance cap, velocity cap, remaining-area cap, reversal semantics, and total
+  predicted output are unchanged.
+- The model and live/shadow logs expose `startsFromStoppedOutput` and
+  `stoppedOpeningResponsivenessDecayLimited`; analyzer schema v4 counts the stopped-opening caps separately. The
+  renderer and model now share one stop-velocity constant so classification and display-link stopping cannot drift.
+
+Verification: `./dev.sh scroll-tests` passes the complete cadence, display-lifecycle, output-policy, correlator,
+motion model/plane/property/refresh, captured replay, and seven analyzer suites. The new captured-shape model test
+proves the visibility window receives at least `2 px`, the retained-plus-impulse area is exactly preserved, and no
+carry is dropped; the existing live-sparse test proves an active response does not receive the stopped-opening
+floor. `git diff --check` and the full Debug Xcode build pass. The final candidate was deployed as helper PID
+`83100`; its physical capture is preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-stopped-opening-fix.log`:
+
+- All 15 raw reports paired with 15 handled CG reports and all routed through ring-live, with zero fallback, sign
+  mismatch, overflow, model reject, axis reset, or carry drop. Four stopped openings exercised the new cap; live
+  follow-ups did not.
+- Stopped sequences `3`, `6`, and `9` mapped an `8.142 px` count to `49.268 ms` decay with both stopped-opening flags
+  set. Sequence `10` mapped `14.829 px` to `95.866 ms`. First integer output across the capture was
+  `1.80–14.18 ms`; queue latency was `0.695–2.304 ms` for the stopped examples and no delivery pathology accompanied
+  the openings.
+- The renderer processed 378 callbacks and 209 output events at `120 Hz` with an `8.333 ms` maximum gap. There was
+  no parked/stalled-tail discard, display start failure/recovery, or unexplained tap disable.
+
+Preserved behavior/tradeoff: a very small isolated count after the axis has visually stopped now spends the same
+`8–15 px` over a shorter interval, so repeatedly ultra-sparse stopped counts can feel crisper or slightly more
+pulsed. Once either meaningful velocity or more than one pixel of retained output remains, the established live
+sparse blend is untouched. Because no distance is added, the change does not enlarge an opposite-sign rebound.
+Phase 5 remains open for an explicit subjective verdict, compatibility/effect and wider-application coverage,
+additional displays, and the telemetry-confirmed legacy rollback.
+
+## 2026-09-05 — subpixel-exhausted tail escaped the stopped-opening response
+
+Symptom: a recent vertical start again felt slow after the two-pixel stopped-opening response was deployed.
+
+Current telemetry before attribution (helper PID `83100`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-nearly-exhausted-slow-start-2026-09-05-2202.log`):
+
+- The retained session contains 255/255 paired raw/CG reports, zero fallback, sign mismatch, overflow, model reject,
+  axis reset, carry drop, display recovery/start failure, or tap disable. Across 256 ring-live latency samples,
+  first integer output was `0.62–13.50 ms` and queue time was `0.32–9.82 ms` (`0.52 ms` median). Renderer callbacks
+  remained at `120 Hz` with an `8.333 ms` maximum gap. This again rules out the queue, HID correlation, display
+  link, target application, and event tap as a general slow-start source.
+- The newest distinct weak shape was sequence `4766` at `22:02:34.310`. It arrived `411.004 ms` after a fast
+  sequence and reached output in `1.18 ms` with `0.729 ms` queued, but selected `145.229 ms` decay for an
+  `18.267 px` one-count response. Only about `0.648 px` of the prior response remained, so there was no meaningful
+  integer motion left to overlap.
+- The model nevertheless emitted `startsFromStoppedOutput=0` because the old classification also required residual
+  analytic velocity at or below `1 px/s`; the short prior decay represented its subpixel remainder as
+  `8.831 px/s`. The preceding frame window had already drained remaining output from `48.570 px` to `1.435 px`,
+  and the report arrived after it fell below one pixel. This is a visibility-classification failure, not a repeat of
+  the already-working two-pixel decay bound.
+
+Confirmed root cause: stopped-opening classification conjoined two different concepts. Remaining area determines
+whether any future integer output can still be visible, while the renderer's `1 px/s` threshold determines when to
+stop analytic callbacks. A short tau can keep analytic velocity above `1 px/s` even when less than one pixel remains
+in total, allowing a visibly fresh report to use the live sparse response.
+
+Change (`RingMotionModel.h`, `RingMotionModelTests.c`):
+
+- An axis now starts from stopped output when pre-report remaining area is at most the existing one-pixel visibility
+  floor, independent of its analytic velocity representation. The first report remains stopped by definition.
+- More than one pixel of retained motion still selects the existing live sparse behavior. The response continues to
+  change decay only: no distance, carry, velocity ceiling, reversal behavior, timer, confirmation gate, or reservoir
+  was added.
+- Exact captured-shape coverage initializes `8.831 px/s` at `73.349 ms` decay, proving the subpixel remainder is
+  below one pixel despite exceeding the renderer stop velocity. The next report must take the stopped-opening cap,
+  preserve retained-plus-impulse area exactly, drop no carry, and expose at least two pixels in the visibility
+  window. For sequence `4766`'s captured `18.267 px` impulse, the same analytic bound reduces the maximum eligible
+  decay from `145.229 ms` to approximately `119.776 ms`.
+
+Verification: `./dev.sh scroll-tests` passes the full cadence, display-lifecycle, output-policy, correlator, motion
+model/plane/property/refresh, captured replay, and seven analyzer suites; `git diff --check` passes. The first Xcode
+build attempt failed only because the sandbox could not write existing Swift/Clang caches. The normal-cache Debug
+build then completed with `BUILD SUCCEEDED`, and `./dev.sh run` deployed the result. Helper PID `5399` selected
+`ring-live`, started the non-seizing HID observer, attached the exact TB800 registry ID `4294971676`, reset config,
+and re-enabled its event tap without a startup failure.
+
+Remaining verification/tradeoff: a post-deployment physical recurrence is still required to confirm
+`startsFromStoppedOutput=1 stoppedOpeningResponsivenessDecayLimited=1` for the formerly missed subpixel-tail shape
+and to judge feel. A report arriving while at most one pixel remains may now respond more crisply even if that last
+fraction was still decaying at more than `1 px/s`; reports with more than one pixel left retain established sparse
+overlap. The broader Phase 5 compatibility/display/effect matrix and legacy rollback remain open.
+
+## 2026-09-05 — the two-pixel stopped-opening floor still felt weak
+
+Symptom: immediately after the subpixel-tail classification fix, another stopped vertical opening felt slow.
+
+Current telemetry before attribution (helper PID `5399`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-recurrent-slow-start-2026-09-05-2256.log`):
+
+- The replacement classifier is physically verified. Sequence `1071` at `22:56:24.579` arrived after `413.016 ms`
+  with only about `0.974 px` retained despite `8.213 px/s` analytic velocity. It now correctly emitted
+  `startsFromStoppedOutput=1 stoppedOpeningResponsivenessDecayLimited=1`, selected `119.212 ms` instead of the old
+  approximately `145 ms` class, and produced first output in `0.79 ms` with `0.571 ms` queued.
+- The newest stopped opening was sequence `1085` at `22:56:39.165`, after `4.800 s` and after the prior renderer
+  had logged `action=stop`. HID and CG signs matched, display start returned `result=0`, queue time was `0.670 ms`,
+  and first output arrived in `7.24 ms`. The model correctly classified a stopped direction change and applied the
+  two-pixel response cap, but the one-count input still had only `8.142 px` total and `49.268 ms` decay. Its next
+  physical report arrived `41.979 ms` later and immediately jumped to `145.268 px`, exposing the weak initial
+  response as a short velocity notch rather than delayed delivery.
+- Across the retained helper session, all 248 raw reports paired with 248 handled CG reports, with zero fallback,
+  sign mismatch, overflow, model reject, axis reset, carry drop, display recovery/start failure, or tap disable.
+  First output was `0.76–18.05 ms` (`5.66 ms` median), queue time was `0.35–10.41 ms` (`0.62 ms` median), and 3,721
+  renderer callbacks retained a maximum `8.333 ms` gap. No queue, HID, target, tap, or display failure explains the
+  reported feel.
+
+Confirmed root cause: the classification correction worked, but the two-pixel/two-fast-callback floor remained only
+a detectability threshold. The fresh physical report demonstrates that an `8.142 px` stopped response could still
+spend three quarters of its area after that initial window and then be followed by a much stronger acceleration
+packet. Increasing report distance would also increase the indistinguishable wrong-sign long-idle baseline recorded
+in Phase 1, so temporal distribution—not amplitude or another classifier—is the safe tuning dimension.
+
+Change (`RingMotionModel.h`, `RingMotionModelTests.c`):
+
+- A stopped opening now exposes at least `3 px`, rather than `2 px`, over the same two-144-Hz-callback visibility
+  window. Live sparse reports retain the established one-pixel rule.
+- The captured `8.142 px` response therefore shortens from `49.268 ms` to approximately `30.220 ms`. Total output
+  remains exactly `8.142 px`; no distance is added to a deliberate count or an ambiguous wrong-sign baseline.
+- Captured-shape coverage reproduces the `4.800 s` stopped reversal, asserts the exact impulse distance, direction
+  cancellation, zero carry drop, decay below `31 ms`, and at least three pixels of analytic output in the window.
+
+Verification: `./dev.sh scroll-tests` passes the complete cadence, display-lifecycle, output-policy, correlator,
+motion model/plane/property/refresh, captured replay, and seven analyzer suites. The paused-reversal replay's
+maximum remaining area changed slightly (`212.673 -> 211.686 px`) because stopped response timing changed; its total
+integrated output remained exactly `-237.942 px`. `git diff --check` and the normal-cache Debug Xcode build pass.
+`./dev.sh run` deployed the candidate; final helper PID `33989` selected `ring-live`, started the non-seizing HID
+observer, attached TB800 registry ID `4294971676`, reset config, and re-enabled its tap without a startup failure.
+
+Preserved behavior/tradeoff: input remains immediate, total distance is unchanged, and reports with visible retained
+motion keep their accepted sparse overlap. Very small stopped counts are now more front-loaded and finish sooner,
+which can feel crisper or more discrete during deliberately ultra-sparse input. This is preferable to amplifying the
+known indistinguishable wrong-sign HID baseline. A physical occurrence on PID `33989` and subjective verdict remain
+required; the broader Phase 5 application/display/effect matrix and legacy rollback are still open.
+
+## 2026-09-05 — three-pixel stopped-opening response passes physical telemetry
+
+The deployed helper PID `33989` physically exercised the tuning above. The preserved capture is
+`/tmp/mac-trackball-fix-scroll-phase5-three-pixel-stopped-opening-2026-09-05.log`.
+
+- All 47 raw reports paired with 47 CG reports and routed through ring-live, with zero fallback, sign mismatch,
+  overflow, model reject, axis reset, or carry drop. Six reversals remained same-update and same-sign.
+- Stopped one-count sequences `5` and `10` mapped exactly `8.142 px` and selected `30.218 ms` decay with
+  `responsivenessDecayLimited=1 startsFromStoppedOutput=1 stoppedOpeningResponsivenessDecayLimited=1`. Sequence `5`
+  followed `22.692 s` of silence and an opposite direction; sequence `10` followed `2.197 s`. This verifies both
+  the three-pixel response and preservation of atomic reversal/total distance on real hardware.
+- A larger stopped sequence `40` mapped `22.674 px` to `97.865 ms` under the same three-pixel rule. Stopped reports
+  whose natural response already exceeded three pixels, such as sequences `6`, `17`, and `41`, were correctly not
+  shortened by the responsiveness limiter.
+- First output across all 47 reports was `1.01–12.22 ms` (`5.68 ms` median, `10.02 ms` p95); queue time was
+  `0.47–4.46 ms` (`0.71 ms` median). The renderer processed 887 callbacks and posted 603 events at `120 Hz` with an
+  `8.333 ms` maximum callback gap. There was no parked/stalled discard, display start failure/recovery, or tap
+  disable.
+
+Conclusion: the exact stopped-only timing change is physically active and healthy. No further classifier, distance,
+queue, or display change is justified by this pass. Subjective acceptance and the broader Phase 5 compatibility,
+effect, display, and telemetry-confirmed legacy rollback gates remain open.
+
+## 2026-09-05 — stopped-opening timing was healthy but amplitude still notched
+
+Symptom: after the three-pixel stopped-opening timing fix was physically verified, another vertical start felt slow.
+
+Current telemetry before attribution (helper PID `33989`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-amplitude-notch-2026-09-05-2318.log`):
+
+- The retained session had 198/198 paired vertical raw/CG reports, zero fallback, sign mismatch, overflow, model
+  reject, axis reset, carry drop, display recovery/start failure, or tap disable. First output was `0.60–23.13 ms`
+  (`5.655 ms` median, `12.289 ms` p95), queue time was `0.36–20.16 ms` (`0.61 ms` median, `3.274 ms` p95), and
+  3,536 callbacks retained an `8.333 ms` maximum gap. Delivery remained healthy.
+- Sequence `194` at `23:18:02.893` followed `903.989 ms` of silence, was correctly classified as stopped, applied
+  the three-pixel response cap, queued for `3.722 ms`, and reached first integer output in `13.19 ms`. Its measured
+  speed was only `1.106 reports/s`, so the acceleration mapping gave the one-count opening `8.924 px` total over
+  `33.896 ms`.
+- Sequence `195` arrived `46.988 ms` later and immediately mapped to `131.121 px`. The reported feel therefore
+  coincided with a roughly `9 px -> 131 px` physical acceleration discontinuity, not a missed stopped classifier,
+  slow response tau, queue delay, display-link stall, target-application delay, or HID/correlation failure.
+
+Confirmed root cause: a long silent interval is the only cadence available for the first stopped count, and using
+that interval literally in the quadratic distance map can make a real ramp begin with a very small total impulse.
+The prior two- and three-pixel changes successfully controlled when that bounded impulse became visible, but could
+not remove the amplitude notch. This new evidence justifies a narrowly bounded distance correction. It does not
+justify restoring the rejected `32–35 px` unconditional opening or report-confirmation delay: an isolated genuine
+count and the known opposite-sign long-idle hardware baseline remain indistinguishable.
+
+Change (`RingMotionModel.h`, live/shadow telemetry, model/analyzer tests):
+
+- When and only when an axis starts from visually stopped output and its measured response speed is below
+  `1.5 reports/s`, distance mapping uses `1.5 reports/s`. Raw speed, filtered speed, cadence, direction, and the
+  physical report remain unchanged. With the captured user scale this raises sequence `194`'s approximately
+  `8.924 px` opening to approximately `12.1 px`, still far below the `5 reports/s` full opening and the rejected
+  legacy minimum.
+- The existing stopped-only three-pixel/two-fast-callback temporal floor is applied to the resulting distance.
+  Reports over visible motion, stopped reports already at or above `1.5 reports/s`, fast motion, reversal
+  cancellation, caps, per-axis ownership, fallback routing, and target/display generations are unchanged.
+- Live and shadow model telemetry now expose `distanceOmega` and `stoppedOpeningDistanceRaised`; analyzer schema v4
+  counts the new branch as `stoppedOpeningDistanceRaiseEvents`. Captured-shape coverage compares the same model
+  state with and without the floor, proving identical raw/filtered speed, an `8.924 -> 12.101 px` bounded distance
+  change, and at least three pixels in the visibility window. Existing tests isolate the earlier timing-only fixes.
+
+Verification: `./dev.sh scroll-tests` passes the complete cadence, display-lifecycle, output-policy, correlator,
+motion model/plane/property/refresh, all captured replays, and seven analyzer suites; `git diff --check` and the full
+Debug Xcode build pass. `./dev.sh run` deployed helper PID `46699`. Its post-fix physical capture is preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-stopped-amplitude-floor-2026-09-05.log`:
+
+- All 24 raw reports paired with all 24 CG reports and routed through ring-live, with zero fallback, sign mismatch,
+  overflow, reject, axis reset, carry drop, display recovery/start failure, or tap disable. First output was
+  `2.56–14.61 ms`, queue time was `0.48–5.44 ms`, and 516 callbacks retained an `8.333 ms` maximum gap.
+- Stopped sequences `5`, `8`, and `15` physically exercised the branch after `5.874 s`, `4.176 s`, and `1.673 s`.
+  Each retained raw/filtered omega `1.000`, logged `distanceOmega=1.500 stoppedOpeningDistanceRaised=1`, mapped the
+  count to `11.769 px`, and applied the three-pixel response at `47.203 ms`. Sequence `15` reached output in
+  `9.92 ms` with `0.525 ms` queued, then its live `20.011 reports/s` continuation correctly bypassed the floor.
+
+Preserved behavior/tradeoff: this deliberately adds at most the gap between a sub-`1.5 reports/s` stopped mapping
+and the `1.5 reports/s` mapping, so an indistinguishable isolated wrong-sign baseline can also become modestly
+larger. The bound is approximately `12 px` at the captured sensitivity rather than the rejected `32–35 px`, and it
+never applies while more than one pixel remains visible. Subjective acceptance and the broader Phase 5
+compatibility, effect, display, and telemetry-confirmed legacy rollback gates remain open.
+
+## 2026-09-06 — replace threshold tuning with one stopped-opening velocity invariant
+
+Symptom: slow starts continued after both the three-pixel timing floor and the `1.5 reports/s` stopped-distance
+floor were deployed. The user noted that this had remained regressed across repeated narrow fixes and requested a
+different approach.
+
+Current telemetry before attribution (helper PID `46699`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-recurrent-opening-velocity-notch-2026-09-06.log`):
+
+- The retained window contained 236 ring-live model updates and latency samples, all sourced from HID with zero
+  fallback, sign mismatch, overflow, reject, axis reset, carry drop, display recovery/start failure, or tap disable.
+  First output was `0.56–18.93 ms` (`5.885 ms` median, `12.198 ms` p95), queue time was `0.39–12.24 ms`
+  (`0.735 ms` median, `3.405 ms` p95), and 4,344 callbacks retained an `8.333 ms` maximum gap. This again rules
+  out delivery, display cadence, target routing, and tap liveness as the general regression.
+- Within the same UI/config session, reset openings consistently began at `439.419 px/s`, while non-first reports
+  arriving after visible output stopped clustered around only `233–255 px/s`. Thirteen such reports exercised the
+  `1.5 reports/s` distance floor and 19 exercised the three-pixel cap, yet the subjective failure recurred. The
+  previous fixes were active but encoded detectability/amplitude thresholds rather than a consistent opening rate.
+- The newest uncovered case was sequence `1329` at `10:50:46.892`. It was a stopped reversal after `425.021 ms`,
+  queued for `0.504 ms`, and reached first output in `6.93 ms`. At raw omega `2.353`, it was above the distance
+  floor; its `17.719 px` response naturally emitted just over three pixels in the visibility window, so it also
+  escaped the timing floor. It consequently kept `70.885 ms` decay and opened at only `249.961 px/s`. Sequence
+  `1330` arrived `38.979 ms` later and jumped to `2,346.404 px/s` impulse velocity. This is another response-rate
+  notch despite healthy classification and delivery.
+
+Confirmed root cause: the model had a responsive first-report envelope, but stopped continuations were governed by
+two independent thresholds. Reports on either side of those thresholds could be visually identical openings while
+starting at materially different velocities. Raising the thresholds again would merely move the escape boundary;
+raising distance also enlarges the indistinguishable long-idle wrong-sign HID baseline. The missing invariant is
+that every visually fresh response should open at least as decisively as the accepted first report, regardless of
+which cadence/distance bucket produced it.
+
+Change (`RingMotionModel.h`, live/shadow telemetry, motion/analyzer tests):
+
+- Remove the `1.5 reports/s` stopped-distance floor. Distance again comes exclusively from the measured raw and
+  filtered report speed, so this replacement does not enlarge a genuine count or the ambiguous wrong-sign baseline.
+- For every non-first report whose pre-report remaining area is at most the existing one-pixel visible floor, cap
+  decay so its impulse velocity is at least the current configuration's normal first-report velocity. This value is
+  derived continuously from the same UI distance map, initial-speed calibration, and start decay rather than a new
+  pixel/rate constant. Faster natural openings and every report over visible motion remain unchanged.
+- Keep the three-pixel/two-fast-callback rule as the integer-output safety minimum. Telemetry now exposes the more
+  general `stoppedOpeningVelocityDecayLimited`; the analyzer separately counts
+  `stoppedOpeningVelocityLimitEvents` while retaining support for historical distance-floor captures.
+- Exact recent-shape coverage reproduces sequence `1329`, verifies that it already passed the old three-pixel rule,
+  preserves the exact `17.719 px` distance and atomic reversal with zero carry, and raises only its impulse rate to
+  the normal opening envelope. Live sparse overlap remains an explicit non-match.
+
+Verification: `./dev.sh scroll-tests` passes the complete cadence, display-lifecycle, output-policy, correlator,
+motion model/plane/property/refresh, all captured replays, and seven analyzer suites; `git diff --check` and the full
+Debug Xcode build pass. `./dev.sh run` deployed helper PID `19326`. Its post-fix physical capture is preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-opening-velocity-invariant-2026-09-06.log`:
+
+- All 32 raw reports paired with 32 CG reports and routed through ring-live, with zero fallback, sign mismatch,
+  overflow, reject, axis reset, carry drop, display recovery/start failure, or tap disable. First output was
+  `1.09–12.43 ms` (`6.65 ms` median), queue time was `0.45–4.94 ms`, and 384 callbacks retained an `8.333 ms`
+  maximum gap.
+- Stopped sequences `3`, `10`, and `16` exercised the replacement across raw omega `1.362`, `2.907`, and `1.709`.
+  Their honest distances remained `10.784`, `21.473`, and `13.254 px`, but decay shortened to `24.540`, `48.867`,
+  and `30.162 ms`; every impulse opened at exactly `439.419 px/s`, matching the normal first-report envelope.
+  They reached first output in `11.51`, `9.15`, and `6.45 ms` with sub-`0.7 ms` queue time. Live follow-ups bypassed
+  the cap and accelerated on the same report.
+
+Preserved behavior/tradeoff: no report is delayed, confirmed, discarded, replayed, or given extra distance. Atomic
+reversal, live sparse overlap, current-report acceleration, independent axes, output/carry/velocity caps,
+compatibility fallbacks, target generations, and display recovery are unchanged. An isolated ambiguous hardware
+baseline now spends its honest small distance more quickly, which can make it crisper, but no larger than its raw
+mapping. This deliberately supersedes the ineffective amplitude-floor approach rather than stacking another
+classifier or restoring the rejected `32–35 px` opening. Subjective acceptance and the broader Phase 5 application,
+effect, display, and telemetry-confirmed rollback gates remain open.
+
+## 2026-09-06 — reversal openings no longer depend on discarded old-sign area
+
+Symptom: another recent vertical opening felt slow after the stopped-opening velocity invariant was deployed.
+
+Current telemetry before attribution (helper PID `19326`, preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-second-opening-invariant-recurrence-2026-09-06.log`):
+
+- All `236` handled reports routed through ring-live with `100%` HID pairing, zero fallback, sign mismatch, buffer
+  overflow, model rejection, axis reset, carry drop, display recovery/start failure, or tap disable. Ring-live first
+  output was `0.780–14.740 ms` (`5.820 ms` median, `11.348 ms` p95), queue time was `0.370–9.010 ms`
+  (`0.630 ms` median), and `3,974` renderer callbacks retained an `8.333 ms` maximum gap. The replacement velocity
+  invariant fired on `24` stopped openings. This rules out a general input, queue, HID, target, display, or tap
+  regression and confirms the preceding fix was active.
+- Sequence `2842` at `21:56:24.530` was the remaining weak opening. It reversed after `363.983 ms`, queued for
+  `1.151 ms`, reached first integer output in `4.65 ms`, and atomically discarded the old direction. Immediately
+  before the report the old response was `10.720 px/s` at `95.680 ms` decay, representing approximately `1.026 px`
+  of old-sign area—barely above the one-pixel stopped classifier. The report consequently logged
+  `startsFromStoppedOutput=0`, retained `70.885 ms` decay, and opened its honest `20.400 px` new-sign impulse at only
+  `287.783 px/s`.
+- Other retained reversals immediately outside the same fixed boundary showed the same structural asymmetry:
+  sequences `2735`, `2774`, and `2884` opened at approximately `396–406 px/s`, while ordinary reset openings and
+  qualified stopped openings used the accepted `439.419 px/s` envelope.
+
+Confirmed root cause: `startsFromStoppedOutput` considered the amount of pre-report area without considering its
+sign. That is valid for a same-direction sparse continuation, because old motion can visibly overlap the new
+impulse. It is invalid for a direction change: the model's atomic-reversal invariant discards every pixel of the
+old sign before applying the current report. Even `1.026 px` or much more old-direction area supplies exactly zero
+new-direction output, so allowing it to weaken the opposite opening made response rate depend on state which the
+same update necessarily destroys. Moving the one-pixel threshold would only move this escape again.
+
+Change (`Helper/Core/Scroll/RingMotionModel.h`, `Tests/RingMotionModelTests.c`):
+
+- Define a direction change as a fresh output opening in addition to a first report or a same-direction report with
+  at most one visible pixel remaining. Every reversal therefore receives the existing stopped-opening response and
+  normal-opening-velocity invariants, independent of the amount of old-sign area it atomically discards.
+- Exact sequence-`2842` coverage starts with the captured `1.026 px` old-sign remainder, proves that it is above the
+  old classifier, and verifies immediate direction replacement, zero carried velocity, unchanged `20.400 px`
+  distance, zero carry drop, and a `439.419 px/s` opening derived from the current configuration.
+- No new pixel, cadence, speed, or time threshold was added. This extends the preceding structural invariant to the
+  direction domain rather than raising another boundary or restoring the rejected `32–35 px` distance floor.
+
+Preserved behavior: reversal still cancels the old sign and delivers the requesting report on the same update.
+Current-report distance, raw/filter acceleration, same-direction live sparse overlap, independent axes, integer
+visibility bound, output/area/velocity caps, target/config/click generations, compatibility fallbacks, parked/stall
+recovery, and display ownership are unchanged. No report is delayed, confirmed, discarded, replayed, or given extra
+distance. The known indistinguishable wrong-sign HID baseline is not enlarged; its honest distance is merely spent
+at the accepted opening rate when it reverses direction.
+
+Verification:
+
+- `./dev.sh scroll-tests` passes the full cadence, display-lifecycle, output-policy, correlator, motion
+  model/plane/property/refresh, captured replay, and seven analyzer suites under warning-as-error builds.
+- The exact captured replay passes as described above; existing active/paused reversal, rebound, sparse, target
+  reset, horizontal, packetization, and fixed/variable-refresh cases remain green. `git diff --check` passes.
+- `./dev.sh build` and `./dev.sh run` both completed with `BUILD SUCCEEDED`. The final deployed Debug helper PID
+  `15664` selected ring-live, started the non-seizing observer, attached TB800 registry ID `4294971676`, reset its
+  configuration, and re-enabled its tap without a startup failure.
+- The post-deployment physical capture is preserved at
+  `/tmp/mac-trackball-fix-scroll-phase5-direction-aware-opening-2026-09-06.log`. All `34` raw reports paired with all
+  `34` CG reports and routed through ring-live, with zero fallback, sign mismatch, overflow, reject, axis reset,
+  carry drop, display recovery/start failure, or tap disable. First output was `0.620–15.020 ms` (`5.695 ms`
+  median, `11.450 ms` p95), queue time was `0.350–4.160 ms`, and `358` callbacks retained an `8.333 ms` maximum
+  gap.
+- Physical reversals `7` and `23` arrived after `236.988 ms` and `269.841 ms` while approximately `4–5 px` of
+  old-sign area remained. Both logged `startsFromStoppedOutput=1`, zero carried velocity, and
+  `stoppedOpeningVelocityDecayLimited=1`; their honest `30.129 px` and `26.776 px` distances opened at exactly
+  `439.419 px/s`. Reversal `14` also logged the direction-aware stopped-opening classification but naturally opened
+  faster at `574.934 px/s`, so it correctly required no velocity cap. Following reports accelerated immediately.
+
+Remaining verification/tradeoff: the direction-aware classification and capped/naturally-fast branches are now
+physically verified. A very slow reversal over still-visible old-direction motion is temporally crisper than before,
+because old-sign continuity cannot survive atomic cancellation; its requested distance is unchanged. The user's
+subjective verdict and the wider Phase 5 application, horizontal/effect, available-display, and telemetry-confirmed
+rollback gates remain open.
+
+## 2026-09-06 — weak same-direction carry must not bypass opening protection
+
+Symptom: slow starts recurred after the direction-aware opening fix. Current PID `15664` telemetry is preserved at
+`/tmp/mac-trackball-fix-scroll-phase5-continuity-opening-before-2026-09-06.log`. All 243 handled reports paired with
+HID and routed live, with zero fallback, sign mismatch, overflow, rejection, carry drop, axis reset, display recovery,
+start failure, or tap disable. First output was `0.640–14.660 ms` (median `5.730 ms`), queue p95 `2.640 ms`, and
+4,073 callbacks had maximum gap `8.333 ms`. These measurements show healthy helper delivery; they do not measure
+target-application presentation latency.
+
+At `22:48:30.299`, sequence `1878` followed a `340.009 ms` same-direction gap. About `1.513 px` of old area remained
+at `13.610 px/s`. Because that exceeded the binary one-pixel classifier, the model spread the new `21.703 px` over
+`158.493 ms` and produced only `146.476 px/s`, despite first output in `4.25 ms` with `0.551 ms` queued. The next
+report arrived `28.004 ms` later and accelerated immediately. Eleven retained same-direction updates had total
+velocity below the normal `439.419 px/s` opening. Correspondence to the subjective complaint is inferred; the weak
+response and escape from the classifier are captured directly.
+
+Root cause: a binary amount-of-carry predicate treated a small fading tail as sufficient justification for the full
+sparse envelope. Reversal protection was active and correct. Raising the stopped threshold again would merely move
+the boundary, so the live side now uses the actual relative contribution of visible carry.
+
+Change (`RingMotionModel.h`, `RingScrollRenderer.m`, `RingMotionModelTests.c`): retain the accepted stopped/reversal
+rules and continuously blend the weak live response toward normal opening velocity, weighted by new impulse area
+divided by new impulse plus visible retained area. Visible carry excludes the existing one-pixel stopped floor,
+making the decay bound continuous at that boundary. Responses already faster than the normal opening retain their
+natural envelope. All old area remains present through the existing area-preserving decay conversion; no distance
+is added, no sign is changed, and no report is deferred. Live telemetry records `MFSCROLL_RING_OPENING` when the
+continuity bound applies.
+
+Verification: the full `./dev.sh scroll-tests` suite passes, including all captured replays, cadence, display
+lifecycle, output policy, correlator, independent axes, refresh/packetization and randomized boundedness, and seven
+analyzer tests. A 10,001-state sweep from zero through ten pixels of carry proves continuous, monotonic decay across
+the old boundary and exact area preservation. Captured-state replay retains `21.703 px` plus `1.513 px` carry and
+changes decay to `51.364 ms`, producing `451.988 px/s` with zero carry loss. `git diff --check` passes.
+
+The initial sandboxed build could not write existing Swift/Clang caches. `./dev.sh run` with normal cache access
+completed with `BUILD SUCCEEDED` and deployed helper PID `31568`, selecting ring-live and attaching the TB800.
+Its physical capture is preserved at `/tmp/mac-trackball-fix-scroll-phase5-continuity-opening-after-2026-09-06.log`:
+64/64 reports paired and routed live; 11 reversals; zero fallback, sign mismatch, overflow, reject, axis reset,
+carry loss, display failure/recovery, or tap disable. First output was `0.680–17.640 ms` (median `4.960 ms`, p95
+`11.634 ms`), queue median `0.520 ms`, p95 `2.759 ms`, and 864 callbacks retained an `8.333 ms` maximum gap.
+The continuity bound physically fired on sequences `2`, `27`, `50`, and `52`, producing respectively `442.555`,
+`452.141`, `443.737`, and `434.573 px/s`. This confirms the new branch is active on real reports; subjective
+acceptance and uncaptured horizontal/effect/application/display cases remain open.
+
+Intentional tradeoff: weak live sparse continuations are now crisper, with progressively more of the original
+overlap as retained motion dominates. This supersedes the prior blanket exemption for every live response over one
+pixel; the captured same-direction escape is the new evidence requiring that change. Very sparse physical reports
+may feel more discrete, since their honest distance is spent sooner. Established cadence still begins on report two,
+all motion uses one analytic state per axis, and fast response, reversal, target/effect/display ownership and caps
+remain intact. Physical feel and the wider application/display/effect matrix must not be claimed from model tests.
+
+## 2026-09-08 — user chooses normal opening distance over smaller hardware rebound
+
+Symptom/evidence: PID `31568` retained 205 paired live reports with zero fallback, sign mismatch, overflow, reject,
+carry loss, display failure/recovery, or tap disable. First output was `0.85–14.53 ms` (median `6.25 ms`), with
+3,810 callbacks retaining an `8.333 ms` maximum gap. The capture is preserved at
+`/tmp/mac-trackball-fix-scroll-stronger-opening-before-2026-09-08.log`.
+At `23:40:55.534`, sequence `8472` followed `70.749617 s` idle and received only `8.142 px` at `18.528 ms` decay;
+the next count arrived `34.968 ms` later and requested `171.512 px`. Multiple shorter paused starts reproduced the
+same small opening. Normal reset openings in the same configuration received `35.153 px`. Delivery and the existing
+opening-velocity protection were healthy; shortening decay could not restore missing opening distance.
+
+The user explicitly approved stronger isolated starts after being told they also amplify the indistinguishable
+wrong-direction HID baseline. This overrides the previous rejection of the normal-distance floor: its rebound
+failure mode still exists and is now an accepted tradeoff, not claimed eliminated. The association of these captured
+small impulses with subjective hesitation remains inferred.
+
+Change: `RingMotionModel.h` gives visually stopped starts, including atomic reversals, at least the configuration's
+normal first-report distance, bounded by maximum initial distance. Raw speed, filtered speed, cadence history and
+faster natural distances are retained. Ongoing same-direction motion retains measured distance and the prior
+continuity response. No timer, confirmation, delayed replay or second motion reservoir is introduced. The existing
+velocity and remaining-area ceilings still apply. `RingScrollRenderer.m` records `stoppedOpeningDistanceRaised=1`
+with sequence, distance and decay in `MFSCROLL_RING_OPENING`.
+
+Verification: `./dev.sh scroll-tests` and `git diff --check` pass. New captured-parameter tests cover a `70.749617 s`
+same-direction restart and reversal, `8.142 -> 35.153 px`, unchanged measured speeds, immediate faster follow-up,
+and bounded output. The historical timing-only tests explicitly disable the new distance policy so their prior
+invariants remain independently checked. All production-default captured replays, independent axes, fixed/variable
+refresh, packetization, randomized bounds, cadence, lifecycle, output, correlator and seven analyzer suites pass.
+
+Tradeoff: genuine isolated starts and indistinguishable wrong-sign hardware reports now both get the stronger
+response. Ultra-sparse stopped reports can move farther. Sparse, reversal and rebound replay totals intentionally
+change; live overlap, cancellation, target generations and effect/legacy routing remain intact. Subjective feel and
+the wider physical app/display/effect matrix remain manual verification items.
+
+Deployment: `./dev.sh run` completed with `BUILD SUCCEEDED`; helper PID `65365` selected ring-live and attached the
+TB800. The preserved post-deployment capture is `/tmp/mac-trackball-fix-scroll-stronger-opening-after-2026-09-08.log`.
+All 45 physical reports paired and routed live with zero fallback, sign mismatch, rejection, carry loss, display
+failure/recovery or tap disable. First output was `0.88–14.57 ms` (median `5.79 ms`); 549 callbacks retained an
+`8.333 ms` maximum gap. Sequences `6` and `13` physically logged `stoppedOpeningDistanceRaised=1`, `35.153 px`, and
+`70.885 ms` decay, confirming the stronger opening is active. The older analyzer's distance-raise counter only reads
+model records; these new separate opening markers were verified directly.
+
+## 2026-09-09 — preserve unsigned frequency through low-speed reversals
+
+Request/evidence: the user requested immediate response and direction-independent frequency estimation at low speed.
+The pre-change PID `65365` snapshot contained 221/221 paired physical reports, no fallback/sign mismatch/overflow,
+222 model updates (one input had rolled out), 19 reversals, no rejection/carry drop, and no display failure/recovery
+or tap disable. First output was `0.81–14.47 ms` (median `6.47 ms`); queue median was `0.66 ms`, and 3,158 callbacks
+had maximum gap `8.333 ms`. This measures helper delivery, not application presentation. For example, sequence
+`526` at `08:56:11.087` reversed after `322.993 ms` and logged `cadenceMs=0` despite a measured raw rate of `3.096`.
+
+Root cause/design: raw speed already uses absolute physical units divided by the interval across either direction,
+but every reversal reset the time-based speed filter to raw speed and erased cadence. Low-speed changes of direction
+therefore lost valid timing history. This is a user-directed consistency change, not a proven cure for the subjective
+slow start. The earlier `08:44:10` and `08:44:52` counter-motion captures were reset openings, so their normal `35 px`
+first responses predate the September 8 distance-floor change; reverting that floor would not remove those examples.
+
+Change (`RingMotionModel.h`, live/shadow telemetry, `RingMotionModelTests.c`): preserve and update unsigned speed and
+cadence on a reversal when both current raw speed and previous filtered speed are below the existing slow-band end
+and fast-friction start, and the interval is within the existing cadence-memory horizon. There is no new tuning
+constant. Other reversals retain the raw-speed reset and cadence clearing. The current sign still cancels all old-sign
+output on the same update; only scalar timing history survives. Live and shadow telemetry expose qualifying reports
+as `MFSCROLL_RING_FREQUENCY action=preserve-slow-reversal` with sequence, generation, axis, raw/filtered rate and cadence.
+
+Verification: the full `./dev.sh scroll-tests` suite and `git diff --check` pass. New tests compare identical timestamp
+streams with constant versus alternating signs, requiring identical raw/filtered frequency and cadence from report
+two onward, immediate new-sign frame output, zero opposite carry, and the existing opening-velocity floor. Boundary
+tests exclude either rate at/above the slow limit, fast-to-slow and slow-to-fast reversals, expired memory and session
+resets. Existing captured sparse, active/paused reversal, rebound, horizontal, target-reset, independent-axis,
+refresh/packetization, randomized-bound, legacy-policy, correlator and analyzer suites remain green.
+
+Preserved behavior/tradeoff: no input gate, timer, direction vote, delayed replay or second reservoir. Normal opening
+distance, visibility/velocity protection, fast output bounds, same-direction integration, per-axis ownership, target
+and effect resets remain intact. A slow reversal may now use learned sparse timing, but still obeys the accepted
+opening-rate bound; exact low-speed distance/decay can differ through the retained filter. An ambiguous first hardware
+count remains immediate and cannot be identified as unwanted by this change. Physical low-speed reversal feel and
+the wider app/display/effect matrix remain manual verification items.
+
+Deployment: the initial sandboxed build failed on Swift/Clang cache writes; `./dev.sh run` with normal cache access
+completed with `BUILD SUCCEEDED` and deployed helper PID `3201`, selecting ring-live and attaching the TB800.
+The pre-change snapshot is `/tmp/mac-trackball-fix-scroll-frequency-before-2026-09-09.log`; the post-deployment
+snapshot is `/tmp/mac-trackball-fix-scroll-frequency-after-2026-09-09.log`. All 39 post-deployment raw reports paired
+and routed live, with zero fallback, sign mismatch, overflow, reject, carry drop, display failure/recovery or tap
+disable. First output was `0.94–13.56 ms` (median `6.93 ms`), queue median `0.67 ms`, and 557 callbacks retained
+the `8.333 ms` maximum gap. Physical reversals `12` at `09:01:33.999` and `13` at `09:01:34.983` logged the new
+action after `374.995 ms` and `984.013 ms`, retaining/updating cadence to `216.716 ms` and `600.364 ms` instead of
+clearing it. Both discarded all old-sign carry and opened at `439.419 px/s` with the existing `35.153 px` distance.
+Sequence `19`, after `6.900 s`, correctly cleared expired cadence. This verifies the new branch on hardware;
+subjective feel and uncaptured horizontal/effect/display/application cases remain pending.
+
+## 2026-09-11 — correlation misses must not mix CG acceleration into raw frequency
+
+Symptom/evidence: during the slow-start investigation, current unified telemetry from helper PID `803` contained
+84 live reports between `09:09:57` and `09:18:26`. First output was `0.68–15.66 ms` (median approximately `6 ms`),
+with an `8.333 ms` maximum recorded callback gap and no recorded display recovery/start failure or tap disable.
+The normal-distance opening policy was active. Arc sequence `3846` at `09:17:19.064` followed `429.016 ms` of
+physical-input silence, received `35.153 px`, and produced output in `7.34 ms`. These records measure helper
+delivery, not application presentation or the cause of physical silence.
+
+At `09:17:19.123`, sequence `3848` missed raw correlation and used `source=cg-line-fallback units=3`. The raw-count
+model interpreted those accelerated CG units over `28.013 ms` as `107.095 counts/s`, raised the filter from
+`27.966` to `95.284`, and hit `27,846.950 px/s` output. Sequence `3849` recovered HID, but retained a `54.244`
+filtered rate against `40.021` raw. This is a confirmed source-domain mismatch and filter contamination. Its
+association with the subjective slow-start complaint remains inferred; the capture does not prove why pairing missed.
+
+Change (`RingInputCorrelator.h`, `Scroll.m`, `RingMotionModelTests.c`): require paired nonzero HID units for live
+raw-model eligibility. A miss logs route fallback `reason=raw-correlation-miss` and immediately continues through
+the existing CG-aware legacy pipeline. The existing generation-ordered handoff clears both raw axis states before
+legacy output; repeated misses stay on legacy without repeated live resets. The next paired report cancels legacy
+and opens clean raw state. Shadow prediction also excludes misses so its raw frequency cannot be contaminated.
+Correlation itself still returns the original CG fallback units without waiting or discarding the physical report.
+
+This supersedes the earlier acceptance of CG-line fallback inside the raw live model: the new captured saturation
+demonstrates that those domains cannot share its acceleration/filter state. No report is held for pairing, no raw
+count is guessed from CG magnitude, and no distance reservoir or confirmation gate is introduced. Opening distance,
+unsigned slow-reversal frequency, same-axis cancellation, paired Wheel/Pan overlap, and output caps are unchanged.
+
+Verification: the full `./dev.sh scroll-tests` suite passes, including cadence, display lifecycle, output policy,
+correlator, motion/plane/property/refresh, all captured traces, and seven analyzer tests. New captured-parameter
+coverage demonstrates the old `107 counts/s` contamination and saturation, preserves full fallback magnitudes for
+legacy, exercises repeated misses and both signs/axes, clears both axes on handoff, rejects an old generation,
+and verifies clean immediate raw re-entry and faster follow-up. These pure checks do not simulate macOS posting.
+`git diff --check` and `./dev.sh build` pass. The first sandboxed build could not write existing Swift/Clang caches;
+the normal-cache retry completed with `BUILD SUCCEEDED` and existing unrelated warnings.
+
+Remaining tradeoff/manual verification: compatibility handoff discards bounded old motion on both axes and the next
+paired report begins at normal opening speed. Repeated intermittent pairing can therefore cause discontinuities,
+especially during independent-axis overlap. Physical miss/re-entry, sparse and fast input, active/paused reversal,
+stop/rebound, target/effect changes, each available display and the wider application matrix remain required; no
+physical cure for the subjective complaint is claimed from the model tests.
+
+Deployment: `./dev.sh run` completed with `BUILD SUCCEEDED` and restarted the helper as PID `73052`.
+Fresh physical Readdown telemetry on display `3` confirms ring-live output: sequence `17` at `09:28:29.764`
+reopened after `1161.998 ms` with `35.153 px`, `439.419 px/s` impulse velocity and `10.74 ms` first output.
+Sequence `18` reversed after `2072.965 ms`, cleared all opposite carry, and reached output in `12.84 ms`;
+sequence `19` accelerated on its `63.988 ms` follow-up. Recorded callbacks retained an `8.333 ms` maximum gap.
+These are adjacent-path physical checks; a post-deployment correlation miss has not yet been verified.
+
 ## Required regression pass
 
 For every material scroll change, test the affected case plus adjacent behaviors:
