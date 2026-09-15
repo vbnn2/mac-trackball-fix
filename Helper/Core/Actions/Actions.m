@@ -25,6 +25,100 @@
 #import "Mac_Mouse_Fix_Helper-Swift.h" /// For HelperState (Scroll & Zoom Mode)
 #import <Carbon/Carbon.h>
 
+typedef NS_ENUM(NSInteger, MFMenuCommandState) {
+    MFMenuCommandStateUnknown,
+    MFMenuCommandStateDisabled,
+    MFMenuCommandStateEnabled,
+};
+
+/// Look up a command by its menu shortcut instead of its title so this keeps
+/// working when the browser or macOS is using a non-English localization.
+/// Unknown is deliberately distinct from disabled: failing to inspect the menu
+/// must never turn a Back action into an unexpected Close Tab action.
+static MFMenuCommandState MFMenuCommandStateForShortcutInElement(AXUIElementRef element, NSString *commandCharacter, CGKeyCode virtualKey, NSUInteger depth) {
+    if (depth == 0) return MFMenuCommandStateUnknown;
+
+    CFTypeRef commandCharacterValue = NULL;
+    AXError characterError = AXUIElementCopyAttributeValue(element, kAXMenuItemCmdCharAttribute, &commandCharacterValue);
+    BOOL characterMatches = characterError == kAXErrorSuccess &&
+                            commandCharacterValue != NULL &&
+                            CFGetTypeID(commandCharacterValue) == CFStringGetTypeID() &&
+                            [(__bridge NSString *)commandCharacterValue isEqualToString:commandCharacter];
+    if (commandCharacterValue != NULL) CFRelease(commandCharacterValue);
+
+    CFTypeRef virtualKeyValue = NULL;
+    AXError virtualKeyError = AXUIElementCopyAttributeValue(element, kAXMenuItemCmdVirtualKeyAttribute, &virtualKeyValue);
+    BOOL virtualKeyMatches = NO;
+    if (virtualKeyError == kAXErrorSuccess && virtualKeyValue != NULL && CFGetTypeID(virtualKeyValue) == CFNumberGetTypeID()) {
+        SInt32 menuVirtualKey = -1;
+        CFNumberGetValue((CFNumberRef)virtualKeyValue, kCFNumberSInt32Type, &menuVirtualKey);
+        virtualKeyMatches = menuVirtualKey == virtualKey;
+    }
+    if (virtualKeyValue != NULL) CFRelease(virtualKeyValue);
+
+    if (characterMatches || virtualKeyMatches) {
+        CFTypeRef modifierValue = NULL;
+        AXError modifierError = AXUIElementCopyAttributeValue(element, kAXMenuItemCmdModifiersAttribute, &modifierValue);
+        BOOL isCommandOnly = NO;
+        if (modifierError == kAXErrorSuccess && modifierValue != NULL && CFGetTypeID(modifierValue) == CFNumberGetTypeID()) {
+            CFIndex modifiers = 0;
+            CFNumberGetValue((CFNumberRef)modifierValue, kCFNumberCFIndexType, &modifiers);
+            /// AX treats Command as the default; kAXMenuItemModifierNone means
+            /// Command with no additional modifiers.
+            isCommandOnly = modifiers == kAXMenuItemModifierNone;
+        }
+        if (modifierValue != NULL) CFRelease(modifierValue);
+
+        if (isCommandOnly) {
+            CFTypeRef enabledValue = NULL;
+            AXError enabledError = AXUIElementCopyAttributeValue(element, kAXEnabledAttribute, &enabledValue);
+            if (enabledError == kAXErrorSuccess && enabledValue != NULL && CFGetTypeID(enabledValue) == CFBooleanGetTypeID()) {
+                BOOL enabled = CFBooleanGetValue((CFBooleanRef)enabledValue);
+                CFRelease(enabledValue);
+                return enabled ? MFMenuCommandStateEnabled : MFMenuCommandStateDisabled;
+            }
+            if (enabledValue != NULL) CFRelease(enabledValue);
+            return MFMenuCommandStateUnknown;
+        }
+    }
+
+    CFTypeRef childrenValue = NULL;
+    AXError childrenError = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &childrenValue);
+    if (childrenError != kAXErrorSuccess || childrenValue == NULL) {
+        if (childrenValue != NULL) CFRelease(childrenValue);
+        return MFMenuCommandStateUnknown;
+    }
+
+    MFMenuCommandState result = MFMenuCommandStateUnknown;
+    if (CFGetTypeID(childrenValue) == CFArrayGetTypeID()) {
+        CFArrayRef children = (CFArrayRef)childrenValue;
+        for (CFIndex i = 0; i < CFArrayGetCount(children); i++) {
+            AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+            result = MFMenuCommandStateForShortcutInElement(child, commandCharacter, virtualKey, depth - 1);
+            if (result != MFMenuCommandStateUnknown) break;
+        }
+    }
+    CFRelease(childrenValue);
+    return result;
+}
+
+static MFMenuCommandState MFMenuCommandStateForShortcut(pid_t pid, NSString *commandCharacter, CGKeyCode virtualKey) {
+    AXUIElementRef application = AXUIElementCreateApplication(pid);
+    if (application == NULL) return MFMenuCommandStateUnknown;
+
+    CFTypeRef menuBarValue = NULL;
+    AXError menuBarError = AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute, &menuBarValue);
+    CFRelease(application);
+    if (menuBarError != kAXErrorSuccess || menuBarValue == NULL) {
+        if (menuBarValue != NULL) CFRelease(menuBarValue);
+        return MFMenuCommandStateUnknown;
+    }
+
+    MFMenuCommandState result = MFMenuCommandStateForShortcutInElement((AXUIElementRef)menuBarValue, commandCharacter, virtualKey, 6);
+    CFRelease(menuBarValue);
+    return result;
+}
+
 @implementation Actions
 
 + (void)executeActionArray:(NSArray *)actionArray phase:(MFActionPhase)phase {
@@ -86,12 +180,27 @@
                     /// Choose the `bfmethod`
                     ///     Mnemonic: (method) for going (b)ack and (f)orward
                     
-                    NSString *bundleID = [HelperUtility appUnderMousePointerWithEvent: NULL].bundleIdentifier; /// [Aug 2025] Should we query frontmost app or app-under-mouse-pointer? I think navigation swipes only work when the app is frontmost *and* the mouse pointer is over the desired view. Meanwhile the keyboard shortcuts dont depend on mouse pointer position.
+                    NSRunningApplication *targetApp = [HelperUtility appUnderMousePointerWithEvent: NULL];
+                    NSString *bundleID = targetApp.bundleIdentifier; /// [Aug 2025] Should we query frontmost app or app-under-mouse-pointer? I think navigation swipes only work when the app is frontmost *and* the mouse pointer is over the desired view. Meanwhile the keyboard shortcuts dont depend on mouse pointer position.
                     #define isbundle(bundleid)  [bundleID hasPrefix: @bundleid]                             /** [Aug 2025] Using `hasPrefix:` to also catch other release channels like "com.google.Chrome.canary", or maybe forks that didn't bother to change the bundleID. (?) */
                     {
                         /// Fallback if we can't retrieve a bundleID
                         ///     Note: [Aug 2025] Not sure when this occurs. Maybe non-app executables or certain cross-platform apps? `bfmethod_mouseButton` seems most useful.
                         if (bundleID == nil || bundleID.length == 0)    goto bfmethod_mouseButton;
+
+                        /// Browser Back at the start of history closes the active tab.
+                        ///     Safari, Arc, and Chrome expose Back as Command-[ in their menu. Checking the
+                        ///     enabled state avoids browser-specific scripting and remains localization-safe.
+                        ///     If AX inspection is unavailable or inconclusive, preserve the old routing.
+                        BOOL isSafari = isbundle("com.apple.Safari");
+                        BOOL isArc = isbundle("company.thebrowser.Browser");
+                        BOOL isChrome = isbundle("com.google.Chrome");
+                        if (isleft && (isSafari || isArc || isChrome)) {
+                            MFMenuCommandState backState = MFMenuCommandStateForShortcut(targetApp.processIdentifier, @"[", kVK_ANSI_LeftBracket);
+                            DDLogDebug("Actions.m: Browser Back preflight: bundle=%@ state=%@", bundleID, @(backState));
+                            if (backState == MFMenuCommandStateEnabled) goto bfmethod_commandBracket;
+                            if (backState == MFMenuCommandStateDisabled) goto bfmethod_closeTab;
+                        }
                         
                         /// navigationSwipe overrides from linearmouse
                         ///     Note: linearmouse uses navigationSwipes for Firefox, but Firefox supports MB 4/5 now. (See `https://stackoverflow.com/a/68532003`). [Aug 2025]
@@ -148,6 +257,9 @@
                         bfmethod(bfmethod_optionCommandBracket) {
                             MFVKCAndFlags *shortcut  = MFEmulateNSMenuItemRemapping((isleft ? kVK_ANSI_LeftBracket : kVK_ANSI_RightBracket), (kCGEventFlagMaskAlternate|kCGEventFlagMaskCommand));
                             postKeyboardShortcut(shortcut.vkc,  (CGSModifierFlags)shortcut.modifierMask);
+                        }
+                        bfmethod(bfmethod_closeTab) {
+                            postKeyboardShortcut(kVK_ANSI_W, (CGSModifierFlags)kCGEventFlagMaskCommand);
                         }
                     }
                     endof_bfmethods: {}

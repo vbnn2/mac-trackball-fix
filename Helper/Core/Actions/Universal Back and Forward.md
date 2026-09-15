@@ -1,5 +1,12 @@
 # Universal Back and Forward
 
+## Browser history boundary
+
+[Sep 2026] In Safari (`com.apple.Safari*`), Arc (`company.thebrowser.Browser*`), and Chrome (`com.google.Chrome*`), invoking Back while the browser's
+Command-[ menu command is enabled invokes that shortcut, while invoking Back when it is disabled closes the active tab with Command-W. The enabled state is read through the
+Accessibility menu hierarchy, matching either the shortcut character or its virtual key instead of the localized menu title. If Accessibility inspection
+fails or the shortcut cannot be found, the previous routing is preserved and the tab is not closed.
+
 [Aug 2025] The 'Back' and 'Forward' Actions in MMF simulate navigationSwipes. However, this doesn't work in all apps. (Most notably VSCode)
     So for 3.0.6, we're trying to do a hotfix to improve compatibility
 
