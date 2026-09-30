@@ -3473,3 +3473,31 @@ Append, do not rewrite history. Include:
 - behavior intentionally preserved;
 - commands and manual cases used for verification;
 - known ambiguity or remaining risk.
+
+## 2026-09-27 — restrict direction-independent frequency to the vertical ring
+
+Request/evidence: the user requested that frequency history survive direction changes only for the vertical scroll
+ring. Code inspection confirmed that the September 9 slow-reversal policy was unconditional in the shared scalar
+model, so horizontal Pan also retained its filtered speed and cadence. No rolling capture was available in `/tmp`
+during this change; this is a requested scope correction, not a latency diagnosis.
+
+Change (`RingMotionModel.h`, `RingMotionPlane.h`, `Scroll.m`): make low-speed reversal frequency preservation an
+explicit report opt-in, defaulting off. The live motion plane sets it only for the vertical axis; shadow predictions
+use the same axis condition. Horizontal reversals reset filtered speed to the current raw rate and clear cadence.
+The existing exact-device, paired-HID, Regular/custom-acceleration, no-effect eligibility gates remain authoritative,
+so other devices, zoom, effects, System acceleration, and correlation misses retain their legacy paths.
+
+Verification: `./dev.sh scroll-tests` passes all policy, correlator, model/property/refresh, captured replay, and seven
+capture-analyzer tests. Added an interleaved two-axis reversal test that proves vertical preservation, horizontal
+reset, unchanged same-direction estimation, immediate new-sign output, zero old-sign carry, independent state, and
+bounded output. A direct scalar report without opt-in also resets frequency. Replay fixtures now select the policy
+from their recorded axis. `git diff --check` passes.
+
+The sandboxed build could not write Xcode DerivedData/package caches. Retrying `./dev.sh build` with normal cache
+access completed successfully with existing unrelated warnings. The app/helper was built but not restarted.
+
+Preserved behavior/tradeoff: vertical slow-band and memory-expiry limits, atomic cancellation, normal opening
+distance/rate protection, same-direction integration, independent axes, target/effect resets, and output caps remain
+intact. Horizontal slow reversals intentionally lose timing continuity and may change response distance/decay.
+Physical feel, app/display/effect cases, and telemetry confirmation remain manual checks; automated tests do not
+establish their physical outcome.

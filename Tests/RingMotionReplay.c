@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../Helper/Core/Scroll/RingMotionModel.h"
+#include "../Helper/Core/Scroll/RingMotionPlane.h"
 
 static bool readNumber(
     const char *line,
@@ -100,13 +100,17 @@ static int replay(const char *path) {
             outputPixels += MFRingMotionAdvance(
                 &state, timestamp - previousTimestamp).distancePixels;
         }
+        MFRingMotionConfig axisConfig = MFRingMotionConfigForAxis(config,
+            strstr(line, "\"axis\":\"horizontal\"") != NULL
+                ? kMFRingAxisHorizontal : kMFRingAxisVertical);
         MFRingMotionUpdate update = MFRingMotionApplyReport(
-            &config,
+            &axisConfig,
             &state,
             (MFRingMotionReport) {
                 .generation = generation,
                 .timestamp = timestamp,
                 .signedUnits = (int64_t)units,
+                .preserveLowSpeedReversalFrequency = strstr(line, "\"axis\":\"vertical\"") != NULL,
             });
         if (!update.accepted) {
             fprintf(stderr, "RingMotionReplay: rejected input in %s at %.9f\n",

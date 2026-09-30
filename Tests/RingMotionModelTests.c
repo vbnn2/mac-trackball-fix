@@ -17,6 +17,7 @@ static MFRingMotionReport report(uint64_t generation, double time, int64_t units
         .generation = generation,
         .timestamp = time,
         .signedUnits = units,
+        .preserveLowSpeedReversalFrequency = true,
     };
 }
 
@@ -120,6 +121,54 @@ static void testLowSpeedFrequencyIgnoresDirection(void) {
         assert(MFRingMotionAdvance(&preview, 1.0 / 144.0).distancePixels * sign > 0.0);
         assertFiniteAndBounded(&config, &alternating);
     }
+}
+
+static void testOnlyVerticalRingPreservesReversalFrequency(void) {
+    MFRingMotionConfig config = MFRingMotionConfigDefault();
+    MFRingMotionPlane plane;
+    MFRingMotionPlaneInitialize(&plane, 1);
+    const double times[] = { 0.0, 0.2, 0.5, 0.75, 0.9, 1.2 };
+    for (unsigned i = 0; i < sizeof(times) / sizeof(times[0]); ++i) {
+        if (i > 0) MFRingMotionPlaneAdvance(&plane, times[i] - times[i - 1]);
+        int sign = i < 2 || i % 2 == 1 ? 1 : -1;
+        MFRingMotionReport input = report(1, times[i], sign);
+        input.preserveLowSpeedReversalFrequency = false;
+        MFRingMotionUpdate vertical = MFRingMotionPlaneApplyReport(
+            &config, &plane, kMFRingAxisVertical, input);
+        MFRingMotionState verticalBefore = plane.vertical;
+        input.preserveLowSpeedReversalFrequency = true;
+        MFRingMotionUpdate horizontal = MFRingMotionPlaneApplyReport(
+            &config, &plane, kMFRingAxisHorizontal, input);
+        assert(vertical.accepted && horizontal.accepted);
+        assert(memcmp(&verticalBefore, &plane.vertical, sizeof(verticalBefore)) == 0);
+        assert(!horizontal.lowSpeedReversalFrequencyPreserved);
+        if (i < 2) {
+            assert(vertical.filteredSpeedUnitsPerSecond == horizontal.filteredSpeedUnitsPerSecond);
+            assert(vertical.cadenceEstimateSeconds == horizontal.cadenceEstimateSeconds);
+        } else {
+            assert(vertical.lowSpeedReversalFrequencyPreserved);
+            assert(vertical.hasMeasuredCadence && vertical.cadenceEstimateSeconds > 0.0);
+            assert(!horizontal.hasMeasuredCadence && horizontal.cadenceEstimateSeconds == 0.0);
+            assert(horizontal.filteredSpeedUnitsPerSecond == horizontal.rawSpeedUnitsPerSecond);
+            assert(vertical.carriedVelocityPixelsPerSecond == 0.0);
+            assert(horizontal.carriedVelocityPixelsPerSecond == 0.0);
+        }
+        MFRingMotionPlane preview = plane;
+        MFRingMotionPlaneFrame frame = MFRingMotionPlaneAdvance(&preview, 1.0 / 144.0);
+        assert(frame.vertical.distancePixels * sign > 0.0);
+        assert(frame.horizontal.distancePixels * sign > 0.0);
+        assertFiniteAndBounded(&config, &plane.vertical);
+        assertFiniteAndBounded(&config, &plane.horizontal);
+    }
+
+    MFRingMotionState state;
+    MFRingMotionInitialize(&state, 1);
+    MFRingMotionApplyReport(&config, &state, report(1, 0.0, 1));
+    MFRingMotionReport unspecified = { .generation = 1, .timestamp = 0.3, .signedUnits = -1 };
+    MFRingMotionUpdate update = MFRingMotionApplyReport(&config, &state, unspecified);
+    assert(update.accepted && !update.lowSpeedReversalFrequencyPreserved);
+    assert(!update.hasMeasuredCadence && update.cadenceEstimateSeconds == 0.0);
+    assert(update.filteredSpeedUnitsPerSecond == update.rawSpeedUnitsPerSecond);
 }
 
 static void testReversalFrequencyDoesNotRetainFastOrStaleHistory(void) {
@@ -790,6 +839,7 @@ int main(void) {
     testFirstReportIsImmediateNormalAndBounded();
     testSecondSparseReportEstablishesOverlapImmediately();
     testLowSpeedFrequencyIgnoresDirection();
+    testOnlyVerticalRingPreservesReversalFrequency();
     testReversalFrequencyDoesNotRetainFastOrStaleHistory();
     testCapturedStoppedSparseOpeningRaisesRateWithoutAddingDistance();
     testCapturedNearlyExhaustedTailCountsAsStoppedOutput();

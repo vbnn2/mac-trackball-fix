@@ -24,6 +24,16 @@ typedef struct MFRingMotionPlaneFrame {
     MFRingMotionFrame horizontal;
 } MFRingMotionPlaneFrame;
 
+static inline MFRingMotionConfig MFRingMotionConfigForAxis(
+    MFRingMotionConfig config,
+    MFRingAxis axis
+) {
+    if (axis == kMFRingAxisHorizontal) {
+        config.accelerationGamma = 1.0 + (config.accelerationGamma - 1.0) * 0.25;
+    }
+    return config;
+}
+
 static inline void MFRingMotionPlaneInitialize(
     MFRingMotionPlane *plane,
     uint64_t generation
@@ -74,7 +84,9 @@ static inline MFRingMotionUpdate MFRingMotionPlaneApplyReport(
             && plane->generation != report.generation;
         return update;
     }
-    return MFRingMotionApplyReport(config, state, report);
+    report.preserveLowSpeedReversalFrequency = axis == kMFRingAxisVertical;
+    MFRingMotionConfig axisConfig = MFRingMotionConfigForAxis(*config, axis);
+    return MFRingMotionApplyReport(&axisConfig, state, report);
 }
 
 static inline MFRingMotionFrame MFRingMotionPlaneAdvanceAxis(

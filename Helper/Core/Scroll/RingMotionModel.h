@@ -78,6 +78,7 @@ typedef struct MFRingMotionReport {
     uint64_t generation;
     double timestamp;
     int64_t signedUnits;
+    bool preserveLowSpeedReversalFrequency;
 } MFRingMotionReport;
 
 typedef struct MFRingMotionUpdate {
@@ -356,7 +357,7 @@ static inline MFRingMotionUpdate MFRingMotionApplyReport(
         : fabs((double)report.signedUnits) / interval;
     rawSpeed = fmax(config->speedFloorUnitsPerSecond, rawSpeed);
 
-    // Frequency is unsigned activity on this physical axis. A slow reversal
+    // Vertical ring frequency is unsigned activity. A slow reversal
     // changes output direction, but supplies another valid cadence measurement.
     // Do not carry a fast spin's speed through a reversal, or revive stale
     // history after the existing memory horizon. Use the established slow band,
@@ -364,6 +365,7 @@ static inline MFRingMotionUpdate MFRingMotionApplyReport(
     double lowSpeedLimit = fmin(config->sparseBlendEndSpeedUnitsPerSecond,
                                config->fastDecayStartSpeedUnitsPerSecond);
     bool preserveReversalFrequency = directionChanged
+        && report.preserveLowSpeedReversalFrequency
         && interval <= config->cadenceMemorySeconds
         && rawSpeed < lowSpeedLimit
         && state->filteredSpeedUnitsPerSecond < lowSpeedLimit;

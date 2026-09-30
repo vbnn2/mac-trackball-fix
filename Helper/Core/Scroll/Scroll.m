@@ -313,7 +313,8 @@ static void ringShadowObserve_Unsafe(MFRingCGObservation observation,
     uint64_t generation = _ringShadowGeneration;
     uint64_t sequence = observation.sequence;
     MFRingInputSource source = observation.correlation.source;
-    MFRingMotionConfig modelConfig = ringMotionConfigSnapshot(config);
+    MFRingMotionConfig modelConfig = MFRingMotionConfigForAxis(
+        ringMotionConfigSnapshot(config), axis);
     double refreshRate = ringShadowRefreshRate(displayID);
 
     dispatch_async(_ringShadowQueue, ^{
@@ -345,6 +346,7 @@ static void ringShadowObserve_Unsafe(MFRingCGObservation observation,
                 .generation = generation,
                 .timestamp = timestamp,
                 .signedUnits = signedUnits,
+                .preserveLowSpeedReversalFrequency = axis == kMFRingAxisVertical,
             });
         if (!update.accepted) {
             DDLogInfo("MFSCROLL_RING_MODEL: engineVersion=1 engine=ring-shadow sequence=%llu generation=%llu action=reject staleGeneration=%d invalidTimestamp=%d legacyAuthoritative=1",
